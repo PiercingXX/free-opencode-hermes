@@ -3,11 +3,11 @@
 A complete reference for operating, extending, and maintaining this repository.
 
 **Audience.** Someone who has to change this codebase or run it in anger. The
-root `README.md` explains *why* the project exists and gets you to a first
-routing decision in two minutes; this document explains *how everything works*
-and *where the bodies are buried*.
+root `README.md` is the Linux and Windows install path. This document is how
+the stack works, plus the operator detail that does not belong on the front
+page: Hermes, launchers, PATH, skip-flags, and failure modes.
 
-**Status of this document.** Current as of 2026-09-01. §11 is a defect
+**Status of this document.** Current as of 2026-09-02. §11 is a defect
 register: every confirmed problem this codebase has had, what it actually
 broke, and its status. Everything there is **fixed** unless its row says
 otherwise; the handful of genuinely open items — all judgment calls rather
@@ -29,6 +29,7 @@ statements, and this document should not blur them.
 
 ## Table of contents
 
+0. [Install and run](#0-install-and-run)
 1. [What this is](#1-what-this-is)
 2. [Repository topology](#2-repository-topology)
 3. [The single source of truth: inventory.json](#3-the-single-source-of-truth-inventoryjson)
@@ -42,6 +43,107 @@ statements, and this document should not blur them.
 11. [Defect register](#11-defect-register)
 12. [Maintenance conventions](#12-maintenance-conventions)
 13. [Troubleshooting](#13-troubleshooting)
+
+---
+
+## 0. Install and run
+
+The root `README.md` is the short path. This section is the same procedure with
+PATH, skip-flags, launchers, and the optional Hermes plane.
+
+Requires **Node.js 20+** and **npm**. Hermes additionally needs **Python 3**.
+
+### OpenCode
+
+**Linux / macOS**
+
+```bash
+git clone https://github.com/PiercingXX/free-opencode-hermes
+cd free-opencode-hermes
+./install-opencode.sh
+```
+
+Wrappers land in `~/.local/bin`. If `free-opencode` is missing after a new
+shell, add that directory to `PATH`. Already have the OpenCode CLI:
+
+```bash
+./install-opencode.sh --skip-opencode
+```
+
+**Windows**
+
+```powershell
+git clone https://github.com/PiercingXX/free-opencode-hermes
+cd free-opencode-hermes
+Set-ExecutionPolicy -Scope Process Bypass
+.\install-opencode.ps1
+```
+
+The installer adds `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`
+to the user PATH. Open a new terminal before expecting `opencode` or
+`free-opencode` to resolve. Already have the OpenCode CLI:
+
+```powershell
+.\install-opencode.ps1 -SkipOpenCode
+```
+
+**After either installer**
+
+1. Open http://127.0.0.1:8082/admin, add a provider key, set a default model.
+2. Run `opencode`. If the session sticks on a built-in Zen model, use
+   `foc-opencode` for that session — it writes a process-local config
+   (Responses API, overlay-forced model) and does not rewrite saved OpenCode
+   settings.
+3. If Admin is down: `free-opencode start`.
+
+Shell equivalents of Admin: `free-opencode connect <provider>`,
+`free-opencode set-model <provider/model>`, `free-opencode set-fallback …`.
+`free-opencode autofind` probes local Ollama (and similar) endpoints.
+
+Launchers installed next to `free-opencode`:
+
+| Command | Role |
+|---|---|
+| `opencode` | OpenCode CLI, plugin-wired to the `:8082` catalog |
+| `foc-opencode` | Same catalog, process-local config (use this if Zen wins) |
+| `foc-hermes` | Hermes Agent against the same `:8082` catalog |
+| `xx-hermes` | Hermes against the `:8180` GPU/Ollama orchestrator (needs §8) |
+
+### Hermes (optional)
+
+Two planes. `foc-hermes` needs the OpenCode install above. `xx-hermes` needs
+the Hermes installer and `inventory.json` pointed at machines you own.
+
+**Linux / macOS**
+
+```bash
+./install-hermes.sh
+```
+
+`--skip-hermes` keeps an existing Hermes Agent binary. `--no-systemd` skips
+user units; `xx-hermes` then starts the `:8180` proxy on demand.
+
+**Windows**
+
+```powershell
+.\install-hermes.ps1
+```
+
+`-SkipHermes` keeps an existing binary. There is no systemd path; `xx-hermes`
+starts the proxy on demand. The Hermes Agent installer is added to
+`%LOCALAPPDATA%\hermes\hermes-agent\bin`.
+
+Then:
+
+```bash
+# edit inventory.json, then:
+npm run inventory:sync
+npm run inventory:enable -- example-gpu-box.sglang   # whatever you actually own
+xx-hermes                                            # :8180 self-hosted plane
+foc-hermes                                           # :8082 catalog plane
+```
+
+Token file: `~/.config/hermes-orchestration/proxy.env`.
 
 ---
 
@@ -111,8 +213,8 @@ packages/plugin/           Free OpenCode plugin + loopback catalog proxy
 
 ### The symlink/copy distinction — read this before editing
 
-This trips people up constantly, and the root README currently overstates it
-(see §11, DOC-5).
+This trips people up constantly. An older README claimed the second folder
+"symlinks into" the first; it does not (see §11, DOC-5).
 
 - `opencode-orchestration/{mcp-server,scripts,packs,hooks}` are **symlinks**.
   Editing "through" them edits the real file in `xx-stack/`. Make the edit at
@@ -619,8 +721,8 @@ conflicting, and collapse overlapping sets to one.
 
 ## 8. The Hermes subsystem
 
-`hermes-orchestration/` — Python 3.11+, **standard library only**, no
-dependency on the TypeScript stack.
+Installers are in §0. `hermes-orchestration/` — Python 3.11+, **standard
+library only**, no dependency on the TypeScript stack.
 
 It routes LLM requests across self-hosted lanes with a premium cloud fallback
 via a local `hermes` CLI, and exposes a loopback-only OpenAI-compatible proxy.
@@ -808,6 +910,7 @@ and threshold variables drive the reliability harness and promotion gates.
 | Path | Role | Edit? |
 |---|---|---|
 | `inventory.json` | hardware truth | **yes — the only one** |
+| `~/.free-opencode/config.json` | plugin keys, default model, proxy token | yes |
 | `xx-stack/runtime/platforms.json` | generated registry | no |
 | `opencode-orchestration/opencode/platforms.json` | generated registry | no |
 | `hermes-orchestration/config/orchestration.json` | `lanes` generated; `execution`/`proxy` hand-tuned | partially |
@@ -1056,6 +1159,18 @@ coupling is deliberate.
 ---
 
 ## 13. Troubleshooting
+
+**`free-opencode` or `opencode` is not found.** Open a new terminal. Linux /
+macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
+`%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.
+
+**Admin will not load.** `free-opencode start`, then reload
+http://127.0.0.1:8082/admin.
+
+**OpenCode stuck on a built-in Zen model.** `foc-opencode` for that session.
+
+**Empty tool calls looping.** Quit the session, `free-opencode stop`,
+`free-opencode start`, then a **new** `opencode` or `foc-opencode` session.
 
 **`inventory:check` fails / "generated file is stale."** Run
 `npm run inventory:sync`. This also fires if Prettier reformatted a generated

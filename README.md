@@ -8,19 +8,34 @@ Requires Node.js 20+. Independent project, MIT licensed.
 
 ## How to
 
+### Linux / macOS
+
 ```bash
 git clone https://github.com/PiercingXX/free-opencode-hermes
 cd free-opencode-hermes
 ./install-opencode.sh
 ```
 
-Windows: `.\install-opencode.ps1`
+Open a new terminal. Wrappers go in `~/.local/bin`; add that directory to `PATH` if `free-opencode` is not found.
 
-Open a new terminal so the installer's binaries are on `PATH`, then:
+### Windows
+
+Install [Node.js 20+](https://nodejs.org) first. In PowerShell:
+
+```powershell
+git clone https://github.com/PiercingXX/free-opencode-hermes
+cd free-opencode-hermes
+Set-ExecutionPolicy -Scope Process Bypass
+.\install-opencode.ps1
+```
+
+Open a new terminal so the user PATH update applies (`%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`).
+
+### Configure and run
 
 1. Open [http://127.0.0.1:8082/admin](http://127.0.0.1:8082/admin). Add a provider key and set a default model.
 2. Run `opencode`.
 
 If Admin is not listening: `free-opencode start`.
 
-Reference: [MANUAL.md](MANUAL.md).
+Hermes, skip-flags, launchers, and internals: [MANUAL.md](MANUAL.md).
