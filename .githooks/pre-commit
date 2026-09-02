@@ -1,0 +1,22 @@
+#!/bin/bash
+# Pre-commit hook: keep OpenCode agent/skill mirrors in sync with xx-stack/runtime.
+# Enable with: git config core.hooksPath .githooks
+#
+# The VS Code `agents:check` / `sync-vscode-agents.mjs` surface was removed in
+# xx-stack 1.65. `drift:check` is the remaining mirror gate.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "[xx-stack] Checking OpenCode agent/skill mirrors (drift:check)..."
+
+if ! (cd "$REPO_ROOT" && npm run drift:check); then
+    echo ""
+    echo "ERROR: OpenCode mirrors have drifted from xx-stack/runtime."
+    echo "Edit the canonical files under xx-stack/runtime/, resync the"
+    echo "copies under opencode-orchestration/opencode/, then stage again."
+    exit 1
+fi
+
+echo "[xx-stack] Mirrors are in sync."

@@ -1,0 +1,182 @@
+name: xx-stack CI
+
+# GitHub Actions is disabled for this repo. Restore the push/pull_request
+# triggers (and repo Actions permissions) to run CI again.
+on:
+  workflow_dispatch:
+
+jobs:
+  layout:
+    name: Layout, Drift & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify component layouts
+        run: npm run layout:verify
+
+      # Names AND content: the mirrored skill/agent bodies must differ only by
+      # the deliberate host deltas. Content drift used to reach main freely.
+      - name: Verify canonical and mirrored sources have not drifted
+        run: npm run drift:check
+
+      # inventory.json is git-ignored (private machine truth), so a fresh clone
+      # has only inventory.example.json. Render the registries from whichever
+      # inventory answers — the template on CI — before checking them; without
+      # this the check compares template output against machine-local files.
+      - name: Render registries from the answering inventory
+        run: node xx-stack/scripts/generate-registries.mjs
+
+      - name: Verify generated registries match inventory.json
+        run: npm run inventory:check
+
+      # The three checks below are in `npm run verify` and were absent here
+      # until 2026-08-14, which made CI strictly weaker than a local run in
+      # exactly the places least worth leaving unguarded. guardrails:check in
+      # particular is a safety gate that had never run on a pull request.
+      - name: Verify rules coverage
+        run: npm run rules:check
+
+      - name: Verify nano tiers
+        run: npm run nano:check
+
+      - name: Verify dangerous-pattern guardrails
+        run: npm run guardrails:check
+
+      # Self-enforcing: fails if any gate in the `verify` chain has no step in
+      # this file. Prose in CONTRIBUTING.md asserted that invariant for months
+      # while six gates were missing, so it is a gate now rather than a promise.
+      - name: Verify CI enforces every verify gate
+        run: npm run ci:parity
+
+      # Shipped dependencies only. Dev-only advisories are tracked by Dependabot
+      # but do not gate the build, because they are not distributed — the
+      # reasoning is written down in SECURITY.md rather than left to this
+      # comment. `npm audit` ignores workspace boundaries and reads the root
+      # lockfile, so this covers mcp-server's dependencies too.
+      - name: Audit shipped dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+  mcp-server:
+    # Matrix covers the lowest supported version (package.json engines) and
+    # current LTS. Node's test-runner glob handling differs across majors, so
+    # testing only one version hides real breakage.
+    name: MCP Server (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same reasoning as the layout job: on a fresh clone the template
+      # answers, so render the registries from it first and the suite's strict
+      # sync assertions compare like with like.
+      - name: Render registries from the answering inventory
+        run: node xx-stack/scripts/generate-registries.mjs
+
+      - name: Build and test
+        run: npm --prefix xx-stack/mcp-server test
+
+  plugin:
+    name: Free OpenCode plugin (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '${{ matrix.node }}'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and test plugin
+        run: npm run plugin:test
+
+  design-pack:
+    name: Design Pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Regenerate design catalog
+        run: npm run design:catalog
+
+      - name: Fail if the catalog is stale
+        run: git diff --exit-code -- xx-stack/packs/design/DESIGN-CATALOG.md
+
+      - name: Run golden task checks
+        run: npm run design:golden
+
+      # Structural gate over every HTML template and example in the design
+      # pack. Generic gates only in sweep mode; the per-skill acceptance
+      # profiles run when an agent invokes it with --skill on its own output.
+      - name: Run HTML quality gate
+        run: npm run design:html-gate
+
+      # Read-only lint over all 149 design-systems/ files. This is the gate
+      # manifest.json names as the thing standing between a naive re-vendor and
+      # silently reintroduced 1.06:1 body text — so CI is precisely where it
+      # belongs, and it was missing here until 2026-08-14.
+      - name: Lint design systems (WCAG AA on declared pairs, section order)
+        run: npm run design:systems-lint
+
+      - name: Verify craft references resolve
+        run: npm run design:craft-refs
+
+      # Drives the real anti-slop gate against a slop fixture and a clean one:
+      # asserts every rule fires at its declared severity, that none fire on
+      # clean input, and that only P0 changes the exit code.
+      - name: Test anti-slop rules
+        run: npm run design:anti-slop-test
+
+  hermes:
+    name: Hermes Control Plane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Run orchestrator tests
+        working-directory: hermes-orchestration
+        run: python3 -m unittest discover -s tests -v

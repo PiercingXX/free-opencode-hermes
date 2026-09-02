@@ -1,0 +1,42 @@
+{
+  "name": "free-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: multi-provider routing (free/paid/local) plus the xx-stack agent runtime",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "free-opencode": "./dist/cli.js"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "llm",
+    "proxy",
+    "xx-stack"
+  ],
+  "author": "PiercingXX",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.8",
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.2"
+  }
+}

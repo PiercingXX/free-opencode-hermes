@@ -1,0 +1,41 @@
+{
+  "tiers": {
+    "local": "local",
+    "tailscaleOllama": "tailscale-ollama",
+    "tailscaleOpenAiCompatible": "tailscale-openai-compatible",
+    "cloud": "cloud"
+  },
+  "hosts": {
+    "localWorkstation": "local-workstation",
+    "exampleGpuBox": "example-gpu-box",
+    "localOpenAiCompatible": "local-openai-compatible",
+    "tailscaleOpenAiCompatiblePrimary": "tailscale-openai-compatible-primary",
+    "hermesProxy": "hermes-proxy"
+  },
+  "providers": {
+    "ollamaLocal": "ollama-local",
+    "ollamaRemote": "ollama",
+    "llamaCppLocal": "llama-cpp-local",
+    "sglangRemote": "sglang-remote",
+    "localAiLocal": "localai-local",
+    "localAiRemote": "localai-remote",
+    "hermesProxy": "hermes-proxy"
+  },
+  "networkScopes": {
+    "localhost": "localhost",
+    "tailscale": "tailscale",
+    "internet": "internet"
+  },
+  "paths": {
+    "sourceDir": "opencode",
+    "compatDir": ".opencode",
+    "platformsFile": "platforms.json",
+    "configFile": "config.json",
+    "skillsDir": "skills",
+    "modelRecommendationsFile": "model-recommendations.json",
+    "globalPlatformsFile": "xx-stack-platforms.json",
+    "stateDir": ".xx-stack",
+    "stateProjectsDir": "projects",
+    "canonicalSourceDir": "runtime"
+  }
+}

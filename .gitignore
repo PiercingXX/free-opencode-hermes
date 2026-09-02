@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-test/
+**/dist-test/
+build/
+*.tsbuildinfo
+packages/plugin/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime state and logs
+hermes-orchestration/logs/
+*.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.free-opencode/
+*.local.json
+proxy.env
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+
+# Local overrides that should never be committed
+platforms.local.json
+config.local.json
+
+# Your real machine inventory: private MagicDNS names and hardware details.
+# Start from inventory.example.json; the inventory scripts fall back to it
+# while inventory.json is absent, so a fresh clone works out of the box.
+/inventory.json
+
+# Runtime compatibility shim created by setup (symlink to opencode/)
+.opencode
+
+# Live agent workspace: session traces and verbatim user prompt history.
+# NEVER commit — this is private user data, not build output. Do not delete
+# the directory either; it is the agent's working state.
+.skippy/
