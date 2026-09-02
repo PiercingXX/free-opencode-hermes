@@ -7,6 +7,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Shorter root README.** What it is, then install. Reference material stays
+  in `MANUAL.md` and the component READMEs.
+
 - **No paid-product brand ads.** Dropped two paid-product design systems,
   replaced example-ad names with Skippy, and renamed catalog copy to
   "loopback catalog". xAI Connect still uses that provider's upstream
