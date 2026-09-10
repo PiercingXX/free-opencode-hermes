@@ -7,6 +7,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Admin cloud grid blank.** Last-route's extra lines used a real newline
+  inside the HTML template literal, which broke the Admin script. Cloud cards
+  are back; a test now parses that inline script.
+
 - **Last route shows local hops.** Admin header and `free-opencode status` tag
   CLOUD vs LOCAL (Ollama / SGLang / Tailscale) and list connected local
   last-resort boxes when the last hop was cloud.

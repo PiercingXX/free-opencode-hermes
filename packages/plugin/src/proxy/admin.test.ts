@@ -30,6 +30,15 @@ test("admin catalog keeps both local and cloud order within a bucket", () => {
   );
 });
 
+test("admin inline script is valid JavaScript", () => {
+  const html = adminPage();
+  const start = html.indexOf("<script>");
+  const end = html.indexOf("</script>", start);
+  assert.ok(start >= 0 && end > start);
+  const script = html.slice(start + 8, end);
+  new Function(script);
+});
+
 test("admin last-route template labels LOCAL hops and last-resort locals", () => {
   const html = adminPage();
   assert.ok(html.includes("LOCAL"));

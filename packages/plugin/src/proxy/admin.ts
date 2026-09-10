@@ -410,9 +410,10 @@ export function adminPage(): string {
       if (r) hops.push(r);
       const lastLocal = hops.reverse().find((x) => isLocalProvider(x.providerId));
       if (lastLocal && (!r || lastLocal.slug !== r.slug)) {
-        line += "\nlast local hop: " + formatRoute(lastLocal);
+        line += "\\nlast local hop: " + formatRoute(lastLocal);
       } else if (r && !isLocalProvider(r.providerId) && localReady.length) {
-        line += "\nlocal last-resort: " + localReady.map((p) => p.id).join(", ") + " (not used this hop)";
+        line +=
+          "\\nlocal last-resort: " + localReady.map((p) => p.id).join(", ") + " (not used this hop)";
       }
       return line;
     }
