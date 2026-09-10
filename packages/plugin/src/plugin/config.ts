@@ -32,6 +32,34 @@ const UNBOUNDED_STEPS_AGENTS = new Set([
   "execution-orchestrator",
   "parallel-execution-orchestrator",
 ]);
+
+/** MCP tools the unattended orchestrators must keep; abort stays off. */
+const ORCHESTRATOR_MCP_TOOLS = [
+  "task_create",
+  "task_update",
+  "task_get",
+  "task_list",
+  "task_suspend",
+  "supervisor_start_session",
+  "supervisor_tick",
+  "supervisor_complete_session",
+  "supervisor_record_event",
+  "supervisor_record_completion_check",
+  "search_tools",
+  "list_platforms",
+  "check_health",
+  "route_task",
+  "route_parallel_tasks",
+] as const;
+
+function enableOrchestratorMcpTools(def: AgentConfig): void {
+  const tools: Record<string, boolean> = {
+    ...((def.tools as Record<string, boolean> | undefined) ?? {}),
+  };
+  for (const name of ORCHESTRATOR_MCP_TOOLS) tools[name] = true;
+  tools.supervisor_abort_session = false;
+  def.tools = tools;
+}
 /** Markdown names that replace OpenCode's native build/plan/general tools. */
 export const OPENCODE_NATIVE_PRIMARY_FILES = ["build.md", "plan.md", "general.md"] as const;
 const PLUGIN_TOOLS = ["foc_status", "foc_models"] as const;
@@ -285,6 +313,26 @@ export function applyRuntimeExtras(config: MutableConfig): void {
       delete merged.steps;
     } else {
       merged.steps = openCodeAgentSteps(existing.steps ?? agent.steps);
+    }
+    if (
+      agent.name === "execution-orchestrator" ||
+      agent.name === "parallel-execution-orchestrator"
+    ) {
+      enableOrchestratorMcpTools(merged);
+      const perm =
+        merged.permission &&
+        typeof merged.permission === "object" &&
+        !Array.isArray(merged.permission)
+          ? { ...(merged.permission as Record<string, unknown>) }
+          : {};
+      perm.edit = "allow";
+      perm.bash = "allow";
+      perm.task = {
+        ...(typeof perm.task === "object" && perm.task ? perm.task : {}),
+        "*": "allow",
+      };
+      merged.permission = perm;
+      merged.mode = "primary";
     }
     (config.agent as Record<string, AgentConfig>)[agent.name] = merged;
   }

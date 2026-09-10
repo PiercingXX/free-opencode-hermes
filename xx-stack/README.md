@@ -229,11 +229,10 @@ copies, deliberately specialised for OpenCode and kept structurally in step by
 
 ### The unattended builders
 
-`execution-orchestrator` and `parallel-execution-orchestrator` are the
-long-running **unattended** primary builders. They omit OpenCode `steps`
-entirely (a `steps` key caps tool calls and ends the loop) and instead run
-until the request is done or a hard blocker stops them. See their agent
-contracts in `runtime/agents/` for the unattended loop rules.
+`execution-orchestrator` (single lane) and `parallel-execution-orchestrator`
+(several lanes) are the **overnight** builders. They omit OpenCode `steps`,
+write `todo.md`, and use Free OpenCode routing (free cloud first, GPU last).
+`free-opencode overnight` / `--parallel` launches them. See `runtime/agents/`.
 
 ---
 

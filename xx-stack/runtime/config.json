@@ -214,7 +214,7 @@
       }
     },
     "execution-orchestrator": {
-      "description": "Unattended primary builder for long-running plan-exec workflows. Owns the loop in-session, delegates slices, writes todo/contract state to disk, and continues until the request is done or a hard blocker stops it. Uses the caller's current host model by default.",
+      "description": "Overnight single-lane builder for Free OpenCode. One session on free-opencode/default (free cloud → paid → GPU last). Owns the loop on disk until done.",
       "mode": "primary",
       "temperature": 0.05,
       "requiredMcpServers": [
@@ -238,7 +238,7 @@
       }
     },
     "parallel-execution-orchestrator": {
-      "description": "Unattended primary builder that fans out independent slices in parallel. Uses whatever healthy lanes exist (non-GPU first, self-hosted last) and still runs if MCP is down. Keeps orchestration on the caller's host model.",
+      "description": "Overnight multi-lane builder for Free OpenCode. Fans independent slices across available free/cloud models and extra hosts. GPU/self-hosted last.",
       "mode": "primary",
       "temperature": 0,
       "requiredMcpServers": [
@@ -249,10 +249,6 @@
           "*"
         ],
         "deny": [
-          "task_create",
-          "supervisor_start_session",
-          "supervisor_tick",
-          "supervisor_complete_session",
           "supervisor_abort_session"
         ]
       },

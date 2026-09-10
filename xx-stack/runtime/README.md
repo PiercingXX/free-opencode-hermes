@@ -45,7 +45,7 @@ For the boundary contract, see `REPO-LAYERS.md`.
 
 ## Primary Agents
 
-- `execution-orchestrator` **unattended primary builder** — owns the loop in-session, delegates slices, writes todo/contract state to disk, and continues until the request is done or a hard blocker stops it. Omits OpenCode `steps` (no tool-call cap) and asks no clarifying questions absent a blocker.
+- `execution-orchestrator` **overnight single-lane builder** — one Free OpenCode session (free cloud → paid → GPU last), todo on disk, no step cap.
 - `build`: implementation agent
 - `fast-build`: narrow speed lane for small changes
 - `plan`: planning-only lane
@@ -54,7 +54,7 @@ For the boundary contract, see `REPO-LAYERS.md`.
 - `incident-commander`: incident handling
 - `design-engineer`: design workflow specialist
 
-`parallel-execution-orchestrator` is the other **unattended primary builder**: it fans out independent slices in parallel, prefers healthy non-GPU lanes over self-hosted GPU boxes, and still runs (in-process) if MCP routing is down. It also omits `steps`.
+`parallel-execution-orchestrator` is the **overnight multi-lane builder**: independent slices across available free/cloud models and extra hosts, GPU last, still runs if MCP is down.
 
 ## Requirements
 

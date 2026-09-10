@@ -49,9 +49,21 @@ Open a new terminal so the user PATH update applies
 2. Run `opencode` in a terminal, or from the OpenCode IDE extension
    (`Ctrl+Esc` / `Cmd+Esc`). `opencode serve` loads the same plugin.
 
-If Admin is not listening: `free-opencode start`. Native `build` / `plan` /
-`general` have no step cap so a session can keep using tools until the model
-stops; write progress on disk if you need to survive a reboot.
+If Admin is not listening: `free-opencode start`.
+
+### Overnight / unattended
+
+Tab **execution-orchestrator** for one lane (free cloud → paid → your GPU
+last). Tab **parallel-execution-orchestrator** when the work splits into
+independent slices across several models/hosts.
+
+```bash
+free-opencode overnight              # single lane
+free-opencode overnight --parallel   # several lanes
+```
+
+Or `opencode --agent execution-orchestrator`. They have no step cap; they
+write `todo.md` so a reboot can resume. `build` stays the interactive default.
 
 A second key for the same provider: account name on the card (e.g. `work`)
 then **Add account**, or `free-opencode connect open_router@work`.

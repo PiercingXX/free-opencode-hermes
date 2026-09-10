@@ -290,7 +290,7 @@
       }
     },
     "execution-orchestrator": {
-      "description": "Unattended primary builder for long-running plan-exec workflows. Owns the loop in-session, delegates slices, writes todo/contract state to disk, and continues until the request is done or a hard blocker stops it. Runs on the pinned local lane by default.",
+      "description": "Overnight single-lane builder for Free OpenCode. One session, one routing chain. Owns the loop on disk until done. Runs on the pinned local lane by default.",
       "mode": "primary",
       "color": "#f59e0b",
       "model": "llama-cpp-local/qwen3.5:27b-tq2_0",
@@ -327,7 +327,7 @@
       }
     },
     "parallel-execution-orchestrator": {
-      "description": "Unattended primary builder that fans out independent slices in parallel. Uses whatever healthy lanes exist (non-GPU first, self-hosted last) and still runs if MCP is down. Runs on the pinned local lane by default.",
+      "description": "Overnight multi-lane builder for Free OpenCode. Fans independent slices across available free/cloud models and extra hosts. GPU last. Runs on the pinned local lane by default.",
       "mode": "primary",
       "color": "#ef4444",
       "model": "llama-cpp-local/qwen3-coder:30b-a3b-tq2_0",
@@ -340,10 +340,6 @@
           "*"
         ],
         "deny": [
-          "task_create",
-          "supervisor_start_session",
-          "supervisor_tick",
-          "supervisor_complete_session",
           "supervisor_abort_session"
         ]
       },

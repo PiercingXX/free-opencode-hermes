@@ -152,8 +152,30 @@ test("applyRuntimeExtras loads xx-stack agents and leaves native build without a
   const orch = config.agent?.["execution-orchestrator"] as { steps?: number; prompt?: string };
   assert.equal("steps" in (orch ?? {}), false);
   assert.ok(orch?.prompt && orch.prompt.length > 0);
-  const parallel = config.agent?.["parallel-execution-orchestrator"] as { steps?: number };
+  const parallel = config.agent?.["parallel-execution-orchestrator"] as {
+    steps?: number;
+    tools?: Record<string, boolean>;
+  };
   assert.equal("steps" in (parallel ?? {}), false);
+  assert.equal(parallel?.tools?.task_create, true);
+  assert.equal(parallel?.tools?.supervisor_start_session, true);
+  assert.equal(parallel?.tools?.supervisor_tick, true);
+  assert.equal(parallel?.tools?.supervisor_complete_session, true);
+  assert.equal(parallel?.tools?.supervisor_abort_session, false);
+  const orchTools = config.agent?.["execution-orchestrator"] as { tools?: Record<string, boolean> };
+  assert.equal(orchTools?.tools?.task_create, true);
+  assert.equal(orchTools?.tools?.supervisor_abort_session, false);
+  const orchPerm = config.agent?.["execution-orchestrator"] as {
+    permission?: { task?: Record<string, string>; edit?: string };
+    description?: string;
+    mode?: string;
+  };
+  assert.equal(orchPerm?.permission?.edit, "allow");
+  assert.equal(orchPerm?.permission?.task?.["*"], "allow");
+  assert.equal(orchPerm?.mode, "primary");
+  assert.match(String(orchPerm?.description ?? ""), /Overnight single-lane/);
+  const parDesc = config.agent?.["parallel-execution-orchestrator"] as { description?: string };
+  assert.match(String(parDesc?.description ?? ""), /Overnight multi-lane/);
 });
 
 test("stripNativePrimaryAgentFiles unlinks leftover build/plan/general markdown", () => {
