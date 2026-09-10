@@ -54,7 +54,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
   },
   {
     id: "bai",
-    name: "B.AI",
+    name: "B.ai",
     env: "BAI_API_KEY",
     credentialUrl: "https://docs.b.ai/llmservice/api/",
     defaultBaseUrl: "https://api.b.ai/v1",

@@ -261,7 +261,8 @@ export function connectProvider(
   discovered: string[]
 ): Settings {
   const provider = providerById(providerId);
-  const next = setProviderKey(settings, providerId, provider?.staticKey ?? "local", extra);
+  const key = settings.keys[providerId]?.trim() || provider?.staticKey || "local";
+  const next = setProviderKey(settings, providerId, key, extra);
   next.discovered = { ...next.discovered, [providerId]: discovered };
   if (!next.model && discovered[0]) next.model = `${providerId}/${discovered[0]}`;
   return next;

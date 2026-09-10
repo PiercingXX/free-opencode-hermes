@@ -54,14 +54,15 @@ test("provider catalog ids are unique and non-empty", () => {
   }
 });
 
-test("B.AI is a connectable OpenAI-compatible provider", () => {
+test("B.ai is a connectable OpenAI-compatible provider", () => {
   const provider = providerById("bai");
   assert.ok(provider);
-  assert.equal(provider.name, "B.AI");
+  assert.equal(provider.name, "B.ai");
   assert.equal(provider.env, "BAI_API_KEY");
   assert.equal(provider.defaultBaseUrl, "https://api.b.ai/v1");
   assert.ok(provider.defaultModels.includes("gpt-5.5"));
   assert.equal(provider.local, undefined);
+  assert.equal(isAdminListed(emptySettings(), "bai"), true);
 });
 
 test("local providers expose a base URL extra field", () => {
@@ -216,6 +217,14 @@ test("removeProvider drops Autofind hosts and hosted models, and Apply cannot re
     if (previous === undefined) delete process.env.OLLAMA_BASE_URL;
     else process.env.OLLAMA_BASE_URL = previous;
   }
+});
+
+test("connectProvider keeps a cloud API key already on settings", () => {
+  const settings = setProviderKey(emptySettings(), "bai", "sk-test-bai");
+  const connected = connectProvider(settings, "bai", {}, ["gpt-5.5"]);
+  assert.equal(connected.keys.bai, "sk-test-bai");
+  assert.equal(connected.enabled.bai, true);
+  assert.deepEqual(connected.discovered.bai, ["gpt-5.5"]);
 });
 
 test("connect does not overwrite an existing default model", () => {

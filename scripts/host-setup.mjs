@@ -298,6 +298,11 @@ function opencodeHost() {
 }
 
 function startProxy(cli) {
+  spawnSync(process.execPath, [cli, "stop"], {
+    stdio: "inherit",
+    windowsHide: true,
+    env: process.env,
+  });
   const result = spawnSync(process.execPath, [cli, "start"], {
     stdio: "inherit",
     windowsHide: true,

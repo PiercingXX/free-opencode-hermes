@@ -181,6 +181,8 @@ export function adminPage(): string {
   <main>
     <section>
       <h2>Cloud providers</h2>
+      <label>Filter</label>
+      <input id="provider-filter" placeholder="B.ai, bai, groq…" autocomplete="off" />
       <div id="providers" class="grid"></div>
       <h2 style="margin-top:20px">Self-hosted</h2>
       <p class="muted" style="margin:0 0 10px">Ollama, SGLang, LM Studio, llama.cpp. Autofind probes localhost, LAN neighbors, and Tailscale.</p>
@@ -240,14 +242,13 @@ export function adminPage(): string {
       const badge = p.ready
         ? '<span class="ok">' + (p.local ? "✓ connected" : "✓ configured") + "</span>"
         : '<span class="bad">' + (p.local ? "✗ not connected" : "✗ not configured") + "</span>";
-      const action = p.local
-        ? '<button type="button" data-connect="' + esc(p.id) + '">Connect</button>'
-        : '<button type="button" class="secondary" data-probe="' + esc(p.id) + '">Check</button>';
+      const action = '<button type="button" data-connect="' + esc(p.id) + '">Connect</button>';
       const remove = (p.ready || p.configured)
         ? '<button type="button" class="danger" data-remove="' + esc(p.id) + '">Remove</button>'
         : "";
       const found = (p.discovered || []).slice(0, 6).map((id) => '<div class="muted">' + esc(p.id) + "/" + esc(id) + "</div>").join("");
       return '<div class="card' + (p.ready ? " ready" : "") + '" data-id="' + esc(p.id) + '"><h3>' + esc(p.name) + " " + badge + "</h3>" +
+        '<div class="muted" style="font-size:11px;margin:0 0 6px">' + esc(p.id) + "</div>" +
         keyField + cardExtras(p) +
         '<div class="row">' +
           action +
@@ -266,14 +267,23 @@ export function adminPage(): string {
       });
       return extra;
     }
+    let catalogCache = [];
+    function paintCatalog() {
+      const query = ($("provider-filter").value || "").trim().toLowerCase();
+      const match = (p) =>
+        !query ||
+        String(p.name || "").toLowerCase().indexOf(query) >= 0 ||
+        String(p.id || "").toLowerCase().indexOf(query) >= 0;
+      $("local-providers").innerHTML = catalogCache.filter((p) => p.local && match(p)).map(card).join("");
+      $("providers").innerHTML = catalogCache.filter((p) => !p.local && match(p)).map(card).join("");
+    }
     async function load() {
       const data = await api("/admin/api/state");
       $("status").textContent = "Proxy " + data.listen.host + ":" + data.listen.port;
       $("model").value = data.model || "";
       $("fallbacks").value = (data.fallbacks || []).join(", ");
-      const catalog = data.catalog || [];
-      $("local-providers").innerHTML = catalog.filter((p) => p.local).map(card).join("");
-      $("providers").innerHTML = catalog.filter((p) => !p.local).map(card).join("");
+      catalogCache = data.catalog || [];
+      paintCatalog();
       const models = data.models || [];
       const free = models.filter((m) => m.free);
       $("free-models").innerHTML = free.length
@@ -411,6 +421,7 @@ export function adminPage(): string {
       }
     };
     $("refresh").onclick = () => load().catch((err) => { $("message").textContent = err.message; });
+    $("provider-filter").oninput = () => paintCatalog();
     $("autofind").onclick = async () => {
       const status = $("autofind-status");
       const button = $("autofind");

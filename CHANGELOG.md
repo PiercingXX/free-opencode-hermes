@@ -16,8 +16,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved tree if symlink creation is denied, and treats Git symlink
   placeholders as the directories they name.
 
-- **B.AI provider.** Admin / `free-opencode connect bai` accepts `BAI_API_KEY`
-  against `https://api.b.ai/v1`.
+- **B.ai provider.** Admin lists it as **B.ai** (`bai`) with a filter box.
+  Connect on the card saves the key (`BAI_API_KEY`, `https://api.b.ai/v1`).
+  Reinstall stops then starts the proxy so an old Admin process cannot keep
+  serving a catalog from before this provider existed.
 
 - **Shorter root README.** Intro, then Linux / Windows how-to. Hermes,
   skip-flags, launchers, and failure modes live in `MANUAL.md` §0 and §13.

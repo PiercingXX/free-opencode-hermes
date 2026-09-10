@@ -64,7 +64,7 @@ function send(
     typeof body === "string" && body.startsWith("<!")
       ? "text/html; charset=utf-8"
       : "application/json";
-  res.writeHead(status, { "Content-Type": type, ...extra });
+  res.writeHead(status, { "Content-Type": type, "Cache-Control": "no-store", ...extra });
   res.end(payload);
 }
 
