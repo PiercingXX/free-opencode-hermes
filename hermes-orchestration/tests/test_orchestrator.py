@@ -1141,6 +1141,11 @@ class ProxyTests(TempDirMixin):
         self.cfg["lanes"]["cloud"] = lane_cfg(
             "cloud-lane", cloud.base_url, "gpt-cloud", role="cloud", priority=200
         )
+        # local-first (self_hosted_first=True) would re-derive the order as
+        # ["a", "cloud"], so lane "a" would win on the first hop and the cloud
+        # skip would never be attempted. Disable it here so cloud (priority 200)
+        # is genuinely tried first and the not-opted-in skip is observable.
+        self.cfg["policy"]["self_hosted_first"] = False
         self.cfg["policy"]["primary_lane_order"] = ["cloud", "a"]
         code, body = self._request(
             "/v1/chat/completions",

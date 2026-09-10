@@ -52,6 +52,11 @@ export function logPath(home = homedir()): string {
   return join(stateDir(home), "proxy.log");
 }
 
+/** Schema-versioned cooldown store that survives proxy restarts (no keys). */
+export function cooldownStatePath(home = homedir()): string {
+  return join(stateDir(home), "cooldowns.json");
+}
+
 export const PROVIDER_ID = "free-opencode";
 /** Single model OpenCode advertises. Proxy maps it to Admin default + fallbacks. */
 export const CATALOG_MODEL_ID = "default";

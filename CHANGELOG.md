@@ -144,6 +144,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result behind a replacement lease. `supervisor_complete_session` will not
   rewrite a session that already ended.
 
+- **Cooldowns survive proxy restarts.** 429/402/rate-limit cooldowns are now
+  persisted to a schema-versioned `~/.free-opencode/cooldowns.json` (no API
+  keys) and restored by `free-opencode start`, the keep-alive service, and
+  `overnight`, so a restart does not immediately re-hit an expended slug like
+  `gpt-5-nano`. Expired windows are dropped on load.
+- **`overnight` waits for the proxy to listen.** Starting `free-opencode
+  overnight` (or `--parallel`) previously spawned the detached proxy and
+  launched OpenCode immediately, which could race the port and double-spawn.
+  It now waits for `:8082` health before launching the chosen agent.
+- **Hermes cloud-opt-in routing test.** `test_chat_skips_cloud_lane_when_not_
+  opted_in` asserted a skip marker that the documented local-first
+  `primary_lane_order` would never emit (lane `a` won before the cloud lane was
+  attempted). The test now disables `self_hosted_first` for that case so the
+  cloud lane is actually tried (and skipped) first.
+
 ## [1.66.0] — 2026-09-01
 
 - **Catalog routing and loopback launchers.** OpenCode's picker is

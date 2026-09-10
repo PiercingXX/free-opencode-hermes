@@ -217,6 +217,9 @@ export function adminPage(): string {
       <div id="models" class="muted"></div>
       <h2 style="margin-top:20px">Recent routes</h2>
       <div id="recent-routes" class="muted"></div>
+      <h2 style="margin-top:20px">Log tail</h2>
+      <p class="muted" style="margin:0 0 8px">Latest records from the on-disk <code>proxy.log</code> (secrets redacted).</p>
+      <div id="log-tail" class="muted" style="font-size:11px;max-height:240px;overflow:auto"></div>
     </section>
   </main>
   <footer>
@@ -343,6 +346,17 @@ export function adminPage(): string {
       $("recent-routes").innerHTML = recent.length
         ? recent.slice(0, 20).map((r) => "<div>" + esc(formatRoute(r)) + "</div>").join("")
         : "None yet. Send a request through the :8082 catalog.";
+      // The log tail reads the on-disk proxy.log (redacted server-side), not the
+      // in-memory ring, so a restart/rotation and non-route records show here too.
+      try {
+        const logRes = await api("/admin/api/log?limit=25");
+        const lines = logRes.lines || [];
+        $("log-tail").innerHTML = lines.length
+          ? lines.map((l) => "<div>" + esc(JSON.stringify(l)) + "</div>").join("")
+          : "proxy.log is empty so far.";
+      } catch (err) {
+        $("log-tail").textContent = "log unavailable: " + err.message;
+      }
       const cooldowns = data.cooldowns || [];
       $("cooldowns").innerHTML = cooldowns.length
         ? cooldowns.map((c) =>

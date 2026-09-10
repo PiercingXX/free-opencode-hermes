@@ -66,6 +66,15 @@ Launchers (also installed as foc-opencode and foc-hermes):
 
 async function cmdOvernight(parallel: boolean): Promise<void> {
   await cmdStart(false);
+  // cmdStart(false) starts a detached proxy and returns before it binds, so an
+  // immediate launchOpenCode would race it for the port and could spawn a
+  // second proxy. Wait until the port answers before handing off to the agent.
+  const settings = applyEnvOverrides(loadSettings());
+  const url = `http://${settings.listen.host}:${settings.listen.port}`;
+  if (!(await waitUntilHealthy(url))) {
+    console.error(`The proxy did not become healthy at ${url}; cannot launch overnight.`);
+    process.exit(1);
+  }
   const agent = parallel ? "parallel-execution-orchestrator" : "execution-orchestrator";
   console.log(
     parallel

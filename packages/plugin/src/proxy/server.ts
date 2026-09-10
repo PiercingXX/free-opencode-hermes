@@ -40,7 +40,7 @@ import {
   type LastRoute,
   type RouteHopRecord,
 } from "./route-log.js";
-import { activeCooldowns } from "./cooldown.js";
+import { activeCooldowns, loadCooldowns } from "./cooldown.js";
 
 const PROXY_BUILT_AT: number = ((): number => {
   try {
@@ -262,6 +262,9 @@ function routeResult(
 
 export function startProxy(initial?: Settings, home?: string): RunningProxy {
   let settings = applyEnvOverrides(initial ?? loadSettings(home));
+  // Restore cooldowns from the previous process so a restart does not re-hit a
+  // model that was 402/429'd. Expired windows are dropped on load.
+  loadCooldowns(home);
   const persist = (): void => {
     saveSettings(settings, home);
   };

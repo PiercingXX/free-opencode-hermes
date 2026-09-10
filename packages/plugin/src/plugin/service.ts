@@ -22,11 +22,63 @@ import { join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
 import { repoRoot } from "../paths.js";
-import { isWindows, nodeExecutable } from "../platform.js";
+import { nodeExecutable } from "../platform.js";
 import { appendLog } from "../proxy/route-log.js";
 
 const SERVICE_NAME = "free-opencode-proxy";
 const MAC_LABEL = "com.free-opencode.proxy";
+
+// --- test seams -----------------------------------------------------------
+// The installers are IO: they target $HOME per-platform files and shell out to
+// systemctl / launchctl / schtasks. Tests override home + platform and stub the
+// child-process calls so a unit/plist/task can be asserted without any real
+// system service being touched (no real schtasks / systemctl in CI).
+let testHome: string | null = null;
+export function __setTestHome(home: string | null): void {
+  testHome = home;
+}
+function homeDir(): string {
+  return testHome ?? homedir();
+}
+
+let testPlatform: NodeJS.Platform | null = null;
+export function __setTestPlatform(platform: NodeJS.Platform | null): void {
+  testPlatform = platform;
+}
+function currentPlatform(): NodeJS.Platform {
+  return testPlatform ?? process.platform;
+}
+
+export type ExecCall = { cmd: string; args: string[] };
+export const __serviceRuntime: {
+  spawnSync: (
+    cmd: string,
+    args: string[],
+    opts?: Record<string, unknown>
+  ) => {
+    status: number | null;
+    error?: Error | null;
+    stdout?: string | Buffer;
+    stderr?: string | Buffer;
+  };
+  execFileSync: (cmd: string, args: string[], opts?: Record<string, unknown>) => unknown;
+} = {
+  spawnSync: (cmd, args, opts) => spawnSync(cmd, args as string[], opts as never),
+  execFileSync: (cmd, args, opts) => execFileSync(cmd, args as string[], opts as never) as unknown,
+};
+/** Tests replace these with recorders so no real system service is touched. */
+export function __setSpawnSync(fn: typeof __serviceRuntime.spawnSync | null): void {
+  __serviceRuntime.spawnSync =
+    fn ??
+    ((cmd, args, opts): ReturnType<typeof __serviceRuntime.spawnSync> =>
+      spawnSync(cmd, args as string[], opts as never));
+}
+export function __setExecFileSync(fn: typeof __serviceRuntime.execFileSync | null): void {
+  __serviceRuntime.execFileSync =
+    fn ??
+    ((cmd, args, opts): ReturnType<typeof __serviceRuntime.execFileSync> =>
+      execFileSync(cmd, args as string[], opts as never) as unknown);
+}
 
 function cliPath(): string {
   return join(repoRoot(), "packages", "plugin", "dist", "cli.js");
@@ -37,23 +89,27 @@ function execArgs(): string[] {
   return [nodeExecutable(), cliPath(), "start", "--foreground"];
 }
 
-function serviceDir(home = homedir()): string {
+function serviceDir(home = homeDir()): string {
   return join(home, ".config", "free-opencode");
 }
 
 function isMac(): boolean {
-  return process.platform === "darwin";
+  return currentPlatform() === "darwin";
 }
 
 function isLinux(): boolean {
-  return process.platform === "linux";
+  return currentPlatform() === "linux";
 }
 
-function systemdUserDir(home = homedir()): string {
+function isWindows(): boolean {
+  return currentPlatform() === "win32";
+}
+
+function systemdUserDir(home = homeDir()): string {
   return join(home, ".config", "systemd", "user");
 }
 
-function systemdUnitPath(home = homedir()): string {
+function systemdUnitPath(home = homeDir()): string {
   return join(systemdUserDir(home), `${SERVICE_NAME}.service`);
 }
 
@@ -77,7 +133,7 @@ WantedBy=default.target
 `;
 }
 
-function launchAgentPath(home = homedir()): string {
+function launchAgentPath(home = homeDir()): string {
   return join(home, "Library", "LaunchAgents", `${MAC_LABEL}.plist`);
 }
 
@@ -103,9 +159,9 @@ ${args}
     <false/>
   </dict>
   <key>StandardOutPath</key>
-  <string>${join(homedir(), ".free-opencode", "launchd.log")}</string>
+  <string>${join(homeDir(), ".free-opencode", "launchd.log")}</string>
   <key>StandardErrorPath</key>
-  <string>${join(homedir(), ".free-opencode", "launchd.log")}</string>
+  <string>${join(homeDir(), ".free-opencode", "launchd.log")}</string>
 </dict>
 </plist>
 `;
@@ -129,13 +185,13 @@ export function serviceInstall(): void {
   } else {
     throw new Error(`unsupported platform for keep-alive service: ${process.platform}`);
   }
-  void appendLog("service.install", { platform: process.platform, command: cliPath() });
+  void appendLog("service.install", { platform: currentPlatform(), command: cliPath() });
 }
 
 export function serviceUninstall(): void {
   if (isWindows()) {
     try {
-      execFileSync("schtasks", ["/Delete", "/TN", SERVICE_NAME, "/F"], {
+      __serviceRuntime.execFileSync("schtasks", ["/Delete", "/TN", SERVICE_NAME, "/F"], {
         stdio: "ignore",
         windowsHide: true,
       });
@@ -144,16 +200,18 @@ export function serviceUninstall(): void {
     }
   } else if (isMac()) {
     try {
-      execFileSync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL], {
-        stdio: "ignore",
-      });
+      __serviceRuntime.execFileSync(
+        "launchctl",
+        ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL],
+        { stdio: "ignore" }
+      );
     } catch {
       // not loaded
     }
     removeIfExists(launchAgentPath());
   } else if (isLinux()) {
     try {
-      execFileSync("systemctl", ["--user", "disable", "--now", SERVICE_NAME], {
+      __serviceRuntime.execFileSync("systemctl", ["--user", "disable", "--now", SERVICE_NAME], {
         stdio: "ignore",
       });
     } catch {
@@ -161,7 +219,7 @@ export function serviceUninstall(): void {
     }
     removeIfExists(systemdUnitPath());
   }
-  void appendLog("service.uninstall", { platform: process.platform });
+  void appendLog("service.uninstall", { platform: currentPlatform() });
 }
 
 function removeIfExists(path: string): void {
@@ -180,7 +238,10 @@ function installSystemdUnit(): void {
     ["--user", "daemon-reload"],
     ["--user", "enable", "--now", SERVICE_NAME],
   ]) {
-    const result = spawnSync("systemctl", args, { stdio: "inherit", windowsHide: true });
+    const result = __serviceRuntime.spawnSync("systemctl", args, {
+      stdio: "inherit",
+      windowsHide: true,
+    });
     if (result.error) {
       throw new Error(`systemctl ${args[1]} failed: ${result.error.message}`);
     }
@@ -189,28 +250,29 @@ function installSystemdUnit(): void {
   // headless box without linger drops a user service at logout, which a Proxy
   // user service should survive. Failure is informational only.
   try {
-    spawnSync("loginctl", ["enable-linger", process.env.USER ?? homedir().split("/").pop() ?? ""], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    __serviceRuntime.spawnSync(
+      "loginctl",
+      ["enable-linger", process.env.USER ?? homeDir().split("/").pop() ?? ""],
+      { stdio: "ignore", windowsHide: true }
+    );
   } catch {
     // linger unavailable — the unit still works while logged in
   }
 }
 
 function installLaunchAgent(): void {
-  const dir = join(homedir(), "Library", "LaunchAgents");
+  const dir = join(homeDir(), "Library", "LaunchAgents");
   mkdirSync(dir, { recursive: true });
   writeFileSync(launchAgentPath(), launchAgentBody(), "utf8");
-  spawnSync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL], {
-    stdio: "ignore",
-  });
-  const result = spawnSync(
+  __serviceRuntime.spawnSync(
+    "launchctl",
+    ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL],
+    { stdio: "ignore" }
+  );
+  const result = __serviceRuntime.spawnSync(
     "launchctl",
     ["bootstrap", `gui/${process.getuid?.() ?? 501}`, launchAgentPath()],
-    {
-      stdio: "ignore",
-    }
+    { stdio: "ignore" }
   );
   if (result.error) {
     throw new Error(`launchctl bootstrap failed: ${result.error.message}`);
@@ -222,7 +284,7 @@ function installScheduledTask(): void {
   // foreground; the proxy keeps :8082 up for that user.
   const [exe, script, ...rest] = execArgs();
   const commandLine = `"${exe}" "${script}" ${rest.join(" ")}`;
-  const result = spawnSync(
+  const result = __serviceRuntime.spawnSync(
     "schtasks",
     ["/Create", "/TN", SERVICE_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", commandLine],
     { stdio: "inherit", windowsHide: true }
@@ -234,7 +296,7 @@ function installScheduledTask(): void {
 
 export function serviceStatus(): ServiceStatus {
   if (isWindows()) {
-    const result = spawnSync("schtasks", ["/Query", "/TN", SERVICE_NAME], {
+    const result = __serviceRuntime.spawnSync("schtasks", ["/Query", "/TN", SERVICE_NAME], {
       encoding: "utf8",
       windowsHide: true,
     });
@@ -246,7 +308,7 @@ export function serviceStatus(): ServiceStatus {
     const installed = existsSync(launchAgentPath());
     let running = false;
     try {
-      const result = execFileSync(
+      const result = __serviceRuntime.execFileSync(
         "launchctl",
         ["print", `gui/${process.getuid?.() ?? 501}/${MAC_LABEL}`],
         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
@@ -261,10 +323,11 @@ export function serviceStatus(): ServiceStatus {
     const installed = existsSync(systemdUnitPath());
     let running = false;
     try {
-      const result = execFileSync("systemctl", ["--user", "is-active", SERVICE_NAME], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
+      const result = __serviceRuntime.execFileSync(
+        "systemctl",
+        ["--user", "is-active", SERVICE_NAME],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+      );
       running = String(result).trim() === "active";
     } catch {
       running = false;
@@ -277,7 +340,7 @@ export function serviceStatus(): ServiceStatus {
 /** Restart a service that is already installed (a no-op path for each OS). */
 export function serviceRestart(): void {
   if (isWindows()) {
-    const result = spawnSync("schtasks", ["/Run", "/TN", SERVICE_NAME], {
+    const result = __serviceRuntime.spawnSync("schtasks", ["/Run", "/TN", SERVICE_NAME], {
       stdio: "ignore",
       windowsHide: true,
     });
@@ -285,7 +348,7 @@ export function serviceRestart(): void {
     return;
   }
   if (isMac()) {
-    const result = spawnSync(
+    const result = __serviceRuntime.spawnSync(
       "launchctl",
       ["kickstart", "-k", `gui/${process.getuid?.() ?? 501}/${MAC_LABEL}`],
       { stdio: "ignore", windowsHide: true }
@@ -294,7 +357,7 @@ export function serviceRestart(): void {
     return;
   }
   if (isLinux()) {
-    const result = spawnSync("systemctl", ["--user", "restart", SERVICE_NAME], {
+    const result = __serviceRuntime.spawnSync("systemctl", ["--user", "restart", SERVICE_NAME], {
       stdio: "inherit",
       windowsHide: true,
     });

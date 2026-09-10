@@ -1241,8 +1241,10 @@ that is intentional and never rewritten.
 
 **A free model is skipped for a whole turn after a 429.** That is the
 cooldown. `free-opencode status` or the Admin **Cooldown** panel shows when it
-returns; the first request after that window is the recheck. Restarting the
-proxy clears cooldowns.
+returns; the first request after that window is the recheck. Cooldowns are
+persisted to `~/.free-opencode/cooldowns.json`, so they survive `free-opencode
+start` and a keep-alive/service restart — a fresh proxy does not re-hit a model
+that just 402/429'd.
 
 **`free-opencode status` says the proxy is down.** Only print what is true —
 it will not invent a route. Run `free-opencode start`, or if a keep-alive
