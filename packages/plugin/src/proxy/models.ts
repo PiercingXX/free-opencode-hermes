@@ -8,7 +8,11 @@ import {
 } from "../providers/catalog.js";
 
 export type ModelRef = {
+  /** Full provider id, including `@account` suffix when account-qualified. */
   providerId: string;
+  /** Base provider id without account suffix. */
+  baseProviderId: string;
+  accountId?: string;
   model: string;
   slug: string;
 };
@@ -57,18 +61,45 @@ export function isCatalogAlias(raw: string): boolean {
 export function parseModelRef(raw: string, fallbackProvider?: string): ModelRef {
   const trimmed = stripLocalProviderPrefix(raw.trim());
   const slash = trimmed.indexOf("/");
+
   if (slash > 0) {
-    const providerId = trimmed.slice(0, slash);
+    const providerPart = trimmed.slice(0, slash);
     const model = trimmed.slice(slash + 1);
-    if (providerById(providerId) && model) {
-      return { providerId, model, slug: `${providerId}/${model}` };
+    if (!model) throw new Error(`Unrecognized model '${raw}'.`);
+    const at = providerPart.indexOf("@");
+    if (at > 0) {
+      // provider@account/model
+      const baseProviderId = providerPart.slice(0, at);
+      const accountId = providerPart.slice(at + 1);
+      if (providerById(baseProviderId)) {
+        return {
+          providerId: providerPart,
+          baseProviderId,
+          accountId,
+          model,
+          slug: `${providerPart}/${model}`,
+        };
+      }
+    } else if (providerById(providerPart)) {
+      return {
+        providerId: providerPart,
+        baseProviderId: providerPart,
+        model,
+        slug: `${providerPart}/${model}`,
+      };
     }
   }
+
   if (fallbackProvider) {
-    return { providerId: fallbackProvider, model: trimmed, slug: `${fallbackProvider}/${trimmed}` };
+    return {
+      providerId: fallbackProvider,
+      baseProviderId: fallbackProvider,
+      model: trimmed,
+      slug: `${fallbackProvider}/${trimmed}`,
+    };
   }
   throw new Error(
-    `Unrecognized model '${raw}'. Use provider/model, e.g. groq/llama-3.3-70b-versatile.`
+    `Unrecognized model '${raw}'. Use provider/model or provider@account/model, e.g. groq/llama-3.3-70b-versatile.`
   );
 }
 
@@ -109,7 +140,7 @@ export function listedModel(
   const row: ListedModel = {
     id,
     object: "model",
-    owned_by: providerId,
+    owned_by: providerId.split("@")[0],
     display_name: displayName,
     created: 0,
     created_at: DISCOVERED_CREATED_AT,

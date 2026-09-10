@@ -6,6 +6,12 @@ import { DEFAULT_HOST, DEFAULT_PORT, settingsPath, stateDir } from "../paths.js"
 import { allProviders, providerById } from "../providers/catalog.js";
 import { suggestedBaseUrl, type FoundHost } from "../providers/inventory.js";
 
+export type Account = {
+  providerId: string;
+  id: string;
+  label?: string;
+};
+
 export type Settings = {
   version: 1;
   listen: { host: string; port: number };
@@ -19,6 +25,8 @@ export type Settings = {
   /** Last successful model list from Connect / probe, keyed by provider id. */
   discovered: Record<string, string[]>;
   foundHosts: FoundHost[];
+  /** Optional named accounts per provider (compound provider@account ids). */
+  accounts: Account[];
 };
 
 export function emptySettings(): Settings {
@@ -34,6 +42,7 @@ export function emptySettings(): Settings {
     enabled: {},
     discovered: {},
     foundHosts: [],
+    accounts: [],
   };
 }
 
@@ -55,6 +64,22 @@ function asNestedStringMap(value: unknown): Record<string, Record<string, string
   const out: Record<string, Record<string, string>> = {};
   for (const [k, v] of Object.entries(asRecord(value))) {
     out[k] = asStringMap(v);
+  }
+  return out;
+}
+
+const ACCOUNT_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
+
+function asAccountList(value: unknown): Account[] {
+  const out: Account[] = [];
+  if (!Array.isArray(value)) return out;
+  for (const row of value) {
+    const rec = asRecord(row);
+    const providerId = typeof rec.providerId === "string" ? rec.providerId.trim() : "";
+    const id = typeof rec.id === "string" ? rec.id.trim() : "";
+    if (!providerId || !id || !ACCOUNT_ID_PATTERN.test(id)) continue;
+    const label = typeof rec.label === "string" && rec.label.trim() ? rec.label.trim() : undefined;
+    out.push({ providerId, id, ...(label ? { label } : {}) });
   }
   return out;
 }
@@ -98,6 +123,7 @@ export function normalizeSettings(raw: unknown): Settings {
           .map((row) => asFoundHost(row))
           .filter((row): row is FoundHost => row !== null)
       : [],
+    accounts: asAccountList(obj.accounts),
   };
 }
 
@@ -155,9 +181,19 @@ export function applyEnvOverrides(settings: Settings): Settings {
     enabled: { ...settings.enabled },
     discovered: { ...settings.discovered },
     foundHosts: [...(settings.foundHosts ?? [])],
+    accounts: [...(settings.accounts ?? [])],
   };
   for (const provider of allProviders()) {
     if (next.enabled[provider.id] === false) continue;
+    // Account-qualified provider instances (`provider@account`) do not inherit
+    // environment keys — a shared env var would collapse account isolation.
+    if (provider.baseProviderId && provider.id.includes("@")) {
+      if (provider.local && !next.extra[provider.id]?.baseUrl) {
+        const hint = suggestedBaseUrl(provider.id);
+        if (hint) next.extra[provider.id] = { ...next.extra[provider.id], baseUrl: hint };
+      }
+      continue;
+    }
     if (provider.env) {
       const fromEnv = process.env[provider.env]?.trim();
       if (fromEnv && !next.keys[provider.id]) next.keys[provider.id] = fromEnv;
@@ -230,12 +266,22 @@ export function setProviderKey(
   key: string,
   extra?: Record<string, string>
 ): Settings {
+  // Auto-register an account entry for provider@account ids.
+  const accounts = [...(settings.accounts ?? [])];
+  const { provider } = splitAccountQualifier(providerId);
+  if (isAccountQualified(providerId)) {
+    const accountId = providerId.slice(provider.length + 1);
+    if (!accounts.some((a) => a.providerId === provider && a.id === accountId)) {
+      accounts.push({ providerId: provider, id: accountId });
+    }
+  }
   const next: Settings = {
     ...settings,
     keys: { ...settings.keys },
     extra: { ...settings.extra },
     enabled: { ...settings.enabled, [providerId]: true },
     discovered: { ...settings.discovered },
+    accounts,
   };
   if (key.trim()) next.keys[providerId] = key.trim();
   if (extra && Object.keys(extra).length > 0) {
@@ -305,6 +351,7 @@ export function applyAdminSettingsPatch(settings: Settings, patch: AdminSettings
     enabled: { ...settings.enabled },
     discovered: { ...settings.discovered },
     foundHosts: [...(settings.foundHosts ?? [])],
+    accounts: [...(settings.accounts ?? [])],
   };
   if (typeof patch.model === "string" || patch.model === null) {
     next.model = typeof patch.model === "string" && patch.model.trim() ? patch.model.trim() : null;
@@ -360,5 +407,100 @@ export function removeProvider(settings: Settings, providerId: string): Settings
     model = fallbacks[0] ?? null;
   }
   const foundHosts = (settings.foundHosts ?? []).filter((host) => host.id !== providerId);
-  return { ...settings, keys, extra, discovered, enabled, fallbacks, model, foundHosts };
+  // If this was an account-expanded provider (provider@account), drop its account entry too.
+  const accounts = (settings.accounts ?? []).filter(
+    (account) => `${account.providerId}@${account.id}` !== providerId
+  );
+  return {
+    ...settings,
+    keys,
+    extra,
+    discovered,
+    enabled,
+    fallbacks,
+    model,
+    foundHosts,
+    accounts,
+  };
+}
+
+/** True if the given provider id contains an @ account qualifier. */
+export function isAccountQualified(providerId: string): boolean {
+  return providerId.includes("@");
+}
+
+/** Split `provider@account` into `{ provider, account }`, or the bare provider. */
+export function splitAccountQualifier(providerId: string): {
+  provider: string;
+  account: string | null;
+} {
+  const at = providerId.indexOf("@");
+  if (at <= 0) return { provider: providerId, account: null };
+  return { provider: providerId.slice(0, at), account: providerId.slice(at + 1) };
+}
+
+/** Build the compound id `provider@account`. */
+export function accountProviderId(provider: string, account: string): string {
+  return `${provider}@${account}`;
+}
+
+/**
+ * Add a new account for a provider. Returns the compound provider id
+ * (`provider@account`) and the updated settings. The id must be unique within
+ * that provider and must be slug-safe.
+ */
+export function addAccount(
+  settings: Settings,
+  providerId: string,
+  accountId: string,
+  label?: string
+): { settings: Settings; providerId: string } {
+  const id = accountId.trim();
+  if (!ACCOUNT_ID_PATTERN.test(id)) {
+    throw new Error("accountId must be a slug: letters, digits, _ and -");
+  }
+  const accounts = [...(settings.accounts ?? [])];
+  const existing = accounts.find((a) => a.providerId === providerId && a.id === id);
+  if (existing) {
+    // idempotent — update the label if provided
+    if (label !== undefined && label.trim()) {
+      return {
+        settings: {
+          ...settings,
+          accounts: accounts.map((a) =>
+            a.providerId === providerId && a.id === id ? { ...a, label: label.trim() } : a
+          ),
+        },
+        providerId: accountProviderId(providerId, id),
+      };
+    }
+    return { settings, providerId: accountProviderId(providerId, id) };
+  }
+  accounts.push({ providerId, id, ...(label?.trim() ? { label: label.trim() } : {}) });
+  return {
+    settings: { ...settings, accounts },
+    providerId: accountProviderId(providerId, id),
+  };
+}
+
+/** List the account ids configured for a provider. Empty array means default single-account. */
+export function accountIdsFor(settings: Settings, providerId: string): string[] {
+  return (settings.accounts ?? []).filter((a) => a.providerId === providerId).map((a) => a.id);
+}
+
+/** Whether an account id for a provider is already configured. */
+export function accountIdExists(
+  settings: Settings,
+  providerId: string,
+  accountId: string
+): boolean {
+  return (settings.accounts ?? []).some((a) => a.providerId === providerId && a.id === accountId);
+}
+
+/** Safe base id for a newly minted auto account (a2, a3, ...). */
+export function nextAutoAccountId(settings: Settings, providerId: string): string {
+  const existing = new Set(accountIdsFor(settings, providerId));
+  let n = 2;
+  while (existing.has(`a${n}`)) n += 1;
+  return `a${n}`;
 }

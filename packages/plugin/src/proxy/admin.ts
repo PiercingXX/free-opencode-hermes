@@ -257,7 +257,11 @@ export function adminPage(): string {
             (p.ready && p.discovered && p.discovered.length ? (p.discovered.length + " models") : "not checked") +
           "</span>" +
           link +
-        "</div>" + found + "</div>";
+        "</div>" + found +
+        (p.account === null && !p.local
+          ? '<div class="row" style="margin-top:8px"><input data-account-id="' + esc(p.id) + '" placeholder="account name (e.g. work)" style="flex:1" /><button type="button" class="secondary" data-add-account="' + esc(p.id) + '">Add account</button></div>'
+          : "") +
+        "</div>";
     }
     function extraFromCard(id) {
       const extra = {};
@@ -334,6 +338,34 @@ export function adminPage(): string {
       }
     }
     document.addEventListener("click", async (event) => {
+      const addAccountBtn = event.target.closest("[data-add-account]");
+      if (addAccountBtn) {
+        const id = addAccountBtn.getAttribute("data-add-account");
+        if (!id) return;
+        const input = document.querySelector('[data-account-id="' + id + '"]');
+        const accountId = input ? input.value.trim() : "";
+        if (!accountId) {
+          $("message").textContent = "Enter an account name (e.g. work).";
+          $("message").className = "bad";
+          return;
+        }
+        addAccountBtn.disabled = true;
+        try {
+          await api("/admin/api/account", {
+            method: "POST",
+            body: JSON.stringify({ providerId: id, accountId })
+          });
+          $("message").textContent = "Added " + id + "@" + accountId + ". Configure its key in the new card.";
+          $("message").className = "ok";
+          await load();
+        } catch (err) {
+          $("message").textContent = err.message;
+          $("message").className = "bad";
+        } finally {
+          addAccountBtn.disabled = false;
+        }
+        return;
+      }
       const connectBtn = event.target.closest("[data-connect]");
       if (connectBtn) {
         await probeOrConnect(connectBtn, "/admin/api/connect");

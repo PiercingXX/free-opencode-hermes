@@ -4,14 +4,17 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import {
+  addAccount,
   applyEnvOverrides,
   connectProvider,
+  isAccountQualified,
   isProviderConfigured,
   loadSettings,
   readyProviderIds,
   removeProvider,
   saveSettings,
   setProviderKey,
+  splitAccountQualifier,
 } from "./config/settings.js";
 import { launchHermes } from "./launchers/hermes.js";
 import { launchOpenCode } from "./launchers/opencode.js";
@@ -36,12 +39,13 @@ Usage:
   free-opencode start [--foreground]
   free-opencode stop
   free-opencode status
-  free-opencode connect [provider-id]
+  free-opencode connect [provider-id[@account-id]] [--account <label>]
   free-opencode autofind
-  free-opencode remove [provider-id]
+  free-opencode remove [provider-id[@account-id]]
   free-opencode models [--free]
   free-opencode set-model <provider/model>
   free-opencode set-fallback <provider/model> [...]
+  free-opencode accounts [provider-id]
   free-opencode admin
   free-opencode opencode [args...]
   free-opencode hermes [args...]
@@ -123,19 +127,22 @@ function formatConnectRow(p: ReturnType<typeof allProviders>[number]): string {
 async function cmdConnect(providerId?: string): Promise<void> {
   const catalog = allProviders().filter((p) => !p.unsupported);
   if (!providerId) {
-    const local = catalog.filter((p) => p.local);
-    const cloud = catalog.filter((p) => !p.local && p.env);
+    const local = catalog.filter((p) => p.local && !isAccountQualified(p.id));
+    const cloud = catalog.filter((p) => !p.local && p.env && !isAccountQualified(p.id));
     console.log("Self-hosted (Connect probes the URL and lists models):\n");
     console.log(local.map(formatConnectRow).join("\n"));
     console.log("\nCloud (paste an API key):\n");
     console.log(cloud.map(formatConnectRow).join("\n"));
     console.log("\nThen: free-opencode connect ollama");
     console.log("      free-opencode connect tailscale_sglang");
+    console.log("      free-opencode connect open_router@work");
+    console.log("      free-opencode connect open_router --account work");
     return;
   }
-  const provider = providerById(providerId);
+  const { provider: baseProviderId, account } = splitAccountQualifier(providerId);
+  const provider = providerById(baseProviderId);
   if (!provider || provider.unsupported) {
-    console.error(`Unknown provider '${providerId}'`);
+    console.error(`Unknown provider '${baseProviderId}'`);
     process.exit(1);
   }
   if (provider.credentialUrl) console.log(`Key URL: ${provider.credentialUrl}`);
@@ -158,25 +165,47 @@ async function cmdConnect(providerId?: string): Promise<void> {
         process.exit(1);
       }
     }
-    if (provider.local) {
-      let settings = applyEnvOverrides(loadSettings());
-      settings = {
-        ...settings,
-        extra: { ...settings.extra, [provider.id]: { ...settings.extra[provider.id], ...extra } },
-      };
-      const probed = await probeProvider(settings, provider);
-      if (!probed.ok) {
-        console.error(`Could not reach ${provider.name} at ${probed.baseUrl}: ${probed.error}`);
+    let settings = applyEnvOverrides(loadSettings());
+    // If the user gave an account-qualified provider, ensure the account exists
+    if (account) {
+      try {
+        const result = addAccount(settings, baseProviderId, account);
+        settings = result.settings;
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
         process.exit(1);
       }
-      settings = connectProvider(settings, provider.id, extra, probed.models);
+    }
+    const resolvedProviderId = account ? `${baseProviderId}@${account}` : baseProviderId;
+    const resolvedProvider = providerById(resolvedProviderId) ?? provider;
+
+    if (resolvedProvider.local) {
+      settings = {
+        ...settings,
+        extra: {
+          ...settings.extra,
+          [resolvedProviderId]: {
+            ...settings.extra[resolvedProviderId],
+            ...extra,
+          },
+        },
+      };
+      const probed = await probeProvider(settings, resolvedProvider);
+      if (!probed.ok) {
+        console.error(
+          `Could not reach ${resolvedProvider.name} at ${probed.baseUrl}: ${probed.error}`
+        );
+        process.exit(1);
+      }
+      settings = connectProvider(settings, resolvedProviderId, extra, probed.models);
       saveSettings(settings);
-      console.log(`Connected ${provider.id} at ${probed.baseUrl}`);
+      console.log(`Connected ${resolvedProviderId} at ${probed.baseUrl}`);
       if (probed.models.length === 0)
         console.log("No models listed. Pull or load one, then connect again.");
       else {
         console.log(`Models (${probed.models.length}):`);
-        for (const model of probed.models.slice(0, 20)) console.log(`  ${provider.id}/${model}`);
+        for (const model of probed.models.slice(0, 20))
+          console.log(`  ${resolvedProviderId}/${model}`);
         if (probed.models.length > 20) console.log(`  … ${probed.models.length - 20} more`);
       }
       console.log(`Default model: ${settings.model ?? "(unset)"}`);
@@ -191,9 +220,9 @@ async function cmdConnect(providerId?: string): Promise<void> {
       console.error("No key entered.");
       process.exit(1);
     }
-    const settings = setProviderKey(applyEnvOverrides(loadSettings()), provider.id, key, extra);
+    settings = setProviderKey(settings, resolvedProviderId, key, extra);
     saveSettings(settings);
-    console.log(`Saved ${provider.id}. Default model: ${settings.model ?? "(unchanged)"}`);
+    console.log(`Saved ${resolvedProviderId}. Default model: ${settings.model ?? "(unchanged)"}`);
   } finally {
     rl.close();
   }
@@ -234,20 +263,23 @@ function cmdRemove(providerId?: string): void {
       console.log(`  ${p.id.padEnd(24)} ${ready.padEnd(6)}  ${p.name}`);
     }
     console.log("\nThen: free-opencode remove nvidia_nim");
+    console.log("      free-opencode remove open_router@work");
     return;
   }
-  const provider = providerById(providerId);
+  const { provider: baseProviderId, account } = splitAccountQualifier(providerId);
+  const provider = providerById(baseProviderId);
   if (!provider || provider.unsupported) {
-    console.error(`Unknown provider '${providerId}'`);
+    console.error(`Unknown provider '${baseProviderId}'`);
     process.exit(1);
   }
-  if (!isProviderConfigured(settings, provider.id)) {
-    console.log(`${provider.id} is not saved.`);
+  const resolvedProviderId = account ? `${baseProviderId}@${account}` : baseProviderId;
+  if (!isProviderConfigured(settings, resolvedProviderId)) {
+    console.log(`${resolvedProviderId} is not saved.`);
     return;
   }
-  const next = removeProvider(settings, provider.id);
+  const next = removeProvider(settings, resolvedProviderId);
   saveSettings(next);
-  console.log(`Removed ${provider.id}.`);
+  console.log(`Removed ${resolvedProviderId}.`);
   console.log(`Default model: ${next.model ?? "(unset)"}`);
   console.log(`Fallbacks: ${next.fallbacks.join(", ") || "(none)"}`);
   console.log(`Ready: ${readyProviderIds(next).join(", ") || "(none)"}`);
@@ -284,6 +316,25 @@ function cmdSetFallback(slugs: string[]): void {
   console.log(`Fallbacks: ${slugs.join(", ")}`);
 }
 
+function cmdAccounts(targetProvider?: string): void {
+  const settings = applyEnvOverrides(loadSettings());
+  const accounts = settings.accounts ?? [];
+  const rows = targetProvider ? accounts.filter((a) => a.providerId === targetProvider) : accounts;
+  if (rows.length === 0) {
+    console.log(
+      targetProvider
+        ? `No accounts for ${targetProvider}. Add one: free-opencode connect ${targetProvider}@<name>`
+        : "No named accounts. Add one: free-opencode connect open_router@work"
+    );
+    return;
+  }
+  for (const account of rows) {
+    console.log(
+      `  ${account.providerId}@${account.id}${account.label ? `  (${account.label})` : ""}`
+    );
+  }
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "start":
@@ -295,9 +346,27 @@ switch (cmd) {
   case "status":
     await cmdStatus();
     break;
-  case "connect":
-    await cmdConnect(rest[0]);
+  case "connect": {
+    let accountFlag: string | undefined;
+    let connectTarget: string | undefined;
+    const args = rest.slice();
+    const flagIndex = args.findIndex((a) => a === "--account" || a === "-a");
+    if (flagIndex >= 0) {
+      accountFlag = args[flagIndex + 1];
+      args.splice(flagIndex, flagIndex + 1 <= args.length ? 2 : 1);
+    }
+    connectTarget = args[0];
+    // If --account was given but the target already embeds an @, that wins.
+    // Otherwise append @account to the bare provider.
+    if (accountFlag && connectTarget && !connectTarget.includes("@")) {
+      connectTarget = `${connectTarget}@${accountFlag}`;
+    } else if (accountFlag && !connectTarget) {
+      console.error("--account requires a provider id");
+      process.exit(1);
+    }
+    await cmdConnect(connectTarget);
     break;
+  }
   case "autofind":
     await cmdAutofind();
     break;
@@ -314,6 +383,9 @@ switch (cmd) {
     break;
   case "set-fallback":
     cmdSetFallback(rest);
+    break;
+  case "accounts":
+    cmdAccounts(rest[0]);
     break;
   case "admin":
     {

@@ -16,6 +16,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved tree if symlink creation is denied, and treats Git symlink
   placeholders as the directories they name.
 
+- **Named accounts per provider.** Optional `provider@account` ids (e.g.
+  `open_router@work`) so one provider can hold more than one key. Admin
+  "Add account", CLI `connect open_router@work`, and model refs
+  `open_router@work/qwen/qwen3-coder:free`.
+
 - **B.ai provider.** Admin lists it as **B.ai** (`bai`) with a filter box.
   Connect on the card saves the key (`BAI_API_KEY`, `https://api.b.ai/v1`).
   Reinstall stops then starts the proxy so an old Admin process cannot keep
@@ -168,7 +173,7 @@ fixes that followed are recorded in `MANUAL.md` §11.
     six-series chart had no legal route: `color.md` caps `--accent` at 2 visible
     uses, `accent-overuse` fires at 6, `raw-hex` fires at 12, and no categorical
     tokens existed anywhere in the pack. The ruling — series colour is an
-    *identity* role, accent colour an *attention* role, so the accent cap never
+    _identity_ role, accent colour an _attention_ role, so the accent cap never
     applied to `--series-N` — leaves `color.md` unedited and uncontradicted.
     Carries the validation thresholds and the token contract, not a palette.
   - **`craft/responsive.md`** — the rulebook behind a gate that already warns

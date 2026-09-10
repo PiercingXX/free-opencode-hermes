@@ -110,8 +110,9 @@ export function sanitizeChatPayload(
     const tools = normalizeChatTools(payload.tools);
     if (tools) payload.tools = tools;
   }
+  const baseProvider = providerId?.split("@")[0] ?? providerId;
   if (
-    providerId === "nvidia_nim" &&
+    baseProvider === "nvidia_nim" &&
     body.chat_template_kwargs === undefined &&
     !wantsReasoning(body)
   ) {

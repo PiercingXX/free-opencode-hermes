@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  addAccount,
   applyAdminSettingsPatch,
   applyEnvOverrides,
   connectProvider,
@@ -16,6 +17,7 @@ import {
   removeProvider,
   saveSettings,
   setProviderKey,
+  splitAccountQualifier,
 } from "./config/settings.js";
 import {
   catalogIds,
@@ -463,4 +465,106 @@ test("429 and 5xx are retryable, 401 is not", () => {
   assert.equal(isRetryableStatus(429), true);
   assert.equal(isRetryableStatus(503), true);
   assert.equal(isRetryableStatus(401), false);
+});
+
+test("parseModelRef splits provider@account/model", () => {
+  const ref = parseModelRef("open_router@work/qwen/qwen3-coder:free");
+  assert.equal(ref.providerId, "open_router@work");
+  assert.equal(ref.baseProviderId, "open_router");
+  assert.equal(ref.accountId, "work");
+  assert.equal(ref.model, "qwen/qwen3-coder:free");
+  assert.equal(ref.slug, "open_router@work/qwen/qwen3-coder:free");
+});
+
+test("splitAccountQualifier separates provider from account", () => {
+  assert.deepEqual(splitAccountQualifier("open_router@work"), {
+    provider: "open_router",
+    account: "work",
+  });
+  assert.deepEqual(splitAccountQualifier("open_router"), {
+    provider: "open_router",
+    account: null,
+  });
+});
+
+test("addAccount rejects a non-slug account id", () => {
+  assert.throws(() => addAccount(emptySettings(), "open_router", "work key"));
+  assert.throws(() => addAccount(emptySettings(), "open_router", "@work"));
+  assert.throws(() => addAccount(emptySettings(), "open_router", ""));
+});
+
+test("addAccount registers an account and is idempotent", () => {
+  const r1 = addAccount(emptySettings(), "open_router", "work");
+  assert.equal(r1.providerId, "open_router@work");
+  assert.equal(r1.settings.accounts.length, 1);
+  const r2 = addAccount(r1.settings, "open_router", "work", "Work key");
+  assert.equal(r2.settings.accounts.length, 1);
+  assert.equal(r2.settings.accounts[0].label, "Work key");
+  const r3 = addAccount(r2.settings, "open_router", "personal");
+  assert.equal(r3.settings.accounts.length, 2);
+});
+
+function withHomeDir(fn: (home: string) => void): void {
+  const home = mkdtempSync(join(tmpdir(), "foc-acct-"));
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    fn(home);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+  }
+}
+
+test("account-qualified provider ids stay independent in routing keys", () => {
+  withHomeDir(() => {
+    let settings = emptySettings();
+    const withWork = addAccount(settings, "open_router", "work");
+    settings = withWork.settings;
+    settings = setProviderKey(settings, "open_router@work", "key_work");
+    saveSettings(settings);
+    assert.equal(settings.keys["open_router@work"], "key_work");
+    assert.equal(settings.keys["open_router"], undefined);
+    assert.ok(isProviderReady(settings, "open_router@work"));
+    assert.equal(isProviderReady(settings, "open_router"), false);
+  });
+});
+
+test("providerById resolves account-qualified ids", () => {
+  withHomeDir(() => {
+    let settings = emptySettings();
+    const { settings: withAcct } = addAccount(settings, "open_router", "work");
+    settings = setProviderKey(withAcct, "open_router@work", "key_work");
+    saveSettings(settings);
+    const provider = providerById("open_router@work");
+    assert.ok(provider);
+    assert.equal(provider.id, "open_router@work");
+    assert.equal(provider.name.includes("work"), true);
+    assert.equal(provider.baseProviderId, "open_router");
+    // base still resolves
+    assert.ok(providerById("open_router"));
+  });
+});
+
+test("removeProvider drops an account-qualified provider and its account entry", () => {
+  withHomeDir(() => {
+    let settings = emptySettings();
+    const { settings: withAcct } = addAccount(settings, "open_router", "work");
+    settings = setProviderKey(withAcct, "open_router@work", "key_work");
+    const without = removeProvider(settings, "open_router@work");
+    assert.equal(without.keys["open_router@work"], undefined);
+    assert.equal(without.enabled["open_router@work"], false);
+    assert.equal(without.accounts.length, 0);
+  });
+});
+
+test("defaultListedModels includes account-qualified ids", () => {
+  withHomeDir(() => {
+    let settings = emptySettings();
+    const { settings: withAcct } = addAccount(settings, "groq", "work");
+    settings = setProviderKey(withAcct, "groq@work", "gsk_test");
+    saveSettings(settings);
+    const models = defaultListedModels(settings);
+    assert.ok(models.some((row) => row.id.startsWith("groq@work/")));
+  });
 });

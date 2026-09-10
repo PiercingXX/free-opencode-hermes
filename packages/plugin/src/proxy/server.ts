@@ -4,6 +4,7 @@ import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  addAccount,
   applyAdminSettingsPatch,
   applyEnvOverrides,
   connectProvider,
@@ -190,29 +191,42 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
           model: settings.model,
           fallbacks: settings.fallbacks,
           models,
+          accounts: settings.accounts ?? [],
           catalog: allProviders()
             .filter((p) => isAdminListed(settings, p.id))
-            .map((p) => ({
-              id: p.id,
-              name: p.name,
-              env: p.env,
-              local: Boolean(p.local),
-              notes: p.notes ?? "",
-              credentialUrl: p.credentialUrl,
-              defaultBaseUrl: p.defaultBaseUrl ?? "",
-              extra: providerExtraFields(p).map((field) => ({
-                key: field.key,
-                label: field.label,
-                placeholder:
-                  field.placeholder ||
-                  (field.key === "baseUrl" ? suggestedBaseUrl(p.id) || p.defaultBaseUrl || "" : ""),
-                required: Boolean(field.required),
-                value: settings.extra[p.id]?.[field.key] ?? "",
-              })),
-              ready: isProviderReady(settings, p.id),
-              configured: isProviderConfigured(settings, p.id),
-              discovered: settings.discovered[p.id] ?? [],
-            })),
+            .map((p) => {
+              const accountQualified = p.baseProviderId && p.id.includes("@");
+              return {
+                id: p.id,
+                name: p.name,
+                env: p.env,
+                local: Boolean(p.local),
+                notes: p.notes ?? "",
+                credentialUrl: p.credentialUrl,
+                defaultBaseUrl: p.defaultBaseUrl ?? "",
+                extra: providerExtraFields(p).map((field) => ({
+                  key: field.key,
+                  label: field.label,
+                  placeholder:
+                    field.placeholder ||
+                    (field.key === "baseUrl"
+                      ? suggestedBaseUrl(p.id) || p.defaultBaseUrl || ""
+                      : ""),
+                  required: Boolean(field.required),
+                  value: settings.extra[p.id]?.[field.key] ?? "",
+                })),
+                ready: isProviderReady(settings, p.id),
+                configured: isProviderConfigured(settings, p.id),
+                discovered: settings.discovered[p.id] ?? [],
+                baseProviderId: p.baseProviderId,
+                account: accountQualified
+                  ? {
+                      id: p.id.split("@")[1] ?? "",
+                      isAccount: true,
+                    }
+                  : null,
+              };
+            }),
           inventory: loadInventoryLanes().map((lane) => ({
             providerId: lane.providerId,
             label: lane.label,
@@ -256,6 +270,28 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
           };
         }
         send(res, 200, await probeProvider(overlay, provider));
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/account") {
+        const body = await readJson(req);
+        const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
+        const accountId = typeof body.accountId === "string" ? body.accountId.trim() : "";
+        const label = typeof body.label === "string" ? body.label.trim() : undefined;
+        if (!providerId || !accountId) {
+          send(res, 400, { error: { message: "providerId and accountId are required" } });
+          return;
+        }
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(accountId)) {
+          send(res, 400, {
+            error: { message: "accountId must be a slug: letters, digits, _ and -" },
+          });
+          return;
+        }
+        const result = addAccount(settings, providerId, accountId, label);
+        settings = result.settings;
+        persist();
+        send(res, 200, { ok: true, providerId: result.providerId, accounts: settings.accounts });
         return;
       }
 

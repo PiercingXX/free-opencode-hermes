@@ -189,14 +189,16 @@ export function foundHostProviders(): ProviderDescriptor[] {
 }
 
 export function suggestedBaseUrl(providerId: string): string {
-  const lane = loadInventoryLanes().find((row) => row.providerId === providerId);
+  const compound = providerId.includes("@");
+  const baseProviderId = compound ? providerId.split("@")[0] : providerId;
+  const lane = loadInventoryLanes().find((row) => row.providerId === baseProviderId);
   if (lane) return lane.endpoint;
   const enabled = loadInventoryLanes().filter((row) => row.enabled);
-  if (providerId === "tailscale_ollama") {
+  if (baseProviderId === "tailscale_ollama") {
     const hit = enabled.find((row) => row.kind === "ollama" && row.scope === "tailscale");
     return hit?.endpoint ?? "";
   }
-  if (providerId === "tailscale_sglang") {
+  if (baseProviderId === "tailscale_sglang") {
     const hit = enabled.find((row) => row.kind === "sglang" && row.scope === "tailscale");
     return hit?.endpoint ?? "";
   }
