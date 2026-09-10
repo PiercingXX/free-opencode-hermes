@@ -1,5 +1,5 @@
 import { isProviderReady, type Settings } from "../config/settings.js";
-import { allProviders, providerById } from "../providers/catalog.js";
+import { allProviders, providerById, type ProviderDescriptor } from "../providers/catalog.js";
 import { isCooldowned, clearCooldown, parseRetryAfterHeader, recordCooldown } from "./cooldown.js";
 import {
   isCatalogAlias,
@@ -108,29 +108,34 @@ export function routeTargets(settings: Settings, requestedModel: string): ModelR
     else adminCloudPaid.push(raw);
   }
 
+  // Free cloud always leads: the Admin free default/fallbacks first, then any
+  // other ready provider's free listing. On catalog-alias traffic this free
+  // pass precedes *every* paid slug, so a paid Admin default (e.g. NIM) never
+  // outranks a connected free OpenRouter / Zen model when no fallback is set.
   for (const raw of adminCloudFree) push(raw);
-  for (const raw of adminCloudPaid) push(raw);
+
+  const readyCloudProviders = (): ProviderDescriptor[] =>
+    allProviders().filter((p) => !p.local && isProviderReady(settings, p.id));
 
   if (aliasRequest) {
-    // Enumerate every ready cloud provider (free first, then paid).
-    for (const freeFirst of [true, false]) {
-      for (const provider of allProviders()) {
-        if (provider.local || !isProviderReady(settings, provider.id)) continue;
-        for (const model of listedModelsForProvider(settings, provider)) {
-          const ref = parseOrNull(`${provider.id}/${model}`);
-          if (!ref) continue;
-          if (seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
-          // Check if model is free using discovered model listing if available
-          // For catalog-alias traffic, always prioritize connected free providers
-          const isFreeCandidate =
-            isFreeModelSlug(ref) ||
-            (settings.discovered[provider.id]?.includes(model) &&
-              // In the future, could check pricing via discovered listing
-              false);
-          if (isFreeCandidate === freeFirst) push(ref.slug);
-        }
+    for (const provider of readyCloudProviders()) {
+      for (const model of listedModelsForProvider(settings, provider)) {
+        const ref = parseOrNull(`${provider.id}/${model}`);
+        if (!ref || seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
+        if (isFreeModelSlug(ref)) push(ref.slug);
       }
     }
+    // Paid cloud after the free pass: Admin paid default then other ready paid.
+    for (const raw of adminCloudPaid) push(raw);
+    for (const provider of readyCloudProviders()) {
+      for (const model of listedModelsForProvider(settings, provider)) {
+        const ref = parseOrNull(`${provider.id}/${model}`);
+        if (!ref || seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
+        if (!isFreeModelSlug(ref)) push(ref.slug);
+      }
+    }
+  } else {
+    for (const raw of adminCloudPaid) push(raw);
   }
 
   // Self-hosted last: Admin-local default first, then every ready local box.

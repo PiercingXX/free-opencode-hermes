@@ -117,8 +117,9 @@ free models fail or are in cooldown."
 registers a per-user unit that runs `…/cli.js start --foreground` so `:8082`
 survives a new login (systemd user unit / launchd agent / per-user logon
 scheduled task — never root, never SYSTEM). `service status` / `uninstall`
-and `free-opencode stop` manage it; the service restarts on crash but not on a
-clean stop. `free-opencode log [--lines N]` tails `~/.free-opencode/proxy.log`
+and `free-opencode stop` manage it; the service survives a crash and restarts
+(Linux/macOS — see §13 for the Windows crash-restart limit) but not a clean
+stop. `free-opencode log [--lines N]` tails `~/.free-opencode/proxy.log`
 (a 5 MB rotating JSONL of route attempts / results / `proxy.start` /
 `proxy.stop` / `service.*` / `update.*` / `mcp.spawn` — keys never written).
 `free-opencode update` does `git pull --ff-only` (fails on a dirty tree),
@@ -607,13 +608,13 @@ Inside OpenCode the shipped host contract is
 `instructions` loads `shared_instructions.md`, and
 `mcp.xx-stack-platform-routing` starts the routing server. Tab primaries
 are `build`, `plan`, `research`, `fast-build`, `execution-orchestrator`,
-and `parallel-execution-orchestrator`. `execution-orchestrator` and
-`parallel-execution-orchestrator` are the long-running **unattended**
-primaries: they omit OpenCode `steps` (no tool-call cap), write todo state
-to disk, and keep going until the request is done or a hard blocker stops
-them. Parallel fan-out prefers non-GPU lanes and still runs if MCP is down.
-`npm run orchestrator-steps:check` fails if either agent regains a `steps`
-key. Slash commands live in
+and `parallel-execution-orchestrator`. Overnight / unattended: Tab
+**execution-orchestrator** (one Free OpenCode lane) or
+**parallel-execution-orchestrator** (independent slices on several lanes).
+`free-opencode overnight` / `--parallel` launches them. They omit `steps`,
+write `todo.md`, use task/supervisor MCP tools, and never treat the GPU box
+as the first hop. `npm run orchestrator-steps:check` fails if either agent
+regains a `steps` key. Slash commands live in
 `opencode-orchestration/opencode/command/`. `setup-opencode.sh` and
 `scripts/host-setup.mjs` install agents, skills, commands, and register
 the MCP server. Native OpenCode `build` / `plan` / `general` markdown is
@@ -1251,6 +1252,13 @@ service is installed check `free-opencode service status`.
 restricted boxes cannot linger. `loginctl enable-linger $USER` for a systemd
 user unit; otherwise the proxy still runs on demand with `free-opencode
 start`. The installer warns and does not fail when linger can't be set.
+
+**Keep-alive service doesn't restart the proxy after a crash (Windows).** The
+Windows scheduled task is per-user ONLOGON by design (never SYSTEM, no root).
+A SYSTEM task could restart on crash, but that is exactly what we avoid. If a
+crashed proxy on Windows leaves `:8082` down, run `free-opencode start` (or
+log off/on to re-trigger the task). Linux/macOS units restart a crashed proxy
+automatically.
 
 **`free-opencode update` refuses to run.** It is strict: it needs a git
 checkout and a clean tree (`git pull --ff-only`). Stash or commit local

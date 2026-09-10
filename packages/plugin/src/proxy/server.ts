@@ -24,7 +24,13 @@ import { adminPage } from "./admin.js";
 import { loadedConfigDefaultsToZen } from "../plugin/config.js";
 import { buildModelCatalog, modelsListPayload, parseCatalogView, probeProvider } from "./models.js";
 import { chatStreamToResponses, chatJsonToResponses, responsesBodyToChat } from "./responses.js";
-import { RouteError, routeChat, type ChatRequest, type RouteHopObserver } from "./router.js";
+import {
+  RouteError,
+  routeChat,
+  type ChatRequest,
+  type RouteHopInfo,
+  type RouteHopObserver,
+} from "./router.js";
 import {
   appendLog,
   currentLastRoute,
@@ -152,7 +158,9 @@ async function handleChat(
   requestId: string,
   home?: string
 ): Promise<void> {
+  let lastHop: RouteHopInfo | null = null;
   const onHop: RouteHopObserver = (hop) => {
+    lastHop = hop;
     void logRoute(home, { ...hop, requestId }, "route.attempt");
   };
   let routed;
@@ -161,14 +169,25 @@ async function handleChat(
   } catch (error) {
     const status = error instanceof RouteError ? error.status : null;
     const message = error instanceof Error ? error.message : String(error);
-    const last = recentRoutes()[0];
-    const slug = last?.slug ?? body.model;
-    const providerId = last?.providerId ?? "";
-    const fallback = last ? last.fallback : false;
+    // lastHop is mutated in the onHop closure, so TS narrows it to null here;
+    // the cast keeps the safest-read path without lying about the runtime state.
+    const hop: RouteHopInfo | null = lastHop as RouteHopInfo | null;
+    const slug = hop?.slug ?? body.model;
+    const providerId = hop?.providerId ?? "";
+    const fallback = hop ? hop.fallback : false;
     await logRoute(
       home,
       {
-        ...routeResult(slug, providerId, status, 0, false, fallback, last?.tried ?? [], requestId),
+        ...routeResult(
+          slug,
+          providerId,
+          status,
+          hop?.latencyMs ?? 0,
+          false,
+          fallback,
+          hop?.tried ?? [],
+          requestId
+        ),
         message,
       },
       "route.result"
@@ -177,7 +196,16 @@ async function handleChat(
   }
   await logRoute(
     home,
-    routeResult(routed.used.slug, routed.used.providerId, 200, routed.latencyMs ?? 0, true, routed.fallback ?? 0, routed.tried, requestId),
+    routeResult(
+      routed.used.slug,
+      routed.used.providerId,
+      200,
+      routed.latencyMs ?? 0,
+      true,
+      routed.fallback ?? 0,
+      routed.tried,
+      requestId
+    ),
     "route.result"
   );
   if (body.stream) {
@@ -514,7 +542,9 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
         const raw = await readJson(req);
         const chat = responsesBodyToChat(raw);
         const requestId = newRequestId();
+        let lastHop: RouteHopInfo | null = null;
         const onHop: RouteHopObserver = (hop) => {
+          lastHop = hop;
           void logRoute(home, { ...hop, requestId }, "route.attempt");
         };
         let routed;
@@ -530,18 +560,18 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
         } catch (error) {
           const status = error instanceof RouteError ? error.status : null;
           const message = error instanceof Error ? error.message : String(error);
-          const last = recentRoutes()[0];
+          const hop: RouteHopInfo | null = lastHop as RouteHopInfo | null;
           await logRoute(
             home,
             {
               ...routeResult(
-                last?.slug ?? chat.model,
-                last?.providerId ?? "",
+                hop?.slug ?? chat.model,
+                hop?.providerId ?? "",
                 status,
-                0,
+                hop?.latencyMs ?? 0,
                 false,
-                last ? last.fallback : false,
-                last?.tried ?? [],
+                hop ? hop.fallback : false,
+                hop?.tried ?? [],
                 requestId
               ),
               message,
@@ -556,9 +586,9 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
             routed.used.slug,
             routed.used.providerId,
             200,
-            0,
+            routed.latencyMs ?? 0,
             true,
-            0,
+            routed.fallback ?? 0,
             routed.tried,
             requestId
           ),

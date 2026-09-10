@@ -57,7 +57,7 @@ export function spawnDetachedProxy(): number {
   return child.pid;
 }
 
-async function waitUntilHealthy(url: string): Promise<boolean> {
+export async function waitUntilHealthy(url: string): Promise<boolean> {
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
     const health = await fetchProxyHealth(url);

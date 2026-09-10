@@ -167,14 +167,20 @@ export async function appendLog(
   }
 }
 
-/** Append a route attempt or final-outcome line and update the in-memory state. */
+/**
+ * Append a route attempt or final-outcome line and update the in-memory state.
+ * Only the final `route.result` becomes `lastRoute` / the ring; mid-request
+ * `route.attempt` lines still reach the on-disk proxy.log (tied by requestId)
+ * so you can trace fallback vs one-API looping, but the ring never holds the
+ * same hop twice for one request.
+ */
 export async function logRoute(
   home: string | undefined,
   hop: Omit<RouteHopRecord, "at"> & { at?: string },
   type: "route.attempt" | "route.result"
 ): Promise<void> {
   const record: RouteHopRecord = { ...hop, at: hop.at ?? new Date().toISOString() };
-  recordLastRoute(home, record);
+  if (type === "route.result") recordLastRoute(home, record);
   await appendLog(type, record, home);
 }
 

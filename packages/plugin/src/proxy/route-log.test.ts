@@ -102,7 +102,9 @@ test("lastRoute and recentRoutes track the latest hop", async () => {
   assert.equal(last.fallback, 1);
   const recent = recentRoutes();
   assert.equal(recent[0].slug, "open_router/b");
-  assert.equal(recent.length, 2);
+  // Only the final route.result lands in the ring — the earlier attempt above is
+  // on-disk only, so one request never double-counts the same hop.
+  assert.equal(recent.length, 1);
 });
 
 test("readLogTail returns parsed records with secrets redacted", async () => {

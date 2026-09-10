@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AddressInfo } from "node:net";
+import { createServer } from "node:http";
 
 import { connectProvider, emptySettings, saveSettings, setProviderKey } from "./config/settings.js";
 import { startProxy, waitForListen } from "./proxy/server.js";
@@ -276,6 +277,144 @@ test("admin state and health surface active cooldowns", async () => {
     assert.ok(healthBody.cooldowns.some((c) => c.slug === "open_router/openrouter/free"));
   } finally {
     await proxy.close();
+    __resetCooldowns();
+  }
+});
+
+test("lastRoute reports the winning hop with real latency after a chat request", async () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-proxy-latency-"));
+  // A real upstream server so the hop has genuine transport latency.
+  const upstream = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    // Small delay so the measured latency is never swallowed by 0ms rounding.
+    setTimeout(() => {
+      res.end(
+        JSON.stringify({ id: "ok", choices: [{ message: { role: "assistant", content: "hi" } }] })
+      );
+    }, 15);
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upAddr = upstream.address() as AddressInfo;
+  const upstreamUrl = `http://127.0.0.1:${upAddr.port}/v1`;
+
+  const settings = connectProvider(emptySettings(), "open_router", { baseUrl: upstreamUrl }, [
+    "openrouter/free",
+  ]);
+  settings.model = "open_router/openrouter/free";
+  settings.listen = { host: "127.0.0.1", port: 0 };
+  settings.proxyAuthEnabled = true;
+  saveSettings(settings, home);
+  const proxy = startProxy(settings, home);
+  await waitForListen(proxy);
+  const addr = proxy.server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    const chat = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${settings.proxyAuthToken}`,
+      },
+      body: JSON.stringify({
+        model: "open_router/openrouter/free",
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(chat.status, 200);
+
+    const health = await fetch(`${base}/health`);
+    const healthBody = (await health.json()) as {
+      lastRoute: { slug: string; latencyMs: number; fallback: number | boolean };
+    };
+    assert.ok(healthBody.lastRoute, "lastRoute should exist after a request");
+    assert.equal(healthBody.lastRoute.slug, "open_router/openrouter/free");
+    assert.ok(
+      healthBody.lastRoute.latencyMs > 0,
+      "lastRoute carries real latency, not the synthetic 0ms"
+    );
+    assert.equal(healthBody.lastRoute.fallback, 0, "primary hop reports no fallback");
+  } finally {
+    await proxy.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("lastRoute shows real latency and fallback on a hopped chat request", async () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-proxy-fallback-latency-"));
+  // One upstream that 429s the free model and answers the paid one (delayed).
+  const upstream = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(Buffer.from(c)));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      const model = JSON.parse(body).model as string;
+      if (model === "openrouter/free") {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "rate limited" } }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      setTimeout(() => {
+        res.end(
+          JSON.stringify({
+            id: "ok",
+            choices: [{ message: { role: "assistant", content: "paid" } }],
+          })
+        );
+      }, 15);
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upAddr = upstream.address() as AddressInfo;
+  const upstreamUrl = `http://127.0.0.1:${upAddr.port}/v1`;
+
+  let settings = connectProvider(emptySettings(), "open_router", { baseUrl: upstreamUrl }, [
+    "openrouter/free",
+  ]);
+  settings = setProviderKey(settings, "groq", "gsk_test");
+  settings.extra.groq = { ...settings.extra.groq, baseUrl: upstreamUrl };
+  settings.model = "open_router/openrouter/free";
+  settings.fallbacks = ["groq/llama-3.3-70b-versatile"];
+  settings.listen = { host: "127.0.0.1", port: 0 };
+  settings.proxyAuthEnabled = true;
+  saveSettings(settings, home);
+  const proxy = startProxy(settings, home);
+  await waitForListen(proxy);
+  const addr = proxy.server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    __resetCooldowns();
+    const chat = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${settings.proxyAuthToken}`,
+      },
+      body: JSON.stringify({
+        model: "free-opencode/default",
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(chat.status, 200);
+
+    const health = await fetch(`${base}/health`);
+    const healthBody = (await health.json()) as {
+      lastRoute: {
+        slug: string;
+        latencyMs: number;
+        fallback: number | boolean;
+        tried: string[];
+      };
+    };
+    assert.ok(healthBody.lastRoute);
+    assert.equal(healthBody.lastRoute.slug, "groq/llama-3.3-70b-versatile");
+    assert.ok(healthBody.lastRoute.latencyMs > 0, "real latency on the fallback hop");
+    assert.equal(healthBody.lastRoute.fallback, 1, "fallback hop must not report fallback 0");
+  } finally {
+    await proxy.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
     __resetCooldowns();
   }
 });

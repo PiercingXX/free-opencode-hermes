@@ -129,12 +129,11 @@ export function recordCooldown(
   } else if (opts.retryAfterSeconds != null && opts.retryAfterSeconds > 0) {
     delay = opts.retryAfterSeconds * 1000;
   } else {
-    // Exponential backoff: double the previous default for this slug.
-    const prevSecs =
-      base && (base.reason === "quota" || base.reason === "retryable")
-        ? (base.retryAfterSeconds ?? 0)
-        : 0;
-    const prevMs = prevSecs > 0 ? prevSecs * 1000 : 0;
+    // Exponential backoff: double the previous default for this slug. Keyed off
+    // the live entry's retryAfterSeconds (routeChat stores the upstream message
+    // as `reason`, not a fixed token), so a repeat 429 doubles instead of
+    // resetting to the 60s default.
+    const prevMs = base && base.retryAfterSeconds ? base.retryAfterSeconds * 1000 : 0;
     delay = prevMs > 0 ? Math.min(prevMs * 2, COOLDOWN_MAX_MS) : COOLDOWN_DEFAULT_MS;
   }
   const capped = Math.min(Math.max(1, delay), COOLDOWN_MAX_MS);

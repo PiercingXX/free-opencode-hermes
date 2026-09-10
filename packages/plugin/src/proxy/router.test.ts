@@ -10,7 +10,7 @@ import {
   setProviderKey,
   saveSettings,
 } from "../config/settings.js";
-import { __resetCooldowns, __setNow, recordCooldown } from "./cooldown.js";
+import { __resetCooldowns, __setNow, cooldownAvailableAt, recordCooldown } from "./cooldown.js";
 import {
   isRetryableStatus,
   isSelfHostedProvider,
@@ -58,6 +58,34 @@ test("alias route: free OpenRouter first, paid cloud, self-hosted last", () => {
   assert.ok(slugs.indexOf("groq/llama-3.3-70b-versatile") < localIdx, "cloud precedes self-hosted");
   // Self-hosted is the very last bucket.
   assert.equal(localIdx, slugs.length - 1);
+});
+
+test("alias route: paid Admin default with empty fallbacks still tries free OpenRouter first", () => {
+  __resetCooldowns();
+  // Admin default is a PAID NIM model and the fallback list is empty. A
+  // connected OpenRouter free model must still rank before that paid default
+  // on catalog-alias traffic; self-hosted stays last.
+  let settings = connectProvider(
+    emptySettings(),
+    "tailscale_sglang",
+    { baseUrl: "http://valkyrie:30000/v1" },
+    ["deepseek-v4-flash"]
+  );
+  settings.model = "nvidia_nim/nvidia/nemotron-3-super-120b-a12b";
+  settings.fallbacks = [];
+  settings = setProviderKey(settings, "open_router", "or_test");
+  settings = setProviderKey(settings, "nvidia_nim", "nim_test");
+
+  const targets = routeTargets(settings, "free-opencode/default");
+  const slugs = targets.map((t) => t.slug);
+  const freeIdx = slugs.indexOf("open_router/openrouter/free");
+  assert.ok(freeIdx >= 0, "connected OpenRouter :free should participate");
+  const nimIdx = slugs.indexOf("nvidia_nim/nvidia/nemotron-3-super-120b-a12b");
+  assert.ok(nimIdx >= 0);
+  assert.ok(freeIdx < nimIdx, "free cloud precedes a paid Admin default even with no fallbacks");
+  const localIdx = slugs.indexOf("tailscale_sglang/deepseek-v4-flash");
+  assert.ok(localIdx >= 0);
+  assert.equal(localIdx, slugs.length - 1, "self-hosted stays last");
 });
 
 test("explicit concrete local slug stays first and is never rewritten", async () => {
@@ -191,5 +219,47 @@ test("routeChat records a cooldown from a retryable upstream and answers the fal
     !next.includes("open_router/openrouter/free"),
     "cooldowned free slug is skipped next turn"
   );
+  __resetCooldowns();
+});
+
+test("routeChat repeat 429 without Retry-After doubles the cooldown backoff", async () => {
+  __resetCooldowns();
+  // Fixed clock so the backoff timeline is deterministic.
+  let nowMs = 0;
+  __setNow(() => nowMs);
+  let settings = connectProvider(
+    emptySettings(),
+    "tailscale_sglang",
+    { baseUrl: "http://valkyrie:30000/v1" },
+    ["deepseek-v4-flash"]
+  );
+  // Explicit free model; local SGLang is the last-resort answer that keeps both
+  // routeChat calls from throwing.
+  settings.model = "open_router/openrouter/free";
+  settings = setProviderKey(settings, "open_router", "or_test");
+  const home = mkdtempSync(join(tmpdir(), "foc-router-backoff-"));
+  saveSettings(settings, home);
+
+  const transport = async (attempt: RouteAttempt): Promise<Response> => {
+    if (attempt.ref.providerId === "open_router") {
+      // No Retry-After header; `reason` is the upstream message, not a token.
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+      });
+    }
+    return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+  };
+
+  const request = { model: "open_router/openrouter/free", stream: false } satisfies ChatRequest;
+
+  // First 429 cools the slug down for the default 60s.
+  await routeChat(settings, request, transport, undefined, undefined, home);
+  assert.equal(cooldownAvailableAt("open_router/openrouter/free"), 60_000);
+
+  // Fast-forward past the first window so the slug is eligible again (recheck).
+  nowMs = 61_000;
+  await routeChat(settings, request, transport, undefined, undefined, home);
+  // A second 429 with no Retry-After doubles the previous backoff → 120s.
+  assert.equal(cooldownAvailableAt("open_router/openrouter/free"), 61_000 + 120_000);
   __resetCooldowns();
 });

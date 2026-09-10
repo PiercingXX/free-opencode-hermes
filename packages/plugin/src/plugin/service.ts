@@ -9,8 +9,11 @@
  *   Linux/macOS   systemd user unit / launchd user agent
  *   Windows       a per-user logon scheduled task (never SYSTEM)
  *
- * The service restarts on crash but not on a clean stop: the CLI stop path
- * exits 0, so the unit/task/plist do not bounce it back up.
+ * Linux/macOS restart a crashed proxy (Restart=on-failure / KeepAlive) but not
+ * a clean stop: the CLI stop path exits 0, so the unit/plist do not bounce it
+ * back up. The Windows scheduled task is ONLOGON only — it does NOT restart after
+ * a crash (a restart-on-crash requires a SYSTEM task, which we deliberately do
+ * not create). See MANUAL §13.
  */
 
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
@@ -181,6 +184,17 @@ function installSystemdUnit(): void {
     if (result.error) {
       throw new Error(`systemctl ${args[1]} failed: ${result.error.message}`);
     }
+  }
+  // Best-effort: keep the user unit alive after logout. Never requires root; a
+  // headless box without linger drops a user service at logout, which a Proxy
+  // user service should survive. Failure is informational only.
+  try {
+    spawnSync("loginctl", ["enable-linger", process.env.USER ?? homedir().split("/").pop() ?? ""], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch {
+    // linger unavailable — the unit still works while logged in
   }
 }
 

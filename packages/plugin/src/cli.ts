@@ -19,7 +19,12 @@ import {
 import { launchHermes } from "./launchers/hermes.js";
 import { launchOpenCode } from "./launchers/opencode.js";
 import { pidPath, TOKEN_ENV } from "./paths.js";
-import { localCodeBuiltAt, spawnDetachedProxy, stopDetachedProxy } from "./plugin/lifecycle.js";
+import {
+  localCodeBuiltAt,
+  spawnDetachedProxy,
+  stopDetachedProxy,
+  waitUntilHealthy,
+} from "./plugin/lifecycle.js";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./plugin/service.js";
 import { cmdUpdate } from "./plugin/update.js";
 import { applyAutofindResults, runAutofind } from "./providers/autofind.js";
@@ -47,6 +52,7 @@ Usage:
   free-opencode log [--lines <n>]
   free-opencode service install|uninstall|status
   free-opencode update
+  free-opencode overnight [--parallel]
   free-opencode opencode [args...]
   free-opencode hermes [args...]
 
@@ -56,6 +62,18 @@ Launchers (also installed as foc-opencode and foc-hermes):
   xx-hermes        Hermes against the :8180 GPU/Ollama orchestrator (separate plane)
 `);
   process.exit(1);
+}
+
+async function cmdOvernight(parallel: boolean): Promise<void> {
+  await cmdStart(false);
+  const agent = parallel ? "parallel-execution-orchestrator" : "execution-orchestrator";
+  console.log(
+    parallel
+      ? "Overnight multi-lane: independent slices across available Free OpenCode models (GPU last)."
+      : "Overnight single-lane: one Free OpenCode session (free cloud → paid → GPU last)."
+  );
+  console.log(`Agent: ${agent}`);
+  await launchOpenCode(["--agent", agent]);
 }
 
 async function cmdStart(foreground: boolean): Promise<void> {
@@ -389,18 +407,14 @@ async function cmdService(action: string | undefined): Promise<void> {
           }`
         );
       }
-      // Start a proxy now; the service keeps it alive across reboots/crashes.
+      // Give the unit/task a beat to bring the proxy up under the service. If it
+      // is still down (e.g. systemd slow, or the unit could not be created), fall
+      // back to a detached proxy. Never block on a foreground proxy here — the
+      // installers call `service install` and would otherwise hang forever.
       const settings = applyEnvOverrides(loadSettings());
-      const health = await fetchProxyHealth(
-        `http://${settings.listen.host}:${settings.listen.port}`
-      );
-      if (!health?.ok) {
-        const proxy = startProxy(settings);
-        await waitForListen(proxy);
-        const pid = spawnDetachedProxy();
-        writeFileSync(pidPath(), `${pid}\n`);
-        console.log(`Proxy http://${settings.listen.host}:${settings.listen.port} (pid ${pid})`);
-        console.log(`Admin http://${settings.listen.host}:${settings.listen.port}/admin`);
+      const url = `http://${settings.listen.host}:${settings.listen.port}`;
+      if (!(await waitUntilHealthy(url))) {
+        await cmdStart(false);
       }
       return;
     }
@@ -505,6 +519,9 @@ switch (cmd) {
     break;
   case "update":
     await cmdUpdate();
+    break;
+  case "overnight":
+    await cmdOvernight(rest.includes("--parallel"));
     break;
   case "opencode":
     await launchOpenCode(rest);

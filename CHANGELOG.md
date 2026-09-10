@@ -7,6 +7,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Overnight orchestrators.** `execution-orchestrator` is the single-lane
+  unattended builder (Free OpenCode routing, disk `todo.md`, no step cap).
+  `parallel-execution-orchestrator` fans independent slices across available
+  free/cloud lanes, GPU last. `free-opencode overnight` and
+  `free-opencode overnight --parallel` launch them. MCP task/supervisor tools
+  stay on (abort still denied).
+
+- **Orchestrator MCP tools.** `parallel-execution-orchestrator` can use
+  `task_create` and supervisor session tools (`start` / `tick` / `complete`)
+  again. Abort stays denied. The plugin forces those tools on for both
+  unattended orchestrators.
+
 - **OpenRouter 402 no longer kills the session.** Insufficient credits used to
   abort the whole hop chain (`gpt-5-nano` and similar). 402 now skips remaining
   paid slugs on that provider and continues to the next ready model so OpenCode
@@ -77,6 +89,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   until it should be back, and clears on success; cooldowns are in-memory
   (clear on restart) and surfaced on Admin, `/admin/api/state`, `/health`,
   and `free-opencode status`. Routing never edits `settings.model` on disk.
+
+- **Routing / observability refinements.** On catalog-alias traffic a connected
+  free model (OpenRouter `:free`, Zen `-free`) outranks a *paid* Admin default
+  even when the fallback list is empty. `last-route` now shows the hop that
+  answered with real latency and its real fallback index (the ring records only
+  the final result per request, so a hop is never double-counted). A repeat 429
+  without `Retry-After` doubles the cooldown backoff off the live entry rather
+  than dropping back to 60s. `free-opencode service install` no longer blocks
+  waiting on a foreground proxy; it waits briefly for `/health` and falls back
+  to a detached proxy. Windows docs note the ONLOGON task does not restart a
+  crashed proxy (see MANUAL §13).
 
 - **B.ai provider.** Admin lists it as **B.ai** (`bai`) with a filter box.
   Connect on the card saves the key (`BAI_API_KEY`, `https://api.b.ai/v1`).

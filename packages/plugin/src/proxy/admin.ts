@@ -301,9 +301,14 @@ export function adminPage(): string {
     let catalogCache = [];
     const expanded = new Set();
     function filterMatches(p, query) {
-      return !query ||
+      // Only a non-empty query expands/collapses on its own. With no filter an
+      // unused provider stays compact until clicked. This distinguishes "no
+      // filter" (all kept, unused collapsed) from "filter matches" (expanded).
+      if (!query) return false;
+      return (
         String(p.name || "").toLowerCase().indexOf(query) >= 0 ||
-        String(p.id || "").toLowerCase().indexOf(query) >= 0;
+        String(p.id || "").toLowerCase().indexOf(query) >= 0
+      );
     }
     function cardFor(p, query) {
       if (filterMatches(p, query) || expanded.has(p.id)) return card(p);
@@ -311,8 +316,15 @@ export function adminPage(): string {
     }
     function paintCatalog() {
       const query = ($("provider-filter").value || "").trim().toLowerCase();
-      const cloud = sortCatalog(catalogCache.filter((p) => !p.local)).filter((p) => filterMatches(p, query));
-      const local = sortCatalog(catalogCache.filter((p) => p.local)).filter((p) => filterMatches(p, query));
+      // No filter shows every provider (unused ones stay compact unless clicked);
+      // a filter keeps only the matches (which then expand).
+      const keepAll = !query;
+      const cloud = sortCatalog(catalogCache.filter((p) => !p.local)).filter(
+        (p) => keepAll || filterMatches(p, query)
+      );
+      const local = sortCatalog(catalogCache.filter((p) => p.local)).filter(
+        (p) => keepAll || filterMatches(p, query)
+      );
       $("local-providers").innerHTML = local.map((p) => cardFor(p, query)).join("");
       $("providers").innerHTML = cloud.map((p) => cardFor(p, query)).join("");
     }
