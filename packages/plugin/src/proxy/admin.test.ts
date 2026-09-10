@@ -30,6 +30,13 @@ test("admin catalog keeps both local and cloud order within a bucket", () => {
   );
 });
 
+test("admin last-route template labels LOCAL hops and last-resort locals", () => {
+  const html = adminPage();
+  assert.ok(html.includes("LOCAL"));
+  assert.ok(html.includes("local last-resort"));
+  assert.ok(html.includes("last local hop"));
+});
+
 test("admin page template includes compact class and expand data for unused cards", () => {
   const html = adminPage();
   assert.ok(html.includes('class="card compact"'));

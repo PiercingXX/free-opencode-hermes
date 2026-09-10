@@ -180,7 +180,7 @@ export function adminPage(): string {
     </div>
     <div id="zen-warning" class="muted" style="display:none;font-size:12px;max-width:360px"></div>
     <div id="status" class="muted">Loading…</div>
-    <div id="last-route" class="muted" style="font-size:11px;text-align:right;max-width:340px"></div>
+    <div id="last-route" class="muted" style="font-size:11px;text-align:right;max-width:520px;white-space:pre-wrap"></div>
   </header>
   <main>
     <section>
@@ -333,6 +333,7 @@ export function adminPage(): string {
     }
     async function load() {
       const data = await api("/admin/api/state");
+      catalogCache = data.catalog || [];
       $("status").textContent = "Proxy " + data.listen.host + ":" + data.listen.port;
       if (data.zenDefault) {
         $("zen-warning").style.display = "block";
@@ -341,7 +342,7 @@ export function adminPage(): string {
       } else {
         $("zen-warning").style.display = "none";
       }
-      $("last-route").textContent = "last route: " + (data.lastRoute ? formatRoute(data.lastRoute) : "(none yet)");
+      $("last-route").textContent = lastRouteHeader(data);
       const recent = data.recentRoutes || [];
       $("recent-routes").innerHTML = recent.length
         ? recent.slice(0, 20).map((r) => "<div>" + esc(formatRoute(r)) + "</div>").join("")
@@ -367,7 +368,6 @@ export function adminPage(): string {
         : "Nothing in cooldown.";
       $("model").value = data.model || "";
       $("fallbacks").value = (data.fallbacks || []).join(", ");
-      catalogCache = data.catalog || [];
       paintCatalog();
       const models = data.models || [];
       const free = models.filter((m) => m.free);
@@ -386,13 +386,35 @@ export function adminPage(): string {
           (more > 0 ? '<div class="muted">' + more + " more in the catalog</div>" : "")
         : "None yet. Connect a box or a cloud key.";
     }
+    function catalogProvider(id) {
+      return (catalogCache || []).find((p) => p.id === id);
+    }
+    function isLocalProvider(id) {
+      return Boolean(catalogProvider(id) && catalogProvider(id).local);
+    }
     function formatRoute(r) {
-      const where = r.providerId ? (r.slug + " [" + r.providerId + "]") : r.slug;
+      const p = catalogProvider(r.providerId);
+      const kind = p && p.local ? "LOCAL" : "CLOUD";
+      const name = p && p.name ? " (" + p.name + ")" : "";
       const status = r.status == null ? "transport" : r.status;
       const outcome = r.ok ? "ok" : ("failed " + status);
       const fb = (r.fallback === false || r.fallback === 0) ? "" : (" · fallback#" + r.fallback);
       const tried = (r.tried && r.tried.length > 1) ? (" · tried: " + r.tried.join("→")) : "";
-      return where + " · " + outcome + " · " + r.latencyMs + "ms" + tried + fb;
+      return kind + " " + r.slug + name + " · " + outcome + " · " + r.latencyMs + "ms" + tried + fb;
+    }
+    function lastRouteHeader(data) {
+      const r = data.lastRoute;
+      let line = "last route: " + (r ? formatRoute(r) : "(none yet)");
+      const localReady = (data.catalog || []).filter((p) => p.local && p.ready);
+      const hops = (data.recentRoutes || []).slice();
+      if (r) hops.push(r);
+      const lastLocal = hops.reverse().find((x) => isLocalProvider(x.providerId));
+      if (lastLocal && (!r || lastLocal.slug !== r.slug)) {
+        line += "\nlast local hop: " + formatRoute(lastLocal);
+      } else if (r && !isLocalProvider(r.providerId) && localReady.length) {
+        line += "\nlocal last-resort: " + localReady.map((p) => p.id).join(", ") + " (not used this hop)";
+      }
+      return line;
     }
     async function probeOrConnect(button, path) {
       const id = button.getAttribute("data-probe") || button.getAttribute("data-connect");

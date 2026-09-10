@@ -56,6 +56,16 @@ Write a short contract on disk (objective, scope, artifacts, done criteria). Gen
 
 If answers get vague or ~20+ turns: flush remaining work to `todo.md`, compact, re-read disk, continue. Do not idle after compress.
 
+## Halt (mandatory)
+
+When the request is fully done:
+
+1. Update `todo.md` so nothing actionable remains.
+2. Output **exactly one line**: `DONE: <short summary>`.
+3. **Stop.** Do not send another message. Do not confirm DONE. Do not restate commits, `verify`, or "session closed".
+
+If your previous assistant message already said DONE / session closed / nothing further / a final recap, output **only** `STOP` — no tools, no recap, no "Confirmed". Compaction "continue" after DONE is still `STOP`.
+
 ## Output
 
-Short. Lane = single overnight. Current slice. Evidence or the next action. No menus.
+Short. Lane = single overnight. Current slice. Evidence or the next action. No menus. One DONE line when finished.

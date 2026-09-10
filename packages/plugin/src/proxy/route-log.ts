@@ -79,6 +79,22 @@ export function currentLastRoute(): LastRoute | null {
   return lastRoute;
 }
 
+/** One-line last-route for Admin/CLI. `local` tags self-hosted hops (Ollama/SGLang/Tailscale). */
+export function formatRouteLine(
+  route: RouteHopRecord,
+  opts: { local?: boolean; providerName?: string } = {}
+): string {
+  const kind = opts.local ? "LOCAL" : "CLOUD";
+  const name = opts.providerName?.trim();
+  const where = name ? `${route.slug} (${name})` : route.slug;
+  const ms = `${route.latencyMs}ms`;
+  const outcome = route.ok ? "ok" : `failed ${route.status ?? "transport"}`;
+  const fallback =
+    route.fallback === false || route.fallback === 0 ? "" : ` · fallback#${route.fallback}`;
+  const tried = route.tried && route.tried.length > 1 ? ` · tried: ${route.tried.join(" → ")}` : "";
+  return `${kind} ${where} · ${outcome} · ${ms}${tried}${fallback}`;
+}
+
 export function recordLastRoute(home: string | undefined, hop: RouteHopRecord): void {
   void home;
   lastRoute = normalizeHop(hop);

@@ -17,4 +17,4 @@ Iron rules:
 - Compaction → re-read todo, continue.
 - Tools on: task_*, supervisor_start/tick/complete, foc_status. Never supervisor_abort_session.
 
-Done: todo empty of actions + deterministic evidence.
+Done: todo empty of actions + deterministic evidence. Then one line `DONE: …` and stop. Never confirm DONE or restate "session closed". After a DONE recap, output only `STOP`.

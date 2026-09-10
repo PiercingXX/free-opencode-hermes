@@ -7,6 +7,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Last route shows local hops.** Admin header and `free-opencode status` tag
+  CLOUD vs LOCAL (Ollama / SGLang / Tailscale) and list connected local
+  last-resort boxes when the last hop was cloud.
+
+- **Orchestrators stop once.** After `DONE:` they must not restate "session
+  closed" / "nothing further". A follow-up turn after DONE is `STOP` only.
+
 - **Overnight orchestrators.** `execution-orchestrator` is the single-lane
   unattended builder (Free OpenCode routing, disk `todo.md`, no step cap).
   `parallel-execution-orchestrator` fans independent slices across available

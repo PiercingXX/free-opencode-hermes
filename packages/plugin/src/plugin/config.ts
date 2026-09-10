@@ -52,6 +52,12 @@ const ORCHESTRATOR_MCP_TOOLS = [
   "route_parallel_tasks",
 ] as const;
 
+const ORCHESTRATOR_HALT =
+  "When the user request is fully done, output exactly one line starting with DONE: and stop. " +
+  "Do not send another message. Do not confirm DONE. Do not restate commit hashes, verify, or " +
+  '"session closed" / "nothing further to do". If your previous assistant message already said ' +
+  "DONE, session closed, nothing further, or a final recap, output only STOP with no tools.";
+
 function enableOrchestratorMcpTools(def: AgentConfig): void {
   const tools: Record<string, boolean> = {
     ...((def.tools as Record<string, boolean> | undefined) ?? {}),
@@ -319,6 +325,10 @@ export function applyRuntimeExtras(config: MutableConfig): void {
       agent.name === "parallel-execution-orchestrator"
     ) {
       enableOrchestratorMcpTools(merged);
+      const halt = "\n\n## Halt\n\n" + ORCHESTRATOR_HALT + "\n";
+      if (typeof merged.prompt === "string" && !merged.prompt.includes("output only STOP")) {
+        merged.prompt = merged.prompt + halt;
+      }
       const perm =
         merged.permission &&
         typeof merged.permission === "object" &&

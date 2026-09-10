@@ -57,6 +57,10 @@ Same as the single-lane orchestrator: `todo.md` on disk, no standing by, hard bl
 
 Do not claim remote GPU farm if you only ran in-process Tasks.
 
+## Halt (mandatory)
+
+When the request is fully done: one line `DONE: <short summary>`, then stop. Never confirm DONE, never restate "session closed" / "nothing further to do" / commit hashes. If you already said DONE, output only `STOP` with no tools.
+
 ## Output
 
-Short. Execute first. No menus.
+Short. Execute first. No menus. One DONE line when finished.

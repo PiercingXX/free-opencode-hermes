@@ -8,6 +8,7 @@ import { logPath } from "../paths.js";
 import { emptySettings, setProviderKey } from "../config/settings.js";
 import {
   appendLog,
+  formatRouteLine,
   __setMaxLogBytes,
   __resetRouteLog,
   currentLastRoute,
@@ -21,6 +22,30 @@ import { routeChat, type ChatRequest, type RouteAttempt, type RouteHopInfo } fro
 function tempHome(): string {
   return mkdtempSync(join(tmpdir(), "foc-log-"));
 }
+
+test("formatRouteLine tags local vs cloud hops", () => {
+  const cloud: RouteHopRecord = {
+    at: new Date().toISOString(),
+    slug: "open_router/openrouter/free",
+    providerId: "open_router",
+    status: 200,
+    latencyMs: 12,
+    ok: true,
+    fallback: false,
+    tried: ["open_router/openrouter/free"],
+  };
+  const local: RouteHopRecord = {
+    ...cloud,
+    slug: "tailscale_sglang/deepseek-v4-flash",
+    providerId: "tailscale_sglang",
+  };
+  assert.match(formatRouteLine(cloud, { providerName: "OpenRouter" }), /^CLOUD /);
+  assert.match(
+    formatRouteLine(local, { local: true, providerName: "Tailscale SGLang" }),
+    /^LOCAL /
+  );
+  assert.ok(formatRouteLine(local, { local: true }).includes("tailscale_sglang/deepseek-v4-flash"));
+});
 
 test("logRoute appends JSONL lines and never writes key material", async () => {
   const home = tempHome();

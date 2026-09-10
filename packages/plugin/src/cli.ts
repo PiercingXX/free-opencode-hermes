@@ -32,7 +32,8 @@ import { allProviders, providerById, providerExtraFields } from "./providers/cat
 import { suggestedBaseUrl } from "./providers/inventory.js";
 import { buildModelCatalog, probeProvider } from "./proxy/models.js";
 import { fetchProxyHealth, isStaleProxy, startProxy, waitForListen } from "./proxy/server.js";
-import { appendLog, readLogTail, type RouteHopRecord } from "./proxy/route-log.js";
+import { appendLog, formatRouteLine, readLogTail, type RouteHopRecord } from "./proxy/route-log.js";
+import { isSelfHostedProvider } from "./proxy/router.js";
 
 function usage(): never {
   console.log(`Free OpenCode
@@ -168,12 +169,10 @@ function printLastRoute(route: RouteHopRecord | null): void {
 
 function formatRoute(route: RouteHopRecord | null): string {
   if (!route) return "(none yet)";
-  const where = route.providerId ? `${route.slug} [${route.providerId}]` : route.slug;
-  const ms = `${route.latencyMs}ms`;
-  const outcome = route.ok ? "ok" : `failed ${route.status ?? "transport"}`;
-  const fallback =
-    route.fallback === false || route.fallback === 0 ? "" : ` · fallback#${route.fallback}`;
-  return `${where} · ${outcome} · ${ms}${route.tried && route.tried.length > 1 ? ` · tried: ${route.tried.join(" → ")}` : ""}${fallback}`;
+  return formatRouteLine(route, {
+    local: isSelfHostedProvider(route.providerId),
+    providerName: providerById(route.providerId)?.name,
+  });
 }
 
 function formatConnectRow(p: ReturnType<typeof allProviders>[number]): string {

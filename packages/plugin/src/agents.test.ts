@@ -174,6 +174,8 @@ test("applyRuntimeExtras loads xx-stack agents and leaves native build without a
   assert.equal(orchPerm?.permission?.task?.["*"], "allow");
   assert.equal(orchPerm?.mode, "primary");
   assert.match(String(orchPerm?.description ?? ""), /Overnight single-lane/);
+  const orchPrompt = config.agent?.["execution-orchestrator"] as { prompt?: string };
+  assert.match(String(orchPrompt?.prompt ?? ""), /output only STOP/);
   const parDesc = config.agent?.["parallel-execution-orchestrator"] as { description?: string };
   assert.match(String(parDesc?.description ?? ""), /Overnight multi-lane/);
 });
