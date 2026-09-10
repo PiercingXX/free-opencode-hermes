@@ -46,6 +46,12 @@ test("admin last-route template labels LOCAL hops and last-resort locals", () =>
   assert.ok(html.includes("last local hop"));
 });
 
+test("admin cardFor keeps ready/configured cards expanded", () => {
+  const html = adminPage();
+  assert.ok(html.includes("isUsed(p) || filterMatches(p, query) || expanded.has(p.id)"));
+  assert.ok(html.includes("saved — paste to replace"));
+});
+
 test("admin page template includes compact class and expand data for unused cards", () => {
   const html = adminPage();
   assert.ok(html.includes('class="card compact"'));

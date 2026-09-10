@@ -267,7 +267,9 @@ export function adminPage(): string {
     function card(p) {
       const keyField = p.local
         ? (p.notes ? '<p class="muted">' + esc(p.notes) + "</p>" : "")
-        : '<label>API key</label><input type="password" data-key="' + esc(p.id) + '" placeholder="' + esc(p.env || "API key") + '" autocomplete="off" />';
+        : '<label>API key</label><input type="password" data-key="' + esc(p.id) + '" placeholder="' +
+          (p.ready || p.configured ? "saved — paste to replace" : esc(p.env || "API key")) +
+          '" autocomplete="off" />';
       const link = p.credentialUrl ? '<a href="' + esc(p.credentialUrl) + '" target="_blank" rel="noreferrer">Get a key</a>' : "";
       const badge = p.ready
         ? '<span class="ok">' + (p.local ? "✓ connected" : "✓ configured") + "</span>"
@@ -314,7 +316,7 @@ export function adminPage(): string {
       );
     }
     function cardFor(p, query) {
-      if (filterMatches(p, query) || expanded.has(p.id)) return card(p);
+      if (isUsed(p) || filterMatches(p, query) || expanded.has(p.id)) return card(p);
       return compactCard(p);
     }
     function paintCatalog() {

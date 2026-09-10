@@ -7,6 +7,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Admin hid saved providers after refresh.** Ready/configured cards were
+  painted as compact "unused" because `cardFor` ignored `isUsed`. They stay
+  full-size; key fields show "saved — paste to replace" instead of looking
+  empty.
+
 - **Admin cloud grid blank.** Last-route's extra lines used a real newline
   inside the HTML template literal, which broke the Admin script. Cloud cards
   are back; a test now parses that inline script.
