@@ -34,7 +34,7 @@
   },
   "overrides": [
     {
-      "files": ["xx-stack/scripts/**/*.mjs", "xx-stack/scripts/**/*.js", "scripts/**/*.mjs"],
+      "files": ["xx-stack/scripts/**/*.mjs", "xx-stack/scripts/**/*.js", "xx-stack/mcp-server/**/*.mjs", "scripts/**/*.mjs"],
       "parser": "espree",
       "parserOptions": {
         "ecmaVersion": 2023,

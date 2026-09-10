@@ -26,7 +26,7 @@ import {
   providerExtraFields,
 } from "./providers/catalog.js";
 import { PROVIDER_ID } from "./paths.js";
-import { restrictToFreeOpenCodeProvider } from "./plugin/config.js";
+import { restrictToFreeOpenCodeProvider, type MutableConfig } from "./plugin/config.js";
 import {
   defaultListedModels,
   discoverProviderModels,
@@ -372,6 +372,30 @@ test("OpenCode picker is restricted to the free-opencode provider", () => {
   restrictToFreeOpenCodeProvider(config);
   assert.deepEqual(config.enabled_providers, [PROVIDER_ID]);
   assert.deepEqual(config.disabled_providers, ["gemini", "opencode"]);
+});
+
+test("config overlay rewrites a Zen default model to the catalog alias", () => {
+  const config = {
+    model: "opencode/gpt-5",
+    small_model: "opencode-zen/big-pickle",
+    provider: { opencode: {}, anthropic: {} } as Record<string, unknown>,
+  } as MutableConfig;
+  restrictToFreeOpenCodeProvider(config);
+  assert.equal(config.model, `${PROVIDER_ID}/default`);
+  assert.equal(config.small_model, `${PROVIDER_ID}/default`);
+  // The user's other provider blocks are left alone.
+  assert.ok((config.provider as Record<string, unknown>).opencode);
+  assert.ok((config.provider as Record<string, unknown>).anthropic);
+});
+
+test("config overlay keeps a user-set non-Zen model", () => {
+  const config = {
+    model: "groq/llama-3.3-70b-versatile",
+    small_model: "groq/llama-3.1-8b-instant",
+  } as MutableConfig;
+  restrictToFreeOpenCodeProvider(config);
+  assert.equal(config.model, "groq/llama-3.3-70b-versatile");
+  assert.equal(config.small_model, "groq/llama-3.1-8b-instant");
 });
 
 test("parseModelRef splits provider/model including nested ids", () => {

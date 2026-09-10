@@ -100,6 +100,31 @@ Shell equivalents of Admin: `free-opencode connect <provider>`,
 `free-opencode set-model <provider/model>`, `free-opencode set-fallback …`.
 `free-opencode autofind` probes local Ollama (and similar) endpoints.
 
+**Routing is free-first.** OpenCode sends `free-opencode/default`; on that
+alias the proxy tries free cloud (OpenRouter `:free`, Zen `*-free` /
+`big-pickle`, any connected free listing) first, then paid cloud, and only
+then self-hosted boxes (Ollama / SGLang / LM Studio, Tailscale included).
+A concrete request like `tailscale_sglang/deepseek-v4-flash` is honored
+verbatim and always tried first. When a model returns 429 / 402 / a retryable
+5xx it is marked in cooldown (Retry-After, else 60s doubling to a 30-minute
+cap) and skipped on later turns until it should be back; the first request
+after that window is the recheck. Cooldowns live in memory and clear on proxy
+restart. `free-opencode status` and the Admin **Cooldown** panel show what is
+cooled down and when it returns. Admin shows "Self-hosted is used only after
+free models fail or are in cooldown."
+
+**Keep-alive service, log, update.** `free-opencode service install`
+registers a per-user unit that runs `…/cli.js start --foreground` so `:8082`
+survives a new login (systemd user unit / launchd agent / per-user logon
+scheduled task — never root, never SYSTEM). `service status` / `uninstall`
+and `free-opencode stop` manage it; the service restarts on crash but not on a
+clean stop. `free-opencode log [--lines N]` tails `~/.free-opencode/proxy.log`
+(a 5 MB rotating JSONL of route attempts / results / `proxy.start` /
+`proxy.stop` / `service.*` / `update.*` / `mcp.spawn` — keys never written).
+`free-opencode update` does `git pull --ff-only` (fails on a dirty tree),
+reinstalls and rebuilds, re-runs host-setup, and restarts the proxy or service;
+it never force-pushes.
+
 Launchers installed next to `free-opencode`:
 
 | Command | Role |
@@ -1179,6 +1204,12 @@ the directories they name.
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
 `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.
 
+**Agent repeats the same handoff and tools are dead.** OpenCode hit
+`agent.steps` and disabled tools. Native primaries now omit `steps` (loop
+until the model stops). Start a **new** session so the overlay loads. Write
+progress to `todo.md` so a reboot can resume. Subagents still cap at 120
+calls.
+
 **`xx-stack-platform-routing` MCP error -32000 Connection closed.** OpenCode
 was spawning itself (`opencode …/mcp-server/dist/index.js`) because the
 plugin used `process.execPath`. Pull, rebuild, re-run the installer, then
@@ -1187,6 +1218,31 @@ plugin used `process.execPath`. Pull, rebuild, re-run the installer, then
 
 **Admin will not load.** `free-opencode start`, then reload
 http://127.0.0.1:8082/admin.
+
+**Traffic keeps hitting the Tailscale GPU box instead of a free model.** The
+router is free-first for `free-opencode/default`; a local default only becomes
+the answer after free and paid cloud are exhausted or in cooldown. Check
+`free-opencode status` — it prints the last route and any active cooldowns. A
+concrete request (`tailscale_sglang/deepseek-v4-flash`) is still tried first —
+that is intentional and never rewritten.
+
+**A free model is skipped for a whole turn after a 429.** That is the
+cooldown. `free-opencode status` or the Admin **Cooldown** panel shows when it
+returns; the first request after that window is the recheck. Restarting the
+proxy clears cooldowns.
+
+**`free-opencode status` says the proxy is down.** Only print what is true —
+it will not invent a route. Run `free-opencode start`, or if a keep-alive
+service is installed check `free-opencode service status`.
+
+**Keep-alive service install fails (Linux) / never runs.** Headless or
+restricted boxes cannot linger. `loginctl enable-linger $USER` for a systemd
+user unit; otherwise the proxy still runs on demand with `free-opencode
+start`. The installer warns and does not fail when linger can't be set.
+
+**`free-opencode update` refuses to run.** It is strict: it needs a git
+checkout and a clean tree (`git pull --ff-only`). Stash or commit local
+changes first; update will not clobber a dirty tree and never `reset --hard`.
 
 **OpenCode stuck on a built-in Zen model.** `foc-opencode` for that session.
 

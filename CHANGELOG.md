@@ -22,10 +22,51 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the MCP server made the client report `-32000: Connection closed`.
   Child processes now resolve a real `node`.
 
+- **Unbounded primary agents.** Native `build` / `plan` / `general` no longer
+  set OpenCode `steps`. A 120-call floor was disabling tools
+  (`CRITICAL-MAXIMUM-STEPS-REACHED`) and the model spiraled on text instead of
+  working. Subagents still get the 120 floor.
+
 - **Named accounts per provider.** Optional `provider@account` ids (e.g.
   `open_router@work`) so one provider can hold more than one key. Admin
   "Add account", CLI `connect open_router@work`, and model refs
   `open_router@work/qwen/qwen3-coder:free`.
+
+- **Operator visibility.** The Admin header and `free-opencode status` show
+  the last routed model / provider / status / latency and the recent route
+  ring. `~/.free-opencode/proxy.log` is a 5 MB rotating JSONL of every attempt
+  and final hop (plus `proxy.start/stop`, `service.*`, `update.*`,
+  `mcp.spawn`) so you can tell a fallback from an API loop; keys are never
+  written. `free-opencode log [--lines N]` tails it. Configured provider
+  cards sort above empty ones on Admin (a pure, unit-tested
+  `sortAdminCatalog`); unused cards collapse to a compact row. Requests log
+  an attempt + a result with the `requestId` tying them together.
+
+- **Zen split is gone from the plugin path.** Plugin/native `opencode` write
+  the same overlay as `foc-opencode`: `enabled_providers: ["free-opencode"]`,
+  `opencode` in `disabled_providers`, and `model` / `small_model` pinned to
+  `free-opencode/default` when unset or still Zen. Other provider blocks are
+  left intact; Admin warns when the loaded config would still default to Zen.
+  The real OpenCode binary is never replaced.
+
+- **Keep-alive service and update.** `free-opencode service install |
+  uninstall | status` runs `…/cli.js start --foreground` as a per-user
+  systemd unit / launchd agent / logon scheduled task (never root, never
+  SYSTEM) so `:8082` survives a new login; it restarts on crash, not on a
+  clean stop. Installers attempt a best-effort service install after
+  host-setup (warn, do not fail, if linger/tasking can't be created).
+  `free-opencode update` does `git pull --ff-only` (fails on a dirty tree),
+  reinstalls/rebuilds, re-runs host-setup, and restarts the proxy or service.
+
+- **Free-first / self-hosted-last routing with cooldowns.** Catalog-alias
+  traffic (`free-opencode/default`) now orders attempts free cloud →
+  paid cloud → self-hosted; a Tailscale SGLang / Ollama default is last
+  resort, not the daily driver. A concrete slug is honored first and never
+  rewritten. A 429 / 402 / retryable 5xx marks a model in cooldown
+  (`cooldown.ts`: Retry-After or 60s doubling to a 30-minute cap), skips it
+  until it should be back, and clears on success; cooldowns are in-memory
+  (clear on restart) and surfaced on Admin, `/admin/api/state`, `/health`,
+  and `free-opencode status`. Routing never edits `settings.model` on disk.
 
 - **B.ai provider.** Admin lists it as **B.ai** (`bai`) with a filter box.
   Connect on the card saves the key (`BAI_API_KEY`, `https://api.b.ai/v1`).

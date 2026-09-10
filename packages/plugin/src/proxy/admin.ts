@@ -99,6 +99,8 @@ export function adminPage(): string {
       background: var(--pxx-graphite);
     }
     .card.ready { border-color: var(--pxx-accent-blue); }
+    .card.compact { cursor: pointer; padding: 10px 12px; }
+    .card.compact h3 { margin: 0 0 2px; }
     .card h3 {
       margin: 0 0 6px;
       font-size: 13px;
@@ -176,7 +178,9 @@ export function adminPage(): string {
         <p class="byline">by PiercingXX</p>
       </div>
     </div>
+    <div id="zen-warning" class="muted" style="display:none;font-size:12px;max-width:360px"></div>
     <div id="status" class="muted">Loading…</div>
+    <div id="last-route" class="muted" style="font-size:11px;text-align:right;max-width:340px"></div>
   </header>
   <main>
     <section>
@@ -203,11 +207,16 @@ export function adminPage(): string {
         <button id="refresh" class="secondary">Refresh models</button>
       </div>
       <p id="message" class="muted"></p>
+      <h2 style="margin-top:20px">Cooldown</h2>
+      <p class="muted" style="margin:0 0 8px">Self-hosted is used only after free models fail or are in cooldown. A drained box is skipped until Retry-After elapses.</p>
+      <div id="cooldowns" class="muted"></div>
       <h2 style="margin-top:20px">Free tool models</h2>
       <p class="muted" style="margin:0 0 8px">OpenCode Zen *-free / big-pickle, OpenRouter :free, and anything on your boxes. Use sets the default.</p>
       <div id="free-models" class="muted"></div>
       <h2 style="margin-top:20px">Ready models</h2>
       <div id="models" class="muted"></div>
+      <h2 style="margin-top:20px">Recent routes</h2>
+      <div id="recent-routes" class="muted"></div>
     </section>
   </main>
   <footer>
@@ -233,6 +242,24 @@ export function adminPage(): string {
         "<label>" + esc(f.label) + (f.required ? " (required)" : "") + "</label>" +
         '<input data-extra="' + esc(p.id) + ":" + esc(f.key) + '" placeholder="' + esc(f.placeholder) + '" value="' + esc(f.value) + '" />'
       ).join("");
+    }
+    // The running ready/configured sort. Kept in sync with sortAdminCatalog in
+    // admin.ts (pure, unit-tested); this copy backs the live grid.
+    function sortCatalog(rows) {
+      const catLevel = (p) => (p.ready || p.configured ? 1 : 0);
+      return rows.slice().sort((a, b) => {
+        const al = catLevel(a), bl = catLevel(b);
+        if (al !== bl) return bl - al;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+    }
+    function isUsed(p) { return Boolean(p.ready || p.configured); }
+    function compactCard(p) {
+      return '<div class="card compact" data-id="' + esc(p.id) + '" data-expand="' + esc(p.id) + '">' +
+        '<h3><span>' + esc(p.name) + '</span> <span class="bad">unused</span></h3>' +
+        '<div class="muted" style="font-size:11px">' + esc(p.id) + '</div>' +
+        '<span class="row"><button type="button" data-expand="' + esc(p.id) + '">Connect</button></span>' +
+        "</div>";
     }
     function card(p) {
       const keyField = p.local
@@ -272,18 +299,46 @@ export function adminPage(): string {
       return extra;
     }
     let catalogCache = [];
-    function paintCatalog() {
-      const query = ($("provider-filter").value || "").trim().toLowerCase();
-      const match = (p) =>
-        !query ||
+    const expanded = new Set();
+    function filterMatches(p, query) {
+      return !query ||
         String(p.name || "").toLowerCase().indexOf(query) >= 0 ||
         String(p.id || "").toLowerCase().indexOf(query) >= 0;
-      $("local-providers").innerHTML = catalogCache.filter((p) => p.local && match(p)).map(card).join("");
-      $("providers").innerHTML = catalogCache.filter((p) => !p.local && match(p)).map(card).join("");
+    }
+    function cardFor(p, query) {
+      if (filterMatches(p, query) || isUsed(p) || expanded.has(p.id)) return card(p);
+      return compactCard(p);
+    }
+    function paintCatalog() {
+      const query = ($("provider-filter").value || "").trim().toLowerCase();
+      const cloud = sortCatalog(catalogCache.filter((p) => !p.local)).filter((p) => filterMatches(p, query));
+      const local = sortCatalog(catalogCache.filter((p) => p.local)).filter((p) => filterMatches(p, query));
+      $("local-providers").innerHTML = local.map((p) => cardFor(p, query)).join("");
+      $("providers").innerHTML = cloud.map((p) => cardFor(p, query)).join("");
     }
     async function load() {
       const data = await api("/admin/api/state");
       $("status").textContent = "Proxy " + data.listen.host + ":" + data.listen.port;
+      if (data.zenDefault) {
+        $("zen-warning").style.display = "block";
+        $("zen-warning").className = "bad";
+        $("zen-warning").textContent = "Warning: the loaded OpenCode config still defaults to Zen. The plugin overlay fixes this once OpenCode reloads; use foc-opencode now or Apply default model in Routing.";
+      } else {
+        $("zen-warning").style.display = "none";
+      }
+      $("last-route").textContent = "last route: " + (data.lastRoute ? formatRoute(data.lastRoute) : "(none yet)");
+      const recent = data.recentRoutes || [];
+      $("recent-routes").innerHTML = recent.length
+        ? recent.slice(0, 20).map((r) => "<div>" + esc(formatRoute(r)) + "</div>").join("")
+        : "None yet. Send a request through the :8082 catalog.";
+      const cooldowns = data.cooldowns || [];
+      $("cooldowns").innerHTML = cooldowns.length
+        ? cooldowns.map((c) =>
+            "<div>" + esc(c.slug) + " · cooldown · back " +
+            (c.availableAt ? esc(new Date(c.availableAt).toLocaleTimeString()) : "later") +
+            " (" + esc(c.reason || "") + ")</div>"
+          ).join("")
+        : "Nothing in cooldown.";
       $("model").value = data.model || "";
       $("fallbacks").value = (data.fallbacks || []).join(", ");
       catalogCache = data.catalog || [];
@@ -304,6 +359,14 @@ export function adminPage(): string {
         ? preview.map((m) => "<div>" + esc(m.id) + (m.free ? " · free" : "") + "</div>").join("") +
           (more > 0 ? '<div class="muted">' + more + " more in the catalog</div>" : "")
         : "None yet. Connect a box or a cloud key.";
+    }
+    function formatRoute(r) {
+      const where = r.providerId ? (r.slug + " [" + r.providerId + "]") : r.slug;
+      const status = r.status == null ? "transport" : r.status;
+      const outcome = r.ok ? "ok" : ("failed " + status);
+      const fb = (r.fallback === false || r.fallback === 0) ? "" : (" · fallback#" + r.fallback);
+      const tried = (r.tried && r.tried.length > 1) ? (" · tried: " + r.tried.join("→")) : "";
+      return where + " · " + outcome + " · " + r.latencyMs + "ms" + tried + fb;
     }
     async function probeOrConnect(button, path) {
       const id = button.getAttribute("data-probe") || button.getAttribute("data-connect");
@@ -338,6 +401,16 @@ export function adminPage(): string {
       }
     }
     document.addEventListener("click", async (event) => {
+      const expandTarget = event.target.closest("[data-expand]");
+      if (expandTarget) {
+        const id = expandTarget.getAttribute("data-expand");
+        if (id) {
+          if (expanded.has(id)) expanded.delete(id);
+          else expanded.add(id);
+          paintCatalog();
+        }
+        return;
+      }
       const addAccountBtn = event.target.closest("[data-add-account]");
       if (addAccountBtn) {
         const id = addAccountBtn.getAttribute("data-add-account");
@@ -482,4 +555,30 @@ export function adminPage(): string {
   </script>
 </body>
 </html>`;
+}
+
+/**
+ * The ready/configured-first ordering the Admin grid uses.
+ *
+ * Pure and unit-tested so the real rule is verified without scraping the HTML.
+ * `rows` mimic the per-provider object from `/admin/api/state` (only `id`,
+ * `name`, `ready`, and `configured` are read). Ready/configured providers sort
+ * above everything else; within a bucket, order is stable by id (which tracks
+ * catalog order).
+ */
+export type AdminCatalogSortRow = {
+  id: string;
+  name?: string;
+  ready?: boolean;
+  configured?: boolean;
+};
+
+export function sortAdminCatalog(rows: AdminCatalogSortRow[]): AdminCatalogSortRow[] {
+  const level = (p: AdminCatalogSortRow): number => (p.ready || p.configured ? 1 : 0);
+  return rows.slice().sort((a, b) => {
+    const al = level(a);
+    const bl = level(b);
+    if (al !== bl) return bl - al;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
 }

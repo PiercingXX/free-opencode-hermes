@@ -21,9 +21,20 @@ import { allProviders, providerById, providerExtraFields } from "../providers/ca
 import { applyAutofindResults, runAutofind } from "../providers/autofind.js";
 import { loadInventoryLanes, suggestedBaseUrl } from "../providers/inventory.js";
 import { adminPage } from "./admin.js";
+import { loadedConfigDefaultsToZen } from "../plugin/config.js";
 import { buildModelCatalog, modelsListPayload, parseCatalogView, probeProvider } from "./models.js";
 import { chatStreamToResponses, chatJsonToResponses, responsesBodyToChat } from "./responses.js";
-import { RouteError, routeChat, type ChatRequest } from "./router.js";
+import { RouteError, routeChat, type ChatRequest, type RouteHopObserver } from "./router.js";
+import {
+  appendLog,
+  currentLastRoute,
+  logRoute,
+  readLogTail,
+  recentRoutes,
+  type LastRoute,
+  type RouteHopRecord,
+} from "./route-log.js";
+import { activeCooldowns } from "./cooldown.js";
 
 const PROXY_BUILT_AT: number = ((): number => {
   try {
@@ -37,6 +48,13 @@ export type ProxyHealth = {
   ok: boolean;
   service?: string;
   builtAt?: number;
+  lastRoute?: LastRoute;
+  cooldowns?: Array<{
+    slug: string;
+    providerId: string;
+    availableAt: number;
+    reason?: string;
+  }>;
 };
 
 export type RunningProxy = {
@@ -48,6 +66,12 @@ export type RunningProxy = {
 
 function clientAddress(req: IncomingMessage): string {
   return (req.socket.remoteAddress || "").replace("::ffff:", "");
+}
+
+let requestSeq = 0;
+function newRequestId(): string {
+  requestSeq += 1;
+  return `req_${Date.now().toString(36)}_${requestSeq}`;
 }
 
 function isLoopback(addr: string): boolean {
@@ -124,9 +148,38 @@ async function handleChat(
   res: ServerResponse,
   settings: Settings,
   body: ChatRequest,
-  signal: AbortSignal
+  signal: AbortSignal,
+  requestId: string,
+  home?: string
 ): Promise<void> {
-  const routed = await routeChat(settings, body, undefined, signal);
+  const onHop: RouteHopObserver = (hop) => {
+    void logRoute(home, { ...hop, requestId }, "route.attempt");
+  };
+  let routed;
+  try {
+    routed = await routeChat(settings, body, undefined, signal, onHop, home);
+  } catch (error) {
+    const status = error instanceof RouteError ? error.status : null;
+    const message = error instanceof Error ? error.message : String(error);
+    const last = recentRoutes()[0];
+    const slug = last?.slug ?? body.model;
+    const providerId = last?.providerId ?? "";
+    const fallback = last ? last.fallback : false;
+    await logRoute(
+      home,
+      {
+        ...routeResult(slug, providerId, status, 0, false, fallback, last?.tried ?? [], requestId),
+        message,
+      },
+      "route.result"
+    );
+    throw error;
+  }
+  await logRoute(
+    home,
+    routeResult(routed.used.slug, routed.used.providerId, 200, 0, true, 0, routed.tried, requestId),
+    "route.result"
+  );
   if (body.stream) {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -156,6 +209,29 @@ async function handleChat(
   send(res, 200, json, { "x-foc-model": routed.used.slug });
 }
 
+function routeResult(
+  slug: string,
+  providerId: string,
+  status: number | null,
+  latencyMs: number,
+  ok: boolean,
+  fallback: boolean | number,
+  tried: string[],
+  requestId: string
+): RouteHopRecord {
+  return {
+    at: new Date().toISOString(),
+    requestId,
+    slug,
+    providerId,
+    status,
+    latencyMs,
+    ok,
+    fallback,
+    tried,
+  };
+}
+
 export function startProxy(initial?: Settings, home?: string): RunningProxy {
   let settings = applyEnvOverrides(initial ?? loadSettings(home));
   const persist = (): void => {
@@ -175,7 +251,40 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
       }
 
       if (req.method === "GET" && url.pathname === "/health") {
-        send(res, 200, { ok: true, service: "free-opencode", builtAt: PROXY_BUILT_AT });
+        send(res, 200, {
+          ok: true,
+          service: "free-opencode",
+          builtAt: PROXY_BUILT_AT,
+          lastRoute: currentLastRoute(),
+          cooldowns: activeCooldowns().map((c) => ({
+            slug: c.slug,
+            providerId: c.providerId,
+            availableAt: c.availableAt,
+            reason: c.reason,
+          })),
+        });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/last-route") {
+        send(res, 200, {
+          lastRoute: currentLastRoute(),
+          recent: recentRoutes(),
+          cooldowns: activeCooldowns().map((c) => ({
+            slug: c.slug,
+            providerId: c.providerId,
+            availableAt: c.availableAt,
+            reason: c.reason,
+          })),
+        });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/log") {
+        const raw = Number(url.searchParams.get("limit"));
+        const limit = Number.isInteger(raw) && raw > 0 ? Math.min(raw, 500) : 50;
+        const lines = await readLogTail(limit, home);
+        send(res, 200, { limit, lines });
         return;
       }
 
@@ -190,6 +299,15 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
           listen: settings.listen,
           model: settings.model,
           fallbacks: settings.fallbacks,
+          lastRoute: currentLastRoute(),
+          recentRoutes: recentRoutes(),
+          cooldowns: activeCooldowns().map((c) => ({
+            slug: c.slug,
+            providerId: c.providerId,
+            availableAt: c.availableAt,
+            reason: c.reason,
+          })),
+          zenDefault: loadedConfigDefaultsToZen(home),
           models,
           accounts: settings.accounts ?? [],
           catalog: allProviders()
@@ -388,18 +506,63 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         const body = (await readJson(req)) as ChatRequest;
-        await handleChat(res, settings, body, ac.signal);
+        await handleChat(res, settings, body, ac.signal, newRequestId(), home);
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/responses") {
         const raw = await readJson(req);
         const chat = responsesBodyToChat(raw);
-        const routed = await routeChat(
-          settings,
-          { ...chat, stream: chat.stream !== false },
-          undefined,
-          ac.signal
+        const requestId = newRequestId();
+        const onHop: RouteHopObserver = (hop) => {
+          void logRoute(home, { ...hop, requestId }, "route.attempt");
+        };
+        let routed;
+        try {
+          routed = await routeChat(
+            settings,
+            { ...chat, stream: chat.stream !== false },
+            undefined,
+            ac.signal,
+            onHop,
+            home
+          );
+        } catch (error) {
+          const status = error instanceof RouteError ? error.status : null;
+          const message = error instanceof Error ? error.message : String(error);
+          const last = recentRoutes()[0];
+          await logRoute(
+            home,
+            {
+              ...routeResult(
+                last?.slug ?? chat.model,
+                last?.providerId ?? "",
+                status,
+                0,
+                false,
+                last ? last.fallback : false,
+                last?.tried ?? [],
+                requestId
+              ),
+              message,
+            },
+            "route.result"
+          );
+          throw error;
+        }
+        await logRoute(
+          home,
+          routeResult(
+            routed.used.slug,
+            routed.used.providerId,
+            200,
+            0,
+            true,
+            0,
+            routed.tried,
+            requestId
+          ),
+          "route.result"
         );
         if (chat.stream !== false && routed.response.body) {
           res.writeHead(200, {
@@ -440,13 +603,23 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
 
   server.listen(port, host);
 
+  void appendLog(
+    "proxy.start",
+    { listen: { host, port }, pid: process.pid, builtAt: PROXY_BUILT_AT },
+    home
+  );
+
   return {
     server,
     settings: () => settings,
     url: `http://${host}:${port}`,
     close: () =>
       new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
+        server.close((err) => {
+          void appendLog("proxy.stop", { pid: process.pid }, home);
+          if (err) reject(err);
+          else resolve();
+        });
       }),
   };
 }
@@ -468,7 +641,13 @@ export async function fetchProxyHealth(url: string, token?: string): Promise<Pro
     });
     if (!res.ok) return { ok: false };
     const body = (await res.json()) as ProxyHealth;
-    return { ok: true, service: body.service, builtAt: body.builtAt };
+    return {
+      ok: true,
+      service: body.service,
+      builtAt: body.builtAt,
+      lastRoute: body.lastRoute,
+      cooldowns: body.cooldowns,
+    };
   } catch {
     return null;
   }

@@ -1,7 +1,10 @@
 import { isProviderReady, type Settings } from "../config/settings.js";
-import { providerById } from "../providers/catalog.js";
+import { allProviders, providerById } from "../providers/catalog.js";
+import { isCooldowned, clearCooldown, parseRetryAfterHeader, recordCooldown } from "./cooldown.js";
 import {
   isCatalogAlias,
+  isFreeModelId,
+  listedModelsForProvider,
   parseModelRef,
   providerApiKey,
   providerBaseUrl,
@@ -32,23 +35,106 @@ export class RouteError extends Error {
   }
 }
 
+/**
+ * True when the provider id points at a self-hosted box (Ollama / SGLang / LM
+ * Studio / llama.cpp, or a Tailscale / inventory / autofind host). These are
+ * last-resort buckets in routeTargets.
+ */
+export function isSelfHostedProvider(providerId: string): boolean {
+  return Boolean(providerById(providerId)?.local);
+}
+
+/** A model slug is a "free" candidate when its model id looks free (:free / -free / /free / leaves). */
+export function isFreeModelSlug(ref: ModelRef): boolean {
+  return isFreeModelId(ref.model);
+}
+
+function parseOrNull(raw: string): ModelRef | null {
+  try {
+    return parseModelRef(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the ordered attempt list for a request.
+ *
+ * Policy (free-first, self-hosted-last):
+ *   1. An explicit concrete slug always goes first (never rewritten).
+ *   2. Free cloud — ready non-local models that look free, Admin free default
+ *      and free fallbacks preferred first. For catalog-alias traffic, any
+ *      connected free provider's discovered/default models participate, so no
+ *      user fallback list is required.
+ *   3. Other configured cloud — ready non-local, non-free, in Admin
+ *      default/fallback order among themselves.
+ *   4. Self-hosted last — local boxes only after free and paid cloud cannot
+ *      serve right now (not ready, in cooldown, or failed retryable).
+ *
+ * For an explicit concrete request, the tail is the user's Admin default and
+ * fallbacks only (re-ordered free→paid→local); connected providers are not
+ * enumerated so an explicit request behaves predictably. Alias traffic (the
+ * pervasive OpenCode `free-opencode/default`) enumerates every ready cloud
+ * provider and puts self-hosted at the very end.
+ *
+ * Cooldowned slugs are skipped everywhere; the first request after expiry is
+ * the recheck.
+ */
 export function routeTargets(settings: Settings, requestedModel: string): ModelRef[] {
+  const aliasRequest = isCatalogAlias(requestedModel);
   const seen = new Set<string>();
   const targets: ModelRef[] = [];
   const push = (raw: string | null | undefined): void => {
     if (!raw || isCatalogAlias(raw)) return;
-    try {
-      const ref = parseModelRef(raw);
-      if (seen.has(ref.slug)) return;
-      seen.add(ref.slug);
-      targets.push(ref);
-    } catch {
-      // skip malformed ids
-    }
+    const ref = parseOrNull(raw);
+    if (!ref) return;
+    if (seen.has(ref.slug) || isCooldowned(ref.slug)) return;
+    seen.add(ref.slug);
+    targets.push(ref);
   };
-  if (!isCatalogAlias(requestedModel)) push(requestedModel);
-  push(settings.model);
-  for (const extra of settings.fallbacks) push(extra);
+
+  if (!aliasRequest) push(requestedModel);
+
+  // Partition the user's Admin default + fallbacks into free cloud / paid cloud / local.
+  const adminCloudFree: string[] = [];
+  const adminCloudPaid: string[] = [];
+  const adminLocal: string[] = [];
+  for (const raw of [settings.model, ...(settings.fallbacks ?? [])]) {
+    if (!raw || isCatalogAlias(raw)) continue;
+    const ref = parseOrNull(raw);
+    if (!ref) continue;
+    if (isSelfHostedProvider(ref.providerId)) adminLocal.push(raw);
+    else if (isFreeModelSlug(ref)) adminCloudFree.push(raw);
+    else adminCloudPaid.push(raw);
+  }
+
+  for (const raw of adminCloudFree) push(raw);
+  for (const raw of adminCloudPaid) push(raw);
+
+  if (aliasRequest) {
+    // Enumerate every ready cloud provider (free first, then paid).
+    for (const freeFirst of [true, false]) {
+      for (const provider of allProviders()) {
+        if (provider.local || !isProviderReady(settings, provider.id)) continue;
+        for (const model of listedModelsForProvider(settings, provider)) {
+          const ref = parseOrNull(`${provider.id}/${model}`);
+          if (!ref) continue;
+          if (seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
+          if (isFreeModelSlug(ref) === freeFirst) push(ref.slug);
+        }
+      }
+    }
+  }
+
+  // Self-hosted last: Admin-local default first, then every ready local box.
+  for (const raw of adminLocal) push(raw);
+  for (const provider of allProviders()) {
+    if (!provider.local || !isProviderReady(settings, provider.id)) continue;
+    for (const model of listedModelsForProvider(settings, provider)) {
+      push(`${provider.id}/${model}`);
+    }
+  }
+
   return targets.filter((ref) => isProviderReady(settings, ref.providerId));
 }
 
@@ -169,6 +255,23 @@ export type RoutedResult = {
   tried: string[];
 };
 
+/** One upstream hop a routeChat made (success or failure), for logging/observability. */
+export type RouteHopInfo = {
+  requestId?: string;
+  slug: string;
+  providerId: string;
+  /** HTTP status of the upstream call; null when the transport threw pre-response. */
+  status: number | null;
+  latencyMs: number;
+  ok: boolean;
+  /** false = primary attempt, number = failed fallbacks already tried (slots 1..). */
+  fallback: boolean | number;
+  tried: string[];
+  message?: string;
+};
+
+export type RouteHopObserver = (hop: RouteHopInfo) => void;
+
 async function readErrorMessage(response: Response): Promise<string> {
   try {
     const text = await response.text();
@@ -188,7 +291,9 @@ export async function routeChat(
   settings: Settings,
   body: ChatRequest,
   transport: UpstreamTransport = defaultTransport,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onHop?: RouteHopObserver,
+  home?: string
 ): Promise<RoutedResult> {
   const targets = routeTargets(settings, body.model);
   if (targets.length === 0) {
@@ -205,6 +310,7 @@ export async function routeChat(
 
   for (const ref of targets) {
     tried.push(ref.slug);
+    const fallback = tried.length - 1;
     let attempt: RouteAttempt;
     try {
       attempt = resolveAttempt(settings, ref);
@@ -213,31 +319,69 @@ export async function routeChat(
       continue;
     }
 
+    const started = Date.now();
     let response: Response;
     try {
       response = await transport(attempt, body, signal);
     } catch (error) {
+      const latencyMs = Date.now() - started;
       lastError = new RouteError(
         `${ref.slug} network error: ${error instanceof Error ? error.message : String(error)}`,
         502
       );
+      emitHop(onHop, ref, fallback, tried, null, latencyMs, false, lastError.message);
       if (isAbortError(error) || signal?.aborted) {
         throw lastError;
       }
       continue;
     }
 
+    const latencyMs = Date.now() - started;
     if (response.ok) {
+      clearCooldown(ref.slug);
+      emitHop(onHop, ref, fallback, tried, response.status, latencyMs, true);
       return { response, used: ref, tried };
     }
 
     const retryable = isRetryableStatus(response.status);
     const message = await readErrorMessage(response);
+    if (retryable) {
+      const retryAfterValue = response.headers.get("retry-after");
+      recordCooldown(ref.slug, ref.providerId, {
+        status: response.status,
+        retryAfter: parseRetryAfterHeader(retryAfterValue),
+        reason: message,
+        home,
+      });
+    }
     lastError = new RouteError(`${ref.slug}: ${message}`, response.status);
+    emitHop(onHop, ref, fallback, tried, response.status, latencyMs, false, lastError.message);
     if (!retryable) {
       throw lastError;
     }
   }
 
   throw lastError ?? new RouteError("All configured models failed", 502, { tried });
+}
+
+function emitHop(
+  onHop: RouteHopObserver | undefined,
+  ref: ModelRef,
+  fallback: number,
+  tried: string[],
+  status: number | null,
+  latencyMs: number,
+  ok: boolean,
+  message?: string
+): void {
+  onHop?.({
+    slug: ref.slug,
+    providerId: ref.providerId,
+    status,
+    latencyMs,
+    ok,
+    fallback: fallback > 0 ? fallback : false,
+    tried,
+    ...(message ? { message } : {}),
+  });
 }

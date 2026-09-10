@@ -67,12 +67,15 @@ test("OpenCode agent steps floor overrides xx-stack markdown budgets", () => {
       reviewer: { steps: 12, prompt: "stale", mode: "subagent" },
       ping: { steps: 2, mode: "primary" },
       planning: { steps: 12, mode: "subagent" },
+      build: { steps: 12, mode: "primary" },
     },
   };
   applyRuntimeExtras(config);
   const reviewer = config.agent?.reviewer as { steps: number; prompt: string };
   assert.equal(reviewer.steps, OPENCODE_AGENT_STEPS_FLOOR);
   assert.notEqual(reviewer.prompt, "stale");
+  const build = config.agent?.build as { steps?: number };
+  assert.equal("steps" in build, false);
   const ping = config.agent?.ping as { disable?: boolean; hidden?: boolean; mode?: string };
   assert.equal(ping.disable, true);
   assert.equal(ping.hidden, true);
@@ -128,6 +131,7 @@ test("neutralizeVendorAgents drops native prompts and leaves xx-stack agents vis
   assert.notEqual(architect.hidden, true);
   const overlay = fccStyleAgentOverlay();
   assert.equal("prompt" in (overlay.build ?? {}), false);
+  assert.equal("steps" in (overlay.build ?? {}), false);
   assert.equal(overlay.architect, undefined);
 });
 

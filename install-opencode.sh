@@ -58,6 +58,16 @@ if [ "$FORCE_SETUP" -eq 1 ]; then
 fi
 node "$ROOT/scripts/host-setup.mjs" opencode-host
 
+# Best-effort keep-alive service so :8082 survives reboots and logins. Do not
+# fail the installer if the user cannot linger (headless or restricted box).
+if [ -x "$HOME/.local/bin/free-opencode" ]; then
+  if ! "$HOME/.local/bin/free-opencode" service install >/dev/null 2>&1; then
+    warn "Could not install the keep-alive service. The proxy still runs on demand: free-opencode start"
+  fi
+else
+  warn "free-opencode wrapper not found; run: free-opencode service install"
+fi
+
 cat <<EOF
 
 Free OpenCode is installed.

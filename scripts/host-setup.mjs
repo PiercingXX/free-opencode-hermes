@@ -20,8 +20,24 @@ function info(message) {
 }
 
 function die(message) {
+  hostSetupLog("host-setup.error", { message });
   console.error(`error: ${message}`);
   process.exit(1);
+}
+
+/** Append a JSONL diagnostics line to the proxy log. Best-effort and secret-free. */
+function hostSetupLog(type, payload) {
+  try {
+    const file = path.join(home, ".free-opencode", "proxy.log");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(
+      file,
+      JSON.stringify({ at: new Date().toISOString(), type, ...payload }) + "\n",
+      "utf8"
+    );
+  } catch {
+    // logging must never fail host setup
+  }
 }
 
 function configDir() {
@@ -254,6 +270,7 @@ function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
     info("registered MCP xx-stack-platform-routing");
   }
   writeAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  hostSetupLog("host-setup.plugin", { configPath, pluginRef, mcp: Boolean(mcpEntrypoint) });
   info(`registered plugin in ${configPath}`);
 }
 

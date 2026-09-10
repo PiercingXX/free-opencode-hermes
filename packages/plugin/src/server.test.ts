@@ -7,6 +7,8 @@ import type { AddressInfo } from "node:net";
 
 import { connectProvider, emptySettings, saveSettings, setProviderKey } from "./config/settings.js";
 import { startProxy, waitForListen } from "./proxy/server.js";
+import { logRoute } from "./proxy/route-log.js";
+import { __resetCooldowns, recordCooldown } from "./proxy/cooldown.js";
 
 test("proxy health and models endpoints", async () => {
   const home = mkdtempSync(join(tmpdir(), "foc-proxy-"));
@@ -189,5 +191,91 @@ test("remove local providers hides cards and Apply does not restore them", async
     );
   } finally {
     await proxy.close();
+  }
+});
+
+test("admin state and health expose lastRoute after a recorded hop", async () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-proxy-lastroute-"));
+  const settings = setProviderKey(emptySettings(), "groq", "gsk_test");
+  settings.listen = { host: "127.0.0.1", port: 0 };
+  settings.proxyAuthEnabled = true;
+  saveSettings(settings, home);
+  const proxy = startProxy(settings, home);
+  await waitForListen(proxy);
+  const addr = proxy.server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    await logRoute(
+      home,
+      {
+        at: new Date().toISOString(),
+        slug: "groq/llama-3.3-70b-versatile",
+        providerId: "groq",
+        status: 200,
+        latencyMs: 33,
+        ok: true,
+        fallback: false,
+        tried: ["groq/llama-3.3-70b-versatile", "open_router/openrouter/free"],
+      },
+      "route.result"
+    );
+    const state = await fetch(`${base}/admin/api/state`);
+    const body = (await state.json()) as {
+      lastRoute: { slug: string; status: number; tried: string[] };
+    };
+    assert.ok(body.lastRoute);
+    assert.equal(body.lastRoute.slug, "groq/llama-3.3-70b-versatile");
+    assert.equal(body.lastRoute.status, 200);
+    assert.deepEqual(body.lastRoute.tried, [
+      "groq/llama-3.3-70b-versatile",
+      "open_router/openrouter/free",
+    ]);
+
+    const health = await fetch(`${base}/health`);
+    const healthBody = (await health.json()) as { lastRoute: { slug: string } };
+    assert.equal(healthBody.lastRoute.slug, "groq/llama-3.3-70b-versatile");
+
+    const lastRoute = await fetch(`${base}/admin/api/last-route`);
+    const lastRouteBody = (await lastRoute.json()) as {
+      lastRoute: { slug: string };
+      recent: unknown[];
+    };
+    assert.equal(lastRouteBody.lastRoute.slug, "groq/llama-3.3-70b-versatile");
+    assert.ok(lastRouteBody.recent.length >= 1);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("admin state and health surface active cooldowns", async () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-proxy-cooldown-"));
+  const settings = setProviderKey(emptySettings(), "groq", "gsk_test");
+  settings.listen = { host: "127.0.0.1", port: 0 };
+  settings.proxyAuthEnabled = true;
+  saveSettings(settings, home);
+  const proxy = startProxy(settings, home);
+  await waitForListen(proxy);
+  const addr = proxy.server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    __resetCooldowns();
+    recordCooldown("open_router/openrouter/free", "open_router", {
+      status: 429,
+      retryAfter: 60_000,
+    });
+    const state = await fetch(`${base}/admin/api/state`);
+    const body = (await state.json()) as {
+      cooldowns: Array<{ slug: string; availableAt: number }>;
+    };
+    assert.equal(body.cooldowns.length, 1);
+    assert.equal(body.cooldowns[0].slug, "open_router/openrouter/free");
+    assert.equal(typeof body.cooldowns[0].availableAt, "number");
+
+    const health = await fetch(`${base}/health`);
+    const healthBody = (await health.json()) as { cooldowns: Array<{ slug: string }> };
+    assert.ok(healthBody.cooldowns.some((c) => c.slug === "open_router/openrouter/free"));
+  } finally {
+    await proxy.close();
+    __resetCooldowns();
   }
 });

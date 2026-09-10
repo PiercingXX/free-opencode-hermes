@@ -55,20 +55,27 @@ test("OpenCode process config uses Responses SDK and overlay-forces the model", 
   assert.equal(config.overlay.agent, undefined);
 });
 
-test("catalog alias uses Admin default then fallbacks", () => {
+test("catalog alias tries free cloud first, then paid, self-hosted last", () => {
   let settings = setProviderKey(emptySettings(), "groq", "k1");
   settings = setProviderKey(settings, "open_router", "k2");
   settings.model = "groq/llama-3.3-70b-versatile";
   settings.fallbacks = ["open_router/openrouter/free"];
-  assert.deepEqual(
-    routeTargets(settings, "default").map((ref) => ref.slug),
-    ["groq/llama-3.3-70b-versatile", "open_router/openrouter/free"]
+  // Alias traffic: free OpenRouter models rank before the paid Groq box.
+  const alias = routeTargets(settings, "default").map((ref) => ref.slug);
+  assert.ok(alias[0] === "open_router/openrouter/free", "free fallback leads the alias list");
+  assert.ok(
+    alias.includes("open_router/qwen/qwen3-coder:free"),
+    "connected free models participate"
+  );
+  assert.ok(
+    alias.indexOf("groq/llama-3.3-70b-versatile") > alias.indexOf("open_router/openrouter/free")
   );
   const fromAlias = routeTargets(settings, "free-opencode/default");
   assert.deepEqual(
     fromAlias.map((ref) => ref.slug),
-    ["groq/llama-3.3-70b-versatile", "open_router/openrouter/free"]
+    alias
   );
+  // Explicit free request stays first, then the same policy.
   const explicit = routeTargets(settings, "open_router/openrouter/free");
   assert.deepEqual(
     explicit.map((ref) => ref.slug),

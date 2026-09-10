@@ -124,6 +124,18 @@ Write-Info "wiring OpenCode host files, plugin, and CLI"
 & $node.Source (Join-Path $Root "scripts\host-setup.mjs") "opencode-host"
 if ($LASTEXITCODE -ne 0) { Die "host setup failed" }
 
+# Best-effort keep-alive service (per-user logon scheduled task on Windows).
+$freeOpencode = Join-Path $env:USERPROFILE ".local\bin\free-opencode.cmd"
+if (Test-Path -LiteralPath $freeOpencode) {
+    Write-Info "installing the keep-alive service"
+    & $freeOpencode service install
+    if ($LASTEXITCODE -ne 0) {
+        Write-Info "Could not install the keep-alive service; the proxy runs on demand: free-opencode start"
+    }
+} else {
+    Write-Info "free-opencode wrapper not found; run: free-opencode service install"
+}
+
 Add-UserPath (Join-Path $env:USERPROFILE ".local\bin")
 
 Write-Host ""

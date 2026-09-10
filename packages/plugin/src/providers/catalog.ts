@@ -1,9 +1,5 @@
 import { foundHostProviders, inventoryProviders } from "./inventory.js";
-import {
-  type Settings,
-  accountIdsFor,
-  loadSettings,
-} from "../config/settings.js";
+import { type Settings, accountIdsFor, loadSettings } from "../config/settings.js";
 
 export type ExtraField = {
   key: string;

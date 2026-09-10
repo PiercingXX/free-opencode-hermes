@@ -20,17 +20,14 @@ import { launchHermes } from "./launchers/hermes.js";
 import { launchOpenCode } from "./launchers/opencode.js";
 import { pidPath, TOKEN_ENV } from "./paths.js";
 import { localCodeBuiltAt, spawnDetachedProxy, stopDetachedProxy } from "./plugin/lifecycle.js";
+import { serviceInstall, serviceStatus, serviceUninstall } from "./plugin/service.js";
+import { cmdUpdate } from "./plugin/update.js";
 import { applyAutofindResults, runAutofind } from "./providers/autofind.js";
 import { allProviders, providerById, providerExtraFields } from "./providers/catalog.js";
 import { suggestedBaseUrl } from "./providers/inventory.js";
 import { buildModelCatalog, probeProvider } from "./proxy/models.js";
-import {
-  fetchProxyHealth,
-  isStaleProxy,
-  proxyHealth,
-  startProxy,
-  waitForListen,
-} from "./proxy/server.js";
+import { fetchProxyHealth, isStaleProxy, startProxy, waitForListen } from "./proxy/server.js";
+import { appendLog, readLogTail, type RouteHopRecord } from "./proxy/route-log.js";
 
 function usage(): never {
   console.log(`Free OpenCode
@@ -47,6 +44,9 @@ Usage:
   free-opencode set-fallback <provider/model> [...]
   free-opencode accounts [provider-id]
   free-opencode admin
+  free-opencode log [--lines <n>]
+  free-opencode service install|uninstall|status
+  free-opencode update
   free-opencode opencode [args...]
   free-opencode hermes [args...]
 
@@ -96,8 +96,9 @@ async function cmdStart(foreground: boolean): Promise<void> {
 
 function cmdStop(): void {
   try {
-    readFileSync(pidPath(), "utf8");
+    const pid = Number(readFileSync(pidPath(), "utf8").trim());
     stopDetachedProxy();
+    void appendLog("proxy.stop", { pid: pid > 0 ? pid : undefined });
     console.log("Stopped.");
   } catch {
     console.log("Proxy was not running (or pid file missing).");
@@ -107,13 +108,45 @@ function cmdStop(): void {
 async function cmdStatus(): Promise<void> {
   const settings = applyEnvOverrides(loadSettings());
   const url = `http://${settings.listen.host}:${settings.listen.port}`;
-  const ok = await proxyHealth(url);
+  const health = await fetchProxyHealth(url);
   console.log(`url: ${url}`);
   console.log(`admin: ${url}/admin`);
+  const ok = Boolean(health?.ok);
   console.log(`health: ${ok ? "ok" : "down"}`);
+  if (ok) {
+    printLastRoute(health?.lastRoute ?? null);
+    printCooldowns(health?.cooldowns ?? []);
+  }
   console.log(`default model: ${settings.model ?? "(unset)"}`);
   console.log(`fallbacks: ${settings.fallbacks.join(", ") || "(none)"}`);
   console.log(`ready: ${readyProviderIds(settings).join(", ") || "(none)"}`);
+}
+
+function printCooldowns(
+  cooldowns: Array<{ slug: string; providerId: string; availableAt: number; reason?: string }>
+): void {
+  if (cooldowns.length === 0) return;
+  console.log("cooldowns:");
+  for (const c of cooldowns) {
+    const when = c.availableAt
+      ? `back ${new Date(c.availableAt).toLocaleTimeString()}`
+      : "back later";
+    console.log(`  ${c.slug} · ${when}${c.reason ? ` · ${c.reason}` : ""}`);
+  }
+}
+
+function printLastRoute(route: RouteHopRecord | null): void {
+  console.log(`last route: ${formatRoute(route)}`);
+}
+
+function formatRoute(route: RouteHopRecord | null): string {
+  if (!route) return "(none yet)";
+  const where = route.providerId ? `${route.slug} [${route.providerId}]` : route.slug;
+  const ms = `${route.latencyMs}ms`;
+  const outcome = route.ok ? "ok" : `failed ${route.status ?? "transport"}`;
+  const fallback =
+    route.fallback === false || route.fallback === 0 ? "" : ` · fallback#${route.fallback}`;
+  return `${where} · ${outcome} · ${ms}${route.tried && route.tried.length > 1 ? ` · tried: ${route.tried.join(" → ")}` : ""}${fallback}`;
 }
 
 function formatConnectRow(p: ReturnType<typeof allProviders>[number]): string {
@@ -335,6 +368,68 @@ function cmdAccounts(targetProvider?: string): void {
   }
 }
 
+async function cmdLog(linesValue: number): Promise<void> {
+  const n = Number.isInteger(linesValue) && linesValue > 0 ? Math.min(linesValue, 500) : 50;
+  const lines = await readLogTail(n);
+  for (const line of lines) console.log(JSON.stringify(line));
+}
+
+async function cmdService(action: string | undefined): Promise<void> {
+  switch (action) {
+    case "install": {
+      // Stop any detached proxy first so the service owns the port cleanly.
+      stopDetachedProxy();
+      try {
+        serviceInstall();
+        console.log("Keep-alive service installed.");
+      } catch (error) {
+        console.error(
+          `Could not install the keep-alive service (proxy still runs manually): ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+      // Start a proxy now; the service keeps it alive across reboots/crashes.
+      const settings = applyEnvOverrides(loadSettings());
+      const health = await fetchProxyHealth(
+        `http://${settings.listen.host}:${settings.listen.port}`
+      );
+      if (!health?.ok) {
+        await cmdStart(true);
+      }
+      return;
+    }
+    case "uninstall":
+      serviceUninstall();
+      stopDetachedProxy();
+      console.log(
+        "Keep-alive service removed. Run `free-opencode start` to run the proxy on demand."
+      );
+      return;
+    case "status": {
+      const status = serviceStatus();
+      console.log(
+        `service: ${status.installed ? "installed" : "not installed"} (${status.source})`
+      );
+      console.log(`running: ${status.running ? "yes" : "no"}`);
+      if (status.detail) console.log(status.detail);
+      if (process.platform === "linux" && !status.installed) {
+        console.log(
+          "Tip: on a headless box, `loginctl enable-linger $USER` keeps the user service alive after logout."
+        );
+      }
+      return;
+    }
+    case undefined:
+    case "":
+      usage();
+      return;
+    default:
+      console.error(`Unknown service action '${action}'. Use install, uninstall, or status.`);
+      process.exit(1);
+  }
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "start":
@@ -392,6 +487,19 @@ switch (cmd) {
       const settings = applyEnvOverrides(loadSettings());
       console.log(`http://${settings.listen.host}:${settings.listen.port}/admin`);
     }
+    break;
+  case "log":
+    {
+      const index = rest.findIndex((a) => a === "--lines" || a === "-n");
+      const n = index >= 0 ? Number(rest[index + 1]) : 50;
+      await cmdLog(n);
+    }
+    break;
+  case "service":
+    await cmdService(rest[0]);
+    break;
+  case "update":
+    await cmdUpdate();
     break;
   case "opencode":
     await launchOpenCode(rest);

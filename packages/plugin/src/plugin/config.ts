@@ -14,13 +14,14 @@ import {
   xxStackDir,
 } from "../paths.js";
 import { loadRuntimeAgents, loadSharedInstructions } from "./agents.js";
+import { appendLog } from "../proxy/route-log.js";
 
 /**
- * xx-stack `steps` is a different budget than OpenCode's. OpenCode counts
- * every tool call. The markdown copies under ~/.config/opencode/agents/ still
- * ship 12–28, which a few empty bash/read/glob calls exhaust. Then OpenCode
- * injects CRITICAL-MAXIMUM-STEPS-REACHED (tools disabled) and the model
- * loops on that prompt.
+ * xx-stack markdown `steps` (12–28) is a different budget than OpenCode's.
+ * OpenCode counts every tool call; when `steps` is hit it injects
+ * CRITICAL-MAXIMUM-STEPS-REACHED, disables tools, and the model spirals on
+ * text. Native build/plan/general omit `steps` so the loop runs until the
+ * model stops. Subagents still get this floor so a reviewer cannot run away.
  */
 export const OPENCODE_AGENT_STEPS_FLOOR = 120;
 const DISABLED_HOST_AGENTS = new Set(["ping", "planning", "researcher"]);
@@ -115,7 +116,6 @@ export function neutralizeVendorAgents(config: MutableConfig): void {
     const next: AgentConfig = {
       ...existing,
       model: catalogModelRef(),
-      steps: OPENCODE_AGENT_STEPS_FLOOR,
       disable: false,
       hidden: false,
       mode: "primary",
@@ -126,6 +126,7 @@ export function neutralizeVendorAgents(config: MutableConfig): void {
       },
     };
     delete next.prompt;
+    delete next.steps;
     agents[name] = next;
   }
   for (const name of DISABLED_HOST_AGENTS) {
@@ -145,7 +146,6 @@ export function fccStyleAgentOverlay(): Record<string, Record<string, unknown>> 
   for (const name of OPENCODE_NATIVE_PRIMARIES) {
     out[name] = {
       model: catalogModelRef(),
-      steps: OPENCODE_AGENT_STEPS_FLOOR,
       disable: false,
       hidden: false,
       mode: "primary",
@@ -238,6 +238,7 @@ export function applyRuntimeExtras(config: MutableConfig): void {
         FREE_OPENCODE_REPO: repoRoot(),
       },
     };
+    void appendLog("mcp.spawn", { command: [nodeExecutable(), mcpPath] });
   }
 
   config.agent = config.agent ?? {};
@@ -255,9 +256,9 @@ export function applyRuntimeExtras(config: MutableConfig): void {
             : {}),
           ...agent.permission,
         },
-        steps: openCodeAgentSteps(existing.steps ?? agent.steps),
       };
       delete native.prompt;
+      delete native.steps;
       (config.agent as Record<string, AgentConfig>)[agent.name] = native;
       continue;
     }
@@ -280,7 +281,11 @@ export function applyRuntimeExtras(config: MutableConfig): void {
   const agents = config.agent as Record<string, AgentConfig>;
   for (const [name, def] of Object.entries(agents)) {
     if (!def || typeof def !== "object") continue;
-    def.steps = openCodeAgentSteps(def.steps);
+    if (OPENCODE_NATIVE_PRIMARIES.has(name)) {
+      delete def.steps;
+    } else {
+      def.steps = openCodeAgentSteps(def.steps);
+    }
     if (DISABLED_HOST_AGENTS.has(name)) {
       def.hidden = true;
       def.disable = true;
@@ -320,7 +325,8 @@ export function applyRuntimeExtras(config: MutableConfig): void {
   const shared = loadSharedInstructions();
   const prefix = shared ? TOOL_USE_PREFIX + shared : TOOL_USE_PREFIX;
   const already =
-    (typeof config.instruction === "string" && config.instruction.includes("Free OpenCode is routing models")) ||
+    (typeof config.instruction === "string" &&
+      config.instruction.includes("Free OpenCode is routing models")) ||
     (Array.isArray(config.instruction) &&
       config.instruction.some((line) => line.includes("Free OpenCode is routing models")));
   if (!already) {
@@ -354,9 +360,6 @@ export function injectOpenCodeConfig(config: MutableConfig): void {
     models,
   };
 
-  const defaultModel = catalogModelRef();
-  config.model = defaultModel;
-  config.small_model = defaultModel;
   restrictToFreeOpenCodeProvider(config);
   applyRuntimeExtras(config);
   neutralizeVendorAgents(config);
@@ -368,10 +371,63 @@ export function injectOpenCodeConfig(config: MutableConfig): void {
   void readyProviderIds(settings);
 }
 
-/** Hide OpenCode Zen/built-ins and every other models.dev provider. */
+/** Zen model refs that must not win the picker. big-pickle is OpenCode's free default. */
+const ZEN_MODEL_RE = /^(opencode(\/|@)|opencode-zen(\/|@)|big-pickle(\/|@)|big-pickle$)/;
+
+export function isZenModelRef(raw: unknown): boolean {
+  return typeof raw === "string" && Boolean(raw.trim()) && ZEN_MODEL_RE.test(raw.trim());
+}
+
+/**
+ * Would the OpenCode config that OpenCode actually loads still default to Zen?
+ * True when the model/small_model point at a Zen ref (or are unset) or the
+ * provider restrictions are missing. With the plugin overlay loaded this is
+ * false, because injectOpenCodeConfig pins the picker; the warning is for a
+ * session where the plugin has not run yet (add-on not reloaded, or a config
+ * that predates the overlay).
+ */
+export function loadedConfigDefaultsToZen(home?: string): boolean {
+  try {
+    const raw = readFileSync(join(opencodeConfigDir(home), "opencode.json"), "utf8");
+    const parsed = JSON.parse(raw) as {
+      model?: unknown;
+      small_model?: unknown;
+      enabled_providers?: unknown;
+      disabled_providers?: unknown;
+    };
+    if (isZenModelRef(parsed.model) || isZenModelRef(parsed.small_model)) return true;
+    if (typeof parsed.model !== "string" || !parsed.model.trim()) return true;
+    const enabled = Array.isArray(parsed.enabled_providers)
+      ? (parsed.enabled_providers as unknown[]).filter((v): v is string => v === PROVIDER_ID)
+      : [];
+    if (enabled.length === 0) return true;
+    const disabled = Array.isArray(parsed.disabled_providers)
+      ? (parsed.disabled_providers as unknown[])
+      : [];
+    if (!disabled.includes("opencode")) return true;
+    return false;
+  } catch {
+    // No config yet — a fresh opencode session uses OpenCode's Zen default.
+    return true;
+  }
+}
+
+/**
+ * Pin the picker to the free-opencode provider. This mirrors what the
+ * foc-opencode launcher overlay does, so a bare `opencode` session (which loads
+ * ~/.config/opencode/opencode.json) cannot default to Zen: enabled_providers
+ * carries only free-opencode, opencode stays in disabled_providers, and the
+ * model/small_model are rewritten to the catalog when they are unset or still
+ * point at a Zen model. The user's other provider blocks are left alone; only
+ * the picker default is constrained.
+ */
 export function restrictToFreeOpenCodeProvider(config: MutableConfig): void {
   config.enabled_providers = [PROVIDER_ID];
   const disabled = (config.disabled_providers ?? []).filter((id) => id !== PROVIDER_ID);
   if (!disabled.includes("opencode")) disabled.push("opencode");
   config.disabled_providers = disabled;
+
+  const catalog = catalogModelRef();
+  if (!config.model || isZenModelRef(config.model)) config.model = catalog;
+  if (!config.small_model || isZenModelRef(config.small_model)) config.small_model = catalog;
 }
