@@ -39,7 +39,9 @@ import {
   toolsSupportFromListing,
 } from "./proxy/models.js";
 import {
+  isContextOverflow,
   isRetryableStatus,
+  shouldSkipToNextModel,
   routeChat,
   sanitizeChatPayload,
   type ChatRequest,
@@ -490,6 +492,17 @@ test("429 and 5xx are retryable, 401 is not", () => {
   assert.equal(isRetryableStatus(402), true);
   assert.equal(isRetryableStatus(503), true);
   assert.equal(isRetryableStatus(401), false);
+  assert.equal(isRetryableStatus(400), false);
+});
+
+test("context overflow skips to the next model instead of killing the session", () => {
+  const msg =
+    "Session too large to compact - context exceeds model limit even after stripping media";
+  assert.equal(isContextOverflow(400, msg), true);
+  assert.equal(shouldSkipToNextModel(400, msg), true);
+  assert.equal(isContextOverflow(413, "payload too large"), true);
+  assert.equal(isContextOverflow(400, "invalid json"), false);
+  assert.equal(shouldSkipToNextModel(400, "invalid json"), false);
 });
 
 test("parseModelRef splits provider@account/model", () => {

@@ -9,6 +9,10 @@ export type OpenCodeProcessConfig = {
   overlay: Record<string, unknown>;
 };
 
+/** OpenCode compaction uses this window. Use the union of our hop chain, not a 32k free leaf. */
+export const CATALOG_CONTEXT_TOKENS = 1_048_576;
+export const CATALOG_OUTPUT_TOKENS = 32_768;
+
 export function catalogClientModel(): ClientModel {
   return {
     wireSlug: CATALOG_MODEL_ID,
@@ -16,8 +20,8 @@ export function catalogClientModel(): ClientModel {
     displayName: "Free OpenCode",
     supportsReasoning: true,
     inputModalities: ["text"],
-    contextWindowTokens: null,
-    maxOutputTokens: null,
+    contextWindowTokens: CATALOG_CONTEXT_TOKENS,
+    maxOutputTokens: CATALOG_OUTPUT_TOKENS,
   };
 }
 

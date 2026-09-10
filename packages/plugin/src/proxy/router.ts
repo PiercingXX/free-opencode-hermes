@@ -167,6 +167,26 @@ export function isRetryableStatus(status: number): boolean {
   return status === 402 || status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+/** Context/payload too big for this model — try the next one, do not kill the session. */
+export function isContextOverflow(status: number, message: string): boolean {
+  if (status === 413) return true;
+  const text = message.toLowerCase();
+  if (!/context|token|compact|too large|too long|payload|max_tokens|stripping media/.test(text)) {
+    return status === 413;
+  }
+  return (
+    status === 400 ||
+    status === 413 ||
+    /context[_\s-]?length|context (window|limit)|too large to compact|stripping media|maximum context|too many tokens|prompt is too long|request too large|payload too large/.test(
+      text
+    )
+  );
+}
+
+export function shouldSkipToNextModel(status: number, message: string): boolean {
+  return isRetryableStatus(status) || isContextOverflow(status, message);
+}
+
 export type UpstreamTransport = (
   attempt: RouteAttempt,
   body: ChatRequest,
@@ -369,9 +389,10 @@ export async function routeChat(
       return { response, used: ref, tried, latencyMs: lastLatencyMs, fallback: lastFallback };
     }
 
-    const retryable = isRetryableStatus(response.status);
     const message = await readErrorMessage(response);
-    if (retryable) {
+    const overflow = isContextOverflow(response.status, message);
+    const retryable = shouldSkipToNextModel(response.status, message);
+    if (retryable && !overflow) {
       const retryAfterValue = response.headers.get("retry-after");
       recordCooldown(ref.slug, ref.providerId, {
         status: response.status,

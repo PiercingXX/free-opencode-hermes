@@ -12,6 +12,7 @@ import {
 } from "../config/settings.js";
 import { __resetCooldowns, __setNow, cooldownAvailableAt, recordCooldown } from "./cooldown.js";
 import {
+  isContextOverflow,
   isRetryableStatus,
   isSelfHostedProvider,
   routeChat,
@@ -138,6 +139,34 @@ test("429 with Retry-After skips that slug until it reinstates after expiry", as
   __setNow(() => start + 61_000);
   const back = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
   assert.ok(back.includes("open_router/openrouter/free"));
+  __resetCooldowns();
+});
+
+test("context overflow on a small free model hops to self-hosted instead of ending the session", async () => {
+  __resetCooldowns();
+  let settings = connectProvider(
+    emptySettings(),
+    "tailscale_sglang",
+    { baseUrl: "http://valkyrie:30000/v1" },
+    ["deepseek-v4-flash"]
+  );
+  settings.model = "tailscale_sglang/deepseek-v4-flash";
+  settings = setProviderKey(settings, "open_router", "or_test");
+  const overflow =
+    "Session too large to compact - context exceeds model limit even after stripping media";
+  const result = await routeChat(
+    settings,
+    { model: "free-opencode/default", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.providerId === "open_router") {
+        return new Response(JSON.stringify({ error: { message: overflow } }), { status: 400 });
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(result.used.providerId, "tailscale_sglang");
+  assert.ok(result.tried.some((slug) => slug.startsWith("open_router/")));
+  assert.ok(isContextOverflow(400, overflow));
   __resetCooldowns();
 });
 

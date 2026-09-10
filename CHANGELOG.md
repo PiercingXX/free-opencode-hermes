@@ -7,6 +7,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Context overflow hops instead of killing the session.** A 400/413
+  "too large to compact" / context-length error on a small free model no
+  longer aborts the turn. Routing continues to the next model (then
+  self-hosted). The catalog alias advertises a 1M context window so OpenCode
+  compaction uses the hop chain, not a 32k leaf.
+
 - **Admin hid saved providers after refresh.** Ready/configured cards were
   painted as compact "unused" because `cardFor` ignored `isUsed`. They stay
   full-size; key fields show "saved — paste to replace" instead of looking

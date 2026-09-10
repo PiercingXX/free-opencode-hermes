@@ -1211,6 +1211,13 @@ the directories they name.
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
 `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.
 
+**`Session too large to compact` ends the OpenCode session.** Compact used
+the tiny window of the first free hop. The catalog alias now advertises 1M
+context, and a context-length 400/413 skips that model and continues the
+chain (including your GPU box). Stay in the same session; check last-route.
+A brand-new session is only needed if every connected model rejected the
+payload.
+
 **OpenCode shows `Insufficient credits` on `open_router/openai/gpt-5-nano`
 and never leaves that model.** 402 used to abort routing. It now skips paid
 slugs on that provider and continues to the next ready model (then
