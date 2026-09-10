@@ -21,6 +21,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Reinstall stops then starts the proxy so an old Admin process cannot keep
   serving a catalog from before this provider existed.
 
+- **Windows `npm run build`.** The MCP server build no longer shells out to
+  `rm -f`, which PowerShell reports as not recognized. Install uses a Node
+  strip step instead.
+
 - **Shorter root README.** Intro, then Linux / Windows how-to. Hermes,
   skip-flags, launchers, and failure modes live in `MANUAL.md` §0 and §13.
 

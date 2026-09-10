@@ -4,9 +4,9 @@
   "description": "MCP server for xx-stack platform routing — multi-provider inventory, health checks, task routing, and supervision",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && rm -f dist/*.test.js dist/*.test.d.ts",
+    "build": "tsc && node ./strip-dist-tests.mjs",
     "start": "node dist/index.js",
-    "test": "npm run build && rm -rf dist-test && tsc -p tsconfig.test.json && node --import ./test-isolate-home.mjs --test dist-test/*.test.js",
+    "test": "npm run build && node ./strip-dist-tests.mjs --dist-test && tsc -p tsconfig.test.json && node --import ./test-isolate-home.mjs --test dist-test/*.test.js",
     "reliability:harness": "npm run build && node dist/reliability-harness.js",
     "harness:ci": "npm run build && node dist/reliability-harness.js && node dist/check-regression.js",
     "harness:watch": "node ../scripts/harness-watch.mjs",

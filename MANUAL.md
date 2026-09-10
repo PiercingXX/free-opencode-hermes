@@ -1165,6 +1165,9 @@ the OpenCode picker. Pull, re-run the installer (it now stops then starts
 the proxy), hard-refresh http://127.0.0.1:8082/admin, and type `bai` in the
 filter. The card title is **B.ai**. Paste the key and click **Connect**.
 
+**Windows installer: `'rm' is not recognized`.** The MCP `build` script used
+to call Unix `rm`. Pull and re-run `.\install-opencode.ps1`.
+
 **Install fails with `EEXIST` on `~/.config/opencode/skills`.** Re-run
 `./install-opencode.sh` or `.\install-opencode.ps1` — both call
 `scripts/host-setup.mjs`. A leftover `skills/design` symlink or junction
