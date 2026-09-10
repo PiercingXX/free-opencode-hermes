@@ -1179,6 +1179,12 @@ the directories they name.
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
 `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.
 
+**`xx-stack-platform-routing` MCP error -32000 Connection closed.** OpenCode
+was spawning itself (`opencode …/mcp-server/dist/index.js`) because the
+plugin used `process.execPath`. Pull, rebuild, re-run the installer, then
+`opencode mcp list` should show connected. Confirm the command starts with
+`node`, not `opencode`.
+
 **Admin will not load.** `free-opencode start`, then reload
 http://127.0.0.1:8082/admin.
 

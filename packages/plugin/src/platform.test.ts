@@ -3,7 +3,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { fileUrlFromPath, isWindows, opencodeConfigDir, userBinDir } from "./platform.js";
+import {
+  fileUrlFromPath,
+  isWindows,
+  looksLikeNodeBinary,
+  nodeExecutable,
+  opencodeConfigDir,
+  userBinDir,
+} from "./platform.js";
 
 test("fileUrlFromPath is a file:// URL OpenCode can import", () => {
   if (isWindows()) {
@@ -32,4 +39,15 @@ test("opencode config dir is ~/.config/opencode on every OS", () => {
 
 test("user bin dir is ~/.local/bin on every OS", () => {
   assert.equal(userBinDir(homedir()).endsWith(join(".local", "bin")), true);
+});
+
+test("looksLikeNodeBinary rejects the OpenCode bun binary", () => {
+  assert.equal(looksLikeNodeBinary("/usr/bin/node"), true);
+  assert.equal(looksLikeNodeBinary("C:/Program Files/nodejs/node.exe"), true);
+  assert.equal(looksLikeNodeBinary("/usr/bin/opencode"), false);
+  assert.equal(looksLikeNodeBinary("/usr/bin/bun"), false);
+});
+
+test("nodeExecutable is a node binary in this process", () => {
+  assert.equal(looksLikeNodeBinary(nodeExecutable()), true);
 });

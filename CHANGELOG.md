@@ -16,6 +16,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved tree if symlink creation is denied, and treats Git symlink
   placeholders as the directories they name.
 
+- **MCP `Connection closed`.** The plugin no longer uses OpenCode's own
+  binary as `command[0]` for `xx-stack-platform-routing`. Inside OpenCode,
+  `process.execPath` is the bun-compiled `opencode` binary; spawning that
+  as the MCP server made the client report `-32000: Connection closed`.
+  Child processes now resolve a real `node`.
+
 - **Named accounts per provider.** Optional `provider@account` ids (e.g.
   `open_router@work`) so one provider can hold more than one key. Admin
   "Add account", CLI `connect open_router@work`, and model refs
@@ -30,8 +36,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `rm -f`, which PowerShell reports as not recognized. Install uses a Node
   strip step instead.
 
-- **Shorter root README.** Intro, then Linux / Windows how-to. Hermes,
-  skip-flags, launchers, and failure modes live in `MANUAL.md` §0 and §13.
+- **README.** How-to now covers Admin (filter, Connect), a second key per
+  provider, OpenCode IDE / `opencode serve`, and not mixing PowerShell
+  commands into bash. Hermes, skip-flags, launchers, and failure modes
+  still live in `MANUAL.md` §0 and §13.
 
 - **No paid-product brand ads.** Dropped two paid-product design systems,
   replaced example-ad names with Skippy, and renamed catalog copy to

@@ -1,5 +1,6 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -23,7 +24,32 @@ export function userBinDir(home = homedir()): string {
   return join(home, ".local", "bin");
 }
 
+export function looksLikeNodeBinary(execPath: string): boolean {
+  const name = basename(execPath).toLowerCase();
+  return name === "node" || name === "node.exe";
+}
+
+/**
+ * Real Node binary for child processes. Inside OpenCode, process.execPath is
+ * the OpenCode bun binary — using it as MCP `command[0]` makes OpenCode spawn
+ * itself (`opencode dist/index.js`) and the MCP client sees -32000 connection closed.
+ */
 export function nodeExecutable(): string {
+  if (looksLikeNodeBinary(process.execPath)) return process.execPath;
+  const fromNpm = process.env.npm_node_execpath?.trim();
+  if (fromNpm && existsSync(fromNpm) && looksLikeNodeBinary(fromNpm)) return fromNpm;
+  const probe = spawnSync(isWindows() ? "where" : "which", ["node"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  const found = (probe.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && existsSync(line) && looksLikeNodeBinary(line));
+  if (found) return found;
+  for (const candidate of ["/usr/bin/node", "/usr/local/bin/node"]) {
+    if (existsSync(candidate)) return candidate;
+  }
   return process.execPath;
 }
 

@@ -224,13 +224,13 @@ function loadJsonObject(configPath) {
 
 function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
   const config = loadJsonObject(configPath);
-  const plugins = Array.isArray(config.plugin) ? config.plugin : [];
-  const already = plugins.some(
-    (entry) =>
-      typeof entry === "string" &&
-      (entry === pluginRef || entry.includes("packages/plugin/src/index.ts"))
-  );
-  if (!already) plugins.push(pluginRef);
+  const plugins = Array.isArray(config.plugin)
+    ? config.plugin.filter((entry) => {
+        if (typeof entry !== "string") return true;
+        return !entry.includes("packages/plugin/src/index.ts");
+      })
+    : [];
+  plugins.push(pluginRef);
   config.plugin = plugins;
   config.enabled_providers = ["free-opencode"];
   if (!config.model) config.model = "free-opencode/default";
