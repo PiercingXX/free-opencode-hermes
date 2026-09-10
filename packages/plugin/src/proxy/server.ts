@@ -177,7 +177,7 @@ async function handleChat(
   }
   await logRoute(
     home,
-    routeResult(routed.used.slug, routed.used.providerId, 200, 0, true, 0, routed.tried, requestId),
+    routeResult(routed.used.slug, routed.used.providerId, 200, routed.latencyMs ?? 0, true, routed.fallback ?? 0, routed.tried, requestId),
     "route.result"
   );
   if (body.stream) {

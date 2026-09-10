@@ -306,7 +306,7 @@ export function adminPage(): string {
         String(p.id || "").toLowerCase().indexOf(query) >= 0;
     }
     function cardFor(p, query) {
-      if (filterMatches(p, query) || isUsed(p) || expanded.has(p.id)) return card(p);
+      if (filterMatches(p, query) || expanded.has(p.id)) return card(p);
       return compactCard(p);
     }
     function paintCatalog() {

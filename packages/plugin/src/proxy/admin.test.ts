@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { sortAdminCatalog } from "./admin.js";
+import { sortAdminCatalog, adminPage } from "./admin.js";
 
 test("admin catalog sorts configured/ready providers above unused, stable by id", () => {
   const rows = [
@@ -28,4 +28,11 @@ test("admin catalog keeps both local and cloud order within a bucket", () => {
     result.map((r) => r.id),
     ["groq", "ollama", "open_router"]
   );
+});
+
+test("admin page template includes compact class and expand data for unused cards", () => {
+  const html = adminPage();
+  assert.ok(html.includes('class="card compact"'));
+  assert.ok(html.includes("data-expand="));
+  assert.ok(!html.includes('class="card ready compact"'));
 });

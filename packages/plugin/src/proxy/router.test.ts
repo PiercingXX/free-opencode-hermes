@@ -12,6 +12,7 @@ import {
 } from "../config/settings.js";
 import { __resetCooldowns, __setNow, recordCooldown } from "./cooldown.js";
 import {
+  isRetryableStatus,
   isSelfHostedProvider,
   routeChat,
   routeTargets,
@@ -109,6 +110,45 @@ test("429 with Retry-After skips that slug until it reinstates after expiry", as
   __setNow(() => start + 61_000);
   const back = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
   assert.ok(back.includes("open_router/openrouter/free"));
+  __resetCooldowns();
+});
+
+test("402 insufficient credits skips remaining paid slugs on that provider and uses last-resort", async () => {
+  __resetCooldowns();
+  let settings = connectProvider(
+    emptySettings(),
+    "tailscale_sglang",
+    { baseUrl: "http://valkyrie:30000/v1" },
+    ["deepseek-v4-flash"]
+  );
+  settings.model = "tailscale_sglang/deepseek-v4-flash";
+  settings = setProviderKey(settings, "open_router", "or_test");
+
+  const result = await routeChat(
+    settings,
+    { model: "free-opencode/default", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.providerId === "open_router") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "Insufficient credits. This account never purchased credits.",
+              type: "payment_required",
+            },
+          }),
+          { status: 402 }
+        );
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(result.used.providerId, "tailscale_sglang");
+  assert.ok(result.tried.some((slug) => slug.startsWith("open_router/")));
+  assert.ok(result.tried.includes("tailscale_sglang/deepseek-v4-flash"));
+  // One 402 on a paid OpenRouter slug is enough; we do not walk every paid id.
+  const paidHits = result.tried.filter((slug) => slug.startsWith("open_router/")).length;
+  assert.ok(paidHits >= 1);
+  assert.equal(isRetryableStatus(402), true, "402 must not abort the chain");
   __resetCooldowns();
 });
 

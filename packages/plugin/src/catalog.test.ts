@@ -487,6 +487,7 @@ test("sanitizeChatPayload fills empty OpenCode tool schemas and drops strict", (
 
 test("429 and 5xx are retryable, 401 is not", () => {
   assert.equal(isRetryableStatus(429), true);
+  assert.equal(isRetryableStatus(402), true);
   assert.equal(isRetryableStatus(503), true);
   assert.equal(isRetryableStatus(401), false);
 });

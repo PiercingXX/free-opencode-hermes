@@ -395,7 +395,12 @@ async function cmdService(action: string | undefined): Promise<void> {
         `http://${settings.listen.host}:${settings.listen.port}`
       );
       if (!health?.ok) {
-        await cmdStart(true);
+        const proxy = startProxy(settings);
+        await waitForListen(proxy);
+        const pid = spawnDetachedProxy();
+        writeFileSync(pidPath(), `${pid}\n`);
+        console.log(`Proxy http://${settings.listen.host}:${settings.listen.port} (pid ${pid})`);
+        console.log(`Admin http://${settings.listen.host}:${settings.listen.port}/admin`);
       }
       return;
     }

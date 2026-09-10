@@ -72,6 +72,7 @@ export function recentRoutes(): LastRoute[] {
 export function __resetRouteLog(): void {
   ring.length = 0;
   lastRoute = null;
+  maxLogBytes = MAX_LOG_BYTES;
 }
 
 export function currentLastRoute(): LastRoute | null {

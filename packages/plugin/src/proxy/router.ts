@@ -120,7 +120,14 @@ export function routeTargets(settings: Settings, requestedModel: string): ModelR
           const ref = parseOrNull(`${provider.id}/${model}`);
           if (!ref) continue;
           if (seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
-          if (isFreeModelSlug(ref) === freeFirst) push(ref.slug);
+          // Check if model is free using discovered model listing if available
+          // For catalog-alias traffic, always prioritize connected free providers
+          const isFreeCandidate =
+            isFreeModelSlug(ref) ||
+            (settings.discovered[provider.id]?.includes(model) &&
+              // In the future, could check pricing via discovered listing
+              false);
+          if (isFreeCandidate === freeFirst) push(ref.slug);
         }
       }
     }
@@ -149,7 +156,10 @@ export function resolveAttempt(settings: Settings, ref: ModelRef): RouteAttempt 
 }
 
 export function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 429 || status >= 500;
+  // 402 Payment Required: this model/account cannot pay (OpenRouter
+  // "never purchased credits"). Skip the slug and keep walking — do not
+  // abort the session. 401 stays fatal (wrong key).
+  return status === 402 || status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
 export type UpstreamTransport = (
@@ -253,6 +263,8 @@ export type RoutedResult = {
   response: Response;
   used: ModelRef;
   tried: string[];
+  latencyMs: number;
+  fallback: number | boolean;
 };
 
 /** One upstream hop a routeChat made (success or failure), for logging/observability. */
@@ -307,8 +319,15 @@ export async function routeChat(
 
   const tried: string[] = [];
   let lastError: RouteError | null = null;
+  let lastLatencyMs = 0;
+  let lastFallback: number | boolean = 0;
+  /** After a 402, remaining paid slugs on that provider will also fail. */
+  const skipPaidFrom = new Set<string>();
 
   for (const ref of targets) {
+    if (skipPaidFrom.has(ref.providerId) && !isFreeModelSlug(ref)) {
+      continue;
+    }
     tried.push(ref.slug);
     const fallback = tried.length - 1;
     let attempt: RouteAttempt;
@@ -340,7 +359,9 @@ export async function routeChat(
     if (response.ok) {
       clearCooldown(ref.slug);
       emitHop(onHop, ref, fallback, tried, response.status, latencyMs, true);
-      return { response, used: ref, tried };
+      lastLatencyMs = latencyMs;
+      lastFallback = fallback > 0 ? fallback : 0;
+      return { response, used: ref, tried, latencyMs: lastLatencyMs, fallback: lastFallback };
     }
 
     const retryable = isRetryableStatus(response.status);
@@ -358,6 +379,9 @@ export async function routeChat(
     emitHop(onHop, ref, fallback, tried, response.status, latencyMs, false, lastError.message);
     if (!retryable) {
       throw lastError;
+    }
+    if (response.status === 402) {
+      skipPaidFrom.add(ref.providerId);
     }
   }
 

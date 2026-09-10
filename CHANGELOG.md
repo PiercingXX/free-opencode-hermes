@@ -7,6 +7,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **OpenRouter 402 no longer kills the session.** Insufficient credits used to
+  abort the whole hop chain (`gpt-5-nano` and similar). 402 now skips remaining
+  paid slugs on that provider and continues to the next ready model so OpenCode
+  keeps tools and context.
+
 - **Install over an existing OpenCode config.** `host-setup` no longer dies
   with `EEXIST` on `~/.config/opencode/skills` under Node 26. A leftover
   `skills/design` symlink pointing at a previous clone path was enough to
@@ -26,6 +31,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   set OpenCode `steps`. A 120-call floor was disabling tools
   (`CRITICAL-MAXIMUM-STEPS-REACHED`) and the model spiraled on text instead of
   working. Subagents still get the 120 floor.
+
+- **Unattended orchestrators (from xx-stack `ba97429`).** `execution-orchestrator`
+  and `parallel-execution-orchestrator` omit `steps`, own the loop on disk,
+  and fan out independent slices with GPU/self-hosted last. The plugin no
+  longer floors those two at 120. `orchestrator-steps:check` guards the key.
 
 - **Named accounts per provider.** Optional `provider@account` ids (e.g.
   `open_router@work`) so one provider can hold more than one key. Admin

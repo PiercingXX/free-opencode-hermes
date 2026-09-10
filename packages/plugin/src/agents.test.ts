@@ -76,6 +76,11 @@ test("OpenCode agent steps floor overrides xx-stack markdown budgets", () => {
   assert.notEqual(reviewer.prompt, "stale");
   const build = config.agent?.build as { steps?: number };
   assert.equal("steps" in build, false);
+  const orch = config.agent?.["execution-orchestrator"] as { steps?: number; prompt?: string };
+  if (orch) {
+    assert.equal("steps" in orch, false);
+    assert.ok(orch.prompt && orch.prompt.length > 0);
+  }
   const ping = config.agent?.ping as { disable?: boolean; hidden?: boolean; mode?: string };
   assert.equal(ping.disable, true);
   assert.equal(ping.hidden, true);
@@ -144,6 +149,11 @@ test("applyRuntimeExtras loads xx-stack agents and leaves native build without a
   const reviewer = config.agent?.reviewer as { prompt?: string; disable?: boolean };
   assert.ok(reviewer?.prompt && reviewer.prompt.length > 0);
   assert.notEqual(reviewer.disable, true);
+  const orch = config.agent?.["execution-orchestrator"] as { steps?: number; prompt?: string };
+  assert.equal("steps" in (orch ?? {}), false);
+  assert.ok(orch?.prompt && orch.prompt.length > 0);
+  const parallel = config.agent?.["parallel-execution-orchestrator"] as { steps?: number };
+  assert.equal("steps" in (parallel ?? {}), false);
 });
 
 test("stripNativePrimaryAgentFiles unlinks leftover build/plan/general markdown", () => {

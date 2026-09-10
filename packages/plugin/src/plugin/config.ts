@@ -26,6 +26,12 @@ import { appendLog } from "../proxy/route-log.js";
 export const OPENCODE_AGENT_STEPS_FLOOR = 120;
 const DISABLED_HOST_AGENTS = new Set(["ping", "planning", "researcher"]);
 const OPENCODE_NATIVE_PRIMARIES = new Set(["build", "plan", "general"]);
+/** Native primaries plus xx-stack unattended orchestrators — omit OpenCode `steps`. */
+const UNBOUNDED_STEPS_AGENTS = new Set([
+  ...OPENCODE_NATIVE_PRIMARIES,
+  "execution-orchestrator",
+  "parallel-execution-orchestrator",
+]);
 /** Markdown names that replace OpenCode's native build/plan/general tools. */
 export const OPENCODE_NATIVE_PRIMARY_FILES = ["build.md", "plan.md", "general.md"] as const;
 const PLUGIN_TOOLS = ["foc_status", "foc_models"] as const;
@@ -274,14 +280,18 @@ export function applyRuntimeExtras(config: MutableConfig): void {
           : {}),
         ...agent.permission,
       },
-      steps: openCodeAgentSteps(existing.steps ?? agent.steps),
     };
+    if (UNBOUNDED_STEPS_AGENTS.has(agent.name)) {
+      delete merged.steps;
+    } else {
+      merged.steps = openCodeAgentSteps(existing.steps ?? agent.steps);
+    }
     (config.agent as Record<string, AgentConfig>)[agent.name] = merged;
   }
   const agents = config.agent as Record<string, AgentConfig>;
   for (const [name, def] of Object.entries(agents)) {
     if (!def || typeof def !== "object") continue;
-    if (OPENCODE_NATIVE_PRIMARIES.has(name)) {
+    if (UNBOUNDED_STEPS_AGENTS.has(name)) {
       delete def.steps;
     } else {
       def.steps = openCodeAgentSteps(def.steps);

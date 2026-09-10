@@ -607,7 +607,13 @@ Inside OpenCode the shipped host contract is
 `instructions` loads `shared_instructions.md`, and
 `mcp.xx-stack-platform-routing` starts the routing server. Tab primaries
 are `build`, `plan`, `research`, `fast-build`, `execution-orchestrator`,
-and `parallel-execution-orchestrator`. Slash commands live in
+and `parallel-execution-orchestrator`. `execution-orchestrator` and
+`parallel-execution-orchestrator` are the long-running **unattended**
+primaries: they omit OpenCode `steps` (no tool-call cap), write todo state
+to disk, and keep going until the request is done or a hard blocker stops
+them. Parallel fan-out prefers non-GPU lanes and still runs if MCP is down.
+`npm run orchestrator-steps:check` fails if either agent regains a `steps`
+key. Slash commands live in
 `opencode-orchestration/opencode/command/`. `setup-opencode.sh` and
 `scripts/host-setup.mjs` install agents, skills, commands, and register
 the MCP server. Native OpenCode `build` / `plan` / `general` markdown is
@@ -1203,6 +1209,12 @@ the directories they name.
 **`free-opencode` or `opencode` is not found.** Open a new terminal. Linux /
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
 `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.
+
+**OpenCode shows `Insufficient credits` on `open_router/openai/gpt-5-nano`
+and never leaves that model.** 402 used to abort routing. It now skips paid
+slugs on that provider and continues to the next ready model (then
+self-hosted). Stay in the same session; check Admin last-route. Restart the
+proxy after updating.
 
 **Agent repeats the same handoff and tools are dead.** OpenCode hit
 `agent.steps` and disabled tools. Native primaries now omit `steps` (loop
