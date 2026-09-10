@@ -31,7 +31,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $Root "xx-stack"))) {
 }
 
 function Get-Application([string] $Name) {
-    return Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue
+    # PowerShell can return multiple application matches on Windows (for
+    # example both npm.cmd and npm). Callers need one ApplicationInfo so
+    # .Source is a single executable path rather than an array of paths.
+    return @(Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)[0]
 }
 
 function Add-UserPath([string] $Entry) {
