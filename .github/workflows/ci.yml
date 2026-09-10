@@ -71,6 +71,9 @@ jobs:
       - name: Format check
         run: npm run format:check
 
+      - name: Test host-setup copy
+        run: npm run host-setup:test
+
   mcp-server:
     # Matrix covers the lowest supported version (package.json engines) and
     # current LTS. Node's test-runner glob handling differs across majors, so

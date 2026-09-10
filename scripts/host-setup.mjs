@@ -40,9 +40,118 @@ function writeAtomic(filePath, contents) {
   fs.renameSync(tmp, filePath);
 }
 
+/**
+ * Merge src onto dest. Shared by install-opencode.sh and install-opencode.ps1.
+ * Node 26's fs.cpSync C++ path throws EEXIST when dest already exists and
+ * contains a dangling symlink or junction (a leftover `skills/design`
+ * pointing at a previous clone is the usual case).
+ */
 function copyDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
-  fs.cpSync(src, dest, { recursive: true, force: true });
+  for (const name of fs.readdirSync(src)) {
+    copyPath(path.join(src, name), path.join(dest, name));
+  }
+}
+
+function copyPath(src, dest) {
+  const srcStat = fs.lstatSync(src);
+  if (srcStat.isSymbolicLink()) {
+    copySymlink(src, dest);
+    return;
+  }
+  const placeholder = gitLinkPlaceholderTarget(src, srcStat);
+  if (placeholder) {
+    copyResolved(placeholder, dest);
+    return;
+  }
+  if (srcStat.isDirectory()) {
+    let destStat = null;
+    try {
+      destStat = fs.lstatSync(dest);
+    } catch {
+      destStat = null;
+    }
+    if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+    copyDir(src, dest);
+    return;
+  }
+  try {
+    const destStat = fs.lstatSync(dest);
+    if (destStat.isDirectory() || destStat.isSymbolicLink()) {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+  } catch {
+    // dest is missing
+  }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(src, dest);
+}
+
+/** Git without core.symlinks writes the link text as a file (common on Windows). */
+function gitLinkPlaceholderTarget(src, srcStat) {
+  if (!srcStat.isFile() || srcStat.size === 0 || srcStat.size > 512) return null;
+  let text;
+  try {
+    text = fs.readFileSync(src, "utf8");
+  } catch {
+    return null;
+  }
+  const trimmed = text.trim();
+  if (!trimmed || /[\n\r\0]/.test(trimmed)) return null;
+  if (!trimmed.includes("/") && !trimmed.includes("\\")) return null;
+  const resolved = path.resolve(path.dirname(src), trimmed);
+  try {
+    const st = fs.statSync(resolved);
+    if (st.isDirectory() || st.isFile()) return resolved;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function copyResolved(target, dest) {
+  const st = fs.statSync(target);
+  if (st.isDirectory()) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    copyDir(target, dest);
+    return;
+  }
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(target, dest);
+}
+
+function copySymlink(src, dest) {
+  const raw = fs.readlinkSync(src);
+  const target = path.resolve(path.dirname(src), raw);
+  fs.rmSync(dest, { recursive: true, force: true });
+  let srcIsDir = false;
+  try {
+    srcIsDir = fs.statSync(src).isDirectory();
+  } catch {
+    // dangling source link
+  }
+  if (isWin) {
+    const type = srcIsDir ? "junction" : "file";
+    try {
+      fs.symlinkSync(target, dest, type);
+      return;
+    } catch {
+      if (srcIsDir) {
+        copyDir(target, dest);
+        return;
+      }
+      try {
+        fs.copyFileSync(target, dest);
+      } catch {
+        // dangling file link
+      }
+      return;
+    }
+  }
+  fs.symlinkSync(target, dest);
 }
 
 /** OpenCode ships build/plan/general. Copying xx-stack markdown over those names empties tool calls. */
@@ -59,7 +168,7 @@ function copyAgentsSkippingNativePrimaries(src, dest) {
   }
   for (const name of fs.readdirSync(src)) {
     if (OPENCODE_NATIVE_AGENT_FILES.has(name)) continue;
-    fs.cpSync(path.join(src, name), path.join(dest, name), { recursive: true, force: true });
+    copyPath(path.join(src, name), path.join(dest, name));
   }
 }
 
@@ -242,12 +351,26 @@ function hermesHost() {
   }
 }
 
-const cmd = process.argv[2];
-if (cmd === "opencode-host") {
-  opencodeHost();
-} else if (cmd === "hermes-host") {
-  hermesHost();
-} else {
-  console.log("Usage: node scripts/host-setup.mjs opencode-host|hermes-host");
-  process.exit(1);
+export { copyDir, copyAgentsSkippingNativePrimaries };
+
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return pathToFileURL(path.resolve(entry)).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  const cmd = process.argv[2];
+  if (cmd === "opencode-host") {
+    opencodeHost();
+  } else if (cmd === "hermes-host") {
+    hermesHost();
+  } else {
+    console.log("Usage: node scripts/host-setup.mjs opencode-host|hermes-host");
+    process.exit(1);
+  }
 }

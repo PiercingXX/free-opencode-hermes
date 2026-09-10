@@ -119,6 +119,8 @@ if (-not $SkipOpenCode) {
 }
 
 Write-Info "wiring OpenCode host files, plugin, and CLI"
+# Same host-setup.mjs as ./install-opencode.sh: merges skills/agents even when
+# %USERPROFILE%\.config\opencode\skills already exists (Node 26 EEXIST).
 & $node.Source (Join-Path $Root "scripts\host-setup.mjs") "opencode-host"
 if ($LASTEXITCODE -ne 0) { Die "host setup failed" }
 

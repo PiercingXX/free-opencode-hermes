@@ -1160,6 +1160,13 @@ coupling is deliberate.
 
 ## 13. Troubleshooting
 
+**Install fails with `EEXIST` on `~/.config/opencode/skills`.** Re-run
+`./install-opencode.sh` or `.\install-opencode.ps1` — both call
+`scripts/host-setup.mjs`. A leftover `skills/design` symlink or junction
+from an older clone path used to make Node 26 `fs.cpSync` abort; host-setup
+now merges that tree. On Windows, Git symlink placeholders are copied as
+the directories they name.
+
 **`free-opencode` or `opencode` is not found.** Open a new terminal. Linux /
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include
 `%USERPROFILE%\.local\bin` and `%USERPROFILE%\.opencode\bin`.

@@ -53,6 +53,15 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     modelsQuery: "supported_parameters=tools",
   },
   {
+    id: "bai",
+    name: "B.AI",
+    env: "BAI_API_KEY",
+    credentialUrl: "https://docs.b.ai/llmservice/api/",
+    defaultBaseUrl: "https://api.b.ai/v1",
+    defaultModels: ["gpt-5.5", "deepseek-v4-flash"],
+    notes: "OpenAI-compatible /v1. Connect lists models for the current key.",
+  },
+  {
     id: "groq",
     name: "Groq",
     env: "GROQ_API_KEY",

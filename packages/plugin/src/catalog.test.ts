@@ -54,6 +54,16 @@ test("provider catalog ids are unique and non-empty", () => {
   }
 });
 
+test("B.AI is a connectable OpenAI-compatible provider", () => {
+  const provider = providerById("bai");
+  assert.ok(provider);
+  assert.equal(provider.name, "B.AI");
+  assert.equal(provider.env, "BAI_API_KEY");
+  assert.equal(provider.defaultBaseUrl, "https://api.b.ai/v1");
+  assert.ok(provider.defaultModels.includes("gpt-5.5"));
+  assert.equal(provider.local, undefined);
+});
+
 test("local providers expose a base URL extra field", () => {
   for (const id of [
     "ollama",

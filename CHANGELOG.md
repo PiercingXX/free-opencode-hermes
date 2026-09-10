@@ -7,6 +7,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Install over an existing OpenCode config.** `host-setup` no longer dies
+  with `EEXIST` on `~/.config/opencode/skills` under Node 26. A leftover
+  `skills/design` symlink pointing at a previous clone path was enough to
+  make `fs.cpSync` abort; the copier now merges and replaces dangling links.
+  Linux (`install-opencode.sh`) and Windows (`install-opencode.ps1`) both
+  call this script. On Windows it uses junctions when it can, copies the
+  resolved tree if symlink creation is denied, and treats Git symlink
+  placeholders as the directories they name.
+
+- **B.AI provider.** Admin / `free-opencode connect bai` accepts `BAI_API_KEY`
+  against `https://api.b.ai/v1`.
+
 - **Shorter root README.** Intro, then Linux / Windows how-to. Hermes,
   skip-flags, launchers, and failure modes live in `MANUAL.md` §0 and §13.
 
