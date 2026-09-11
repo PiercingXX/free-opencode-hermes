@@ -31,6 +31,7 @@ import { applyAutofindResults, runAutofind } from "./providers/autofind.js";
 import { allProviders, providerById, providerExtraFields } from "./providers/catalog.js";
 import { suggestedBaseUrl } from "./providers/inventory.js";
 import { buildModelCatalog, probeProvider } from "./proxy/models.js";
+import { probeProviderAccess } from "./proxy/model-access.js";
 import { fetchProxyHealth, isStaleProxy, startProxy, waitForListen } from "./proxy/server.js";
 import { appendLog, formatRouteLine, readLogTail, type RouteHopRecord } from "./proxy/route-log.js";
 import { isSelfHostedProvider } from "./proxy/router.js";
@@ -274,14 +275,40 @@ async function cmdConnect(providerId?: string): Promise<void> {
       console.error(`Provider '${providerId}' is not connectable.`);
       process.exit(1);
     }
-    const key = (await rl.question(`${provider.name} API key: `)).trim();
+    const existingKey = settings.keys[resolvedProviderId]?.trim() || "";
+    const typed = (
+      await rl.question(
+        existingKey ? `${provider.name} API key [saved]: ` : `${provider.name} API key: `
+      )
+    ).trim();
+    const key = typed || existingKey;
     if (!key) {
       console.error("No key entered.");
       process.exit(1);
     }
     settings = setProviderKey(settings, resolvedProviderId, key, extra);
+    const probed = await probeProvider(settings, resolvedProvider);
+    if (!probed.ok) {
+      console.error(
+        `Could not reach ${resolvedProvider.name} at ${probed.baseUrl}: ${probed.error}`
+      );
+      process.exit(1);
+    }
+    settings = connectProvider(settings, resolvedProviderId, extra, probed.models);
+    if (baseProviderId === "bai") {
+      console.log("Probing which B.ai models answer without deposit/balance…");
+      const access = await probeProviderAccess(settings, resolvedProviderId, { force: true });
+      settings = access.settings;
+      const open = access.probed.filter((row) => row.status === "open").map((row) => row.slug);
+      const paywall = access.probed
+        .filter((row) => row.status === "paywall")
+        .map((row) => row.slug);
+      if (open.length) console.log(`Open (auto-route): ${open.join(", ")}`);
+      if (paywall.length) console.log(`Paywall (skipped): ${paywall.join(", ")}`);
+    }
     saveSettings(settings);
-    console.log(`Saved ${resolvedProviderId}. Default model: ${settings.model ?? "(unchanged)"}`);
+    console.log(`Connected ${resolvedProviderId}. Models: ${probed.models.length}`);
+    console.log(`Default model: ${settings.model ?? "(unchanged)"}`);
   } finally {
     rl.close();
   }

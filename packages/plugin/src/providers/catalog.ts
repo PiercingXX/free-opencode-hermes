@@ -61,8 +61,9 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     env: "BAI_API_KEY",
     credentialUrl: "https://docs.b.ai/llmservice/api/",
     defaultBaseUrl: "https://api.b.ai/v1",
-    defaultModels: ["gpt-5.5", "deepseek-v4-flash"],
-    notes: "OpenAI-compatible /v1. Connect lists models for the current key.",
+    defaultModels: ["glm-5.3-flash"],
+    notes:
+      "OpenAI-compatible /v1. Connect probes which models actually answer without deposit/balance errors; only probed-open models are auto-routed (glm / qwen3.8-flash / hy3 / mimo-v2.5 candidates).",
   },
   {
     id: "groq",

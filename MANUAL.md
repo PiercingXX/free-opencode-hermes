@@ -1200,6 +1200,9 @@ coupling is deliberate.
 the OpenCode picker. Pull, re-run the installer (it now stops then starts
 the proxy), hard-refresh http://127.0.0.1:8082/admin, and type `bai` in the
 filter. The card title is **B.ai**. Paste the key and click **Connect**.
+Connect (Admin or `free-opencode connect bai`) live-probes candidates and only
+auto-routes models marked open in `modelAccess` (`glm-5.3-flash`,
+`qwen3.8-flash`, `hy3`, `mimo-v2.5`). Deposit / zero-balance ids are skipped.
 
 **Windows installer: `'rm' is not recognized`.** The MCP `build` script used
 to call Unix `rm`. Pull and re-run `.\install-opencode.ps1`.

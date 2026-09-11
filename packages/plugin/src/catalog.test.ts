@@ -64,7 +64,8 @@ test("B.ai is a connectable OpenAI-compatible provider", () => {
   assert.equal(provider.name, "B.ai");
   assert.equal(provider.env, "BAI_API_KEY");
   assert.equal(provider.defaultBaseUrl, "https://api.b.ai/v1");
-  assert.ok(provider.defaultModels.includes("gpt-5.5"));
+  assert.ok(provider.defaultModels.includes("glm-5.3-flash"));
+  assert.deepEqual(provider.defaultModels, ["glm-5.3-flash"]);
   assert.equal(provider.local, undefined);
   assert.equal(isAdminListed(emptySettings(), "bai"), true);
 });
@@ -245,6 +246,13 @@ test("free model ids include Zen -free, OpenRouter :free, and big-pickle", () =>
   assert.equal(isFreeModelId("mimo-v2.5-free"), true);
   assert.equal(isFreeModelId("qwen/qwen3-coder:free"), true);
   assert.equal(isFreeModelId("llama-3.3-70b-versatile"), false);
+  // gpt-5-nano is free on Zen only — B.ai's same id is premium.
+  assert.equal(isFreeModelId("gpt-5-nano"), false);
+  assert.equal(isFreeModelId("gpt-5-nano", "opencode_zen"), true);
+  assert.equal(isFreeModelId("gpt-5-nano", "bai"), false);
+  assert.equal(isFreeModelId("glm-5.3-flash", "bai"), false);
+  assert.equal(isFreeModelId("qwen3.8-flash", "bai"), false);
+  assert.equal(isFreeModelId("glm-5.3-flash", "open_router"), false);
   const ordered = preferDefaultModel(
     [
       listedModel("groq", "llama-3.3-70b-versatile", "Groq / llama"),
@@ -490,6 +498,7 @@ test("sanitizeChatPayload fills empty OpenCode tool schemas and drops strict", (
 test("429 and 5xx are retryable, 401 is not", () => {
   assert.equal(isRetryableStatus(429), true);
   assert.equal(isRetryableStatus(402), true);
+  assert.equal(isRetryableStatus(403), true);
   assert.equal(isRetryableStatus(503), true);
   assert.equal(isRetryableStatus(401), false);
   assert.equal(isRetryableStatus(400), false);
@@ -555,12 +564,12 @@ function withHomeDir(fn: (home: string) => void): void {
 }
 
 test("account-qualified provider ids stay independent in routing keys", () => {
-  withHomeDir(() => {
+  withHomeDir((home) => {
     let settings = emptySettings();
     const withWork = addAccount(settings, "open_router", "work");
     settings = withWork.settings;
     settings = setProviderKey(settings, "open_router@work", "key_work");
-    saveSettings(settings);
+    saveSettings(settings, home);
     assert.equal(settings.keys["open_router@work"], "key_work");
     assert.equal(settings.keys["open_router"], undefined);
     assert.ok(isProviderReady(settings, "open_router@work"));
@@ -569,11 +578,11 @@ test("account-qualified provider ids stay independent in routing keys", () => {
 });
 
 test("providerById resolves account-qualified ids", () => {
-  withHomeDir(() => {
+  withHomeDir((home) => {
     let settings = emptySettings();
     const { settings: withAcct } = addAccount(settings, "open_router", "work");
     settings = setProviderKey(withAcct, "open_router@work", "key_work");
-    saveSettings(settings);
+    saveSettings(settings, home);
     const provider = providerById("open_router@work");
     assert.ok(provider);
     assert.equal(provider.id, "open_router@work");
@@ -597,11 +606,11 @@ test("removeProvider drops an account-qualified provider and its account entry",
 });
 
 test("defaultListedModels includes account-qualified ids", () => {
-  withHomeDir(() => {
+  withHomeDir((home) => {
     let settings = emptySettings();
     const { settings: withAcct } = addAccount(settings, "groq", "work");
     settings = setProviderKey(withAcct, "groq@work", "gsk_test");
-    saveSettings(settings);
+    saveSettings(settings, home);
     const models = defaultListedModels(settings);
     assert.ok(models.some((row) => row.id.startsWith("groq@work/")));
   });

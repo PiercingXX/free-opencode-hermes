@@ -134,7 +134,8 @@ export function listedModel(
   providerId: string,
   model: string,
   displayName: string,
-  view: CatalogView = "default"
+  view: CatalogView = "default",
+  settings?: Settings
 ): ListedModel {
   const id = `${providerId}/${model}`;
   const row: ListedModel = {
@@ -148,7 +149,11 @@ export function listedModel(
     provider_model_ref: id,
     supportsReasoning: true,
     supportsTools: true,
-    free: Boolean(providerById(providerId)?.local) || isFreeModelId(model),
+    free:
+      Boolean(providerById(providerId)?.local) ||
+      (settings
+        ? isFreeOrLearnedOpen(settings, providerId, model)
+        : isFreeModelId(model, providerId)),
     inputModalities: ["text"],
   };
   if (view === "responses") {
@@ -193,15 +198,58 @@ export type ModelListing = {
   free?: boolean;
 };
 
-/** OpenCode Zen stealth/free leaves that do not use a -free suffix. */
-const FREE_MODEL_LEAVES = new Set(["big-pickle", "gpt-5-nano"]);
+/** Global free leaves (any provider) that do not use a -free / :free suffix. */
+const FREE_MODEL_LEAVES = new Set(["big-pickle"]);
 
-export function isFreeModelId(id: string): boolean {
+/**
+ * Provider-scoped free leaves. Zen `gpt-5-nano` is $0; the same id on B.ai is
+ * premium (deposit). B.ai's current 0-credit promo lineup (docs + live probes)
+ * is listed here — GET /models does not advertise pricing.
+ */
+const FREE_MODEL_LEAVES_BY_PROVIDER: Record<string, ReadonlySet<string>> = {
+  opencode_zen: new Set(["big-pickle", "gpt-5-nano"]),
+  opencode: new Set(["big-pickle", "gpt-5-nano"]),
+  // B.ai has no static free leaf — GET /models lacks pricing. Auto-routing uses
+  // probed `modelAccess` open entries only (see probeProviderAccess).
+};
+
+export function isFreeModelId(id: string, providerId?: string): boolean {
   const n = id.trim().toLowerCase();
   if (!n) return false;
   if (n.endsWith(":free") || n.endsWith("-free") || n.endsWith("/free")) return true;
   const leaf = n.split("/").pop() ?? n;
+  if (providerId) {
+    const base = providerId.split("@")[0]?.toLowerCase() ?? "";
+    const scoped = FREE_MODEL_LEAVES_BY_PROVIDER[base];
+    if (scoped?.has(leaf)) return true;
+  }
   return FREE_MODEL_LEAVES.has(leaf);
+}
+
+/** True when we should treat a slug as free for routing (static leaf or learned open). */
+export function isFreeOrLearnedOpen(
+  settings: { modelAccess?: Record<string, { status?: string }> },
+  providerId: string,
+  model: string
+): boolean {
+  const base = providerId.split("@")[0]?.toLowerCase() ?? "";
+  // B.ai: probed-open only — never trust a static leaf or unprobed flash name.
+  if (base === "bai") {
+    return settings.modelAccess?.[`${providerId}/${model}`]?.status === "open";
+  }
+  if (isFreeModelId(model, providerId)) return true;
+  const slug = `${providerId}/${model}`;
+  return settings.modelAccess?.[slug]?.status === "open";
+}
+
+/** B.ai auto-route: only models a hardened probe marked open. */
+export function isBaiAutoRoutedModel(
+  model: string,
+  settings?: { modelAccess?: Record<string, { status?: string }> },
+  providerId = "bai"
+): boolean {
+  if (!settings) return false;
+  return settings.modelAccess?.[`${providerId}/${model}`]?.status === "open";
 }
 
 export function listingIsFree(row: Record<string, unknown>, id: string): boolean {
@@ -273,7 +321,7 @@ export function defaultListedModels(
   for (const provider of allProviders()) {
     if (!isProviderReady(settings, provider.id)) continue;
     for (const model of listedModelsForProvider(settings, provider)) {
-      out.push(listedModel(provider.id, model, `${provider.name} / ${model}`, view));
+      out.push(listedModel(provider.id, model, `${provider.name} / ${model}`, view, settings));
     }
   }
   return preferDefaultModel(out, settings.model);
@@ -480,7 +528,7 @@ export async function buildModelCatalog(
       models = listedModelsForProvider(settings, provider);
     }
     for (const model of models) {
-      push(listedModel(provider.id, model, `${provider.name} / ${model}`, view));
+      push(listedModel(provider.id, model, `${provider.name} / ${model}`, view, settings));
     }
   }
   return preferDefaultModel(out, settings.model);

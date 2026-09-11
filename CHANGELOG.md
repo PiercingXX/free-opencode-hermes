@@ -7,6 +7,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **B.ai free routing.** B.ai auto-routes only models a hardened live probe
+  marks open (`modelAccess`). Candidates: `glm-5.3-flash`, `qwen3.8-flash`,
+  `hy3`, `mimo-v2.5` (DeepSeek flash is skipped — zero-balance accounts get
+  charged). Deposit / insufficient-balance refusals hop; Connect and the first
+  chat re-probe when no fresh open model exists. The proxy always passes a home
+  path so probe results persist; unit tests omit `home` on `routeChat` so they
+  cannot wipe `~/.free-opencode`. Probes run sequentially with their own timeout
+  so they do not burn concurrency or die with the chat AbortSignal. Admin-named
+  providers free-fill before other connected freeloaders.
+
 - **Windows keep-alive install no longer hits schtasks formatting errors.**
   `service install` writes `~\.config\free-opencode\start-proxy.cmd` and points
   the ONLOGON task `/TR` at that single helper (no nested `node.exe` + `cli.js`

@@ -107,7 +107,161 @@ test("alias route: configured fallbacks do not hop to unlisted paid or Zen free"
   assert.ok(slugs.includes("groq/llama-3.3-70b-versatile"), "bare groq expands to listed models");
   assert.ok(!slugs.includes("bai/gpt-5.5"), "unlisted paid B.ai catalog must not hop");
   assert.ok(!slugs.includes("opencode_zen/big-pickle"), "Zen free must not hop unless Zen is in Admin list");
+  // OpenRouter free leads; Admin B.ai default is explicit (not probed-free here).
   assert.ok(slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("bai/glm-5.3-flash"));
+  assert.ok(slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("groq/llama-3.3-70b-versatile"));
+});
+
+test("alias route: B.ai prefers glm-5.3-flash free over mislabeled gpt-5-nano", () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings.model = null;
+  settings.fallbacks = [];
+  settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash", "gpt-5.5"];
+  settings.modelAccess = {
+    "bai/glm-5.3-flash": { status: "open", at: Date.now() },
+  };
+
+  const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
+  assert.equal(slugs[0], "bai/glm-5.3-flash");
+  assert.ok(!slugs.includes("bai/gpt-5-nano"), "B.ai gpt-5-nano is premium, not a free leaf");
+});
+
+test("alias route: cooled promo free model hops to other probed-open B.ai models", () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings = setProviderKey(settings, "open_router", "or_test");
+  settings.model = "bai/glm-5.3-flash";
+  settings.fallbacks = [];
+  settings.discovered.bai = [
+    "gpt-5-nano",
+    "glm-5.3-flash",
+    "qwen3.8-flash",
+    "hy3",
+    "deepseek-v4.1-flash",
+    "gpt-5.5",
+  ];
+  settings.modelAccess = {
+    "bai/glm-5.3-flash": { status: "open", at: Date.now() },
+    "bai/qwen3.8-flash": { status: "open", at: Date.now() },
+    "bai/hy3": { status: "open", at: Date.now() },
+    "bai/deepseek-v4.1-flash": { status: "paywall", at: Date.now() },
+    "bai/gpt-5-nano": { status: "paywall", at: Date.now() },
+  };
+  recordCooldown("bai/glm-5.3-flash", "bai", { status: 429, retryAfter: 60_000 });
+
+  const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
+  assert.ok(!slugs.includes("bai/glm-5.3-flash"), "cooled default is skipped");
+  assert.ok(slugs.includes("bai/qwen3.8-flash"), "probed-open siblings participate");
+  assert.ok(slugs.includes("bai/hy3"));
+  assert.ok(!slugs.includes("bai/deepseek-v4.1-flash"), "probed paywall excluded");
+  assert.ok(!slugs.includes("bai/gpt-5-nano"));
+  assert.ok(
+    slugs.indexOf("bai/qwen3.8-flash") < slugs.indexOf("open_router/openrouter/free"),
+    "Admin B.ai probed opens hop before unrelated OpenRouter freeloaders"
+  );
+  __resetCooldowns();
+});
+
+test("400 credit insufficient on B.ai hops instead of ending the turn", async () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings = setProviderKey(settings, "open_router", "or_test");
+  settings.model = "bai/deepseek-v4.1-flash";
+  settings.fallbacks = ["open_router/openrouter/free"];
+  settings.discovered.bai = ["deepseek-v4.1-flash", "glm-5.3-flash"];
+
+  const result = await routeChat(
+    settings,
+    { model: "bai/deepseek-v4.1-flash", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.providerId === "bai") {
+        return new Response(
+          JSON.stringify({
+            error: { message: "credit insufficient balance: balance=0 required=23320" },
+          }),
+          { status: 400 }
+        );
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(result.used.slug, "open_router/openrouter/free");
+  assert.equal(result.tried[0], "bai/deepseek-v4.1-flash");
+  __resetCooldowns();
+});
+
+test("403 deposit on one premium model keeps hopping other B.ai siblings", async () => {
+  __resetCooldowns();
+  // Explicit Admin fallback is required — B.ai no longer auto-siblings.
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings.model = "bai/gpt-5-nano";
+  settings.fallbacks = ["bai/glm-5.3-flash"];
+  settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash"];
+
+  const result = await routeChat(
+    settings,
+    { model: "bai/gpt-5-nano", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.model === "gpt-5-nano") {
+        return new Response(
+          JSON.stringify({
+            error: { message: "Access restricted. Deposit required to unlock premium models." },
+          }),
+          { status: 403 }
+        );
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(result.used.slug, "bai/glm-5.3-flash");
+  assert.equal(result.tried[0], "bai/gpt-5-nano");
+  __resetCooldowns();
+});
+
+test("alias route: explicit fallbacks still block unlisted B.ai siblings", () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings = setProviderKey(settings, "open_router", "or_test");
+  settings.model = "bai/glm-5.3-flash";
+  settings.fallbacks = ["open_router/openrouter/free"];
+  settings.discovered.bai = ["glm-5.3-flash", "gpt-5.5"];
+
+  const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
+  assert.ok(slugs.includes("bai/glm-5.3-flash"));
+  assert.ok(slugs.includes("open_router/openrouter/free"));
+  assert.ok(!slugs.includes("bai/gpt-5.5"), "fallbacks remain an allowlist");
+});
+
+test("403 deposit required hops past the premium slug", async () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings.model = "bai/glm-5.3-flash";
+  settings.fallbacks = [];
+  settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash"];
+
+  const result = await routeChat(
+    settings,
+    // Explicit premium request must stay first, then hop to the free Admin default.
+    { model: "bai/gpt-5-nano", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.model === "gpt-5-nano") {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "Access restricted. Deposit required to unlock premium models.",
+            },
+          }),
+          { status: 403 }
+        );
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(result.used.slug, "bai/glm-5.3-flash");
+  assert.equal(result.tried[0], "bai/gpt-5-nano");
+  assert.equal(isRetryableStatus(403), true);
+  __resetCooldowns();
 });
 
 test("explicit concrete local slug stays first and is never rewritten", async () => {

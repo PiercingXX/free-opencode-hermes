@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { statSync } from "node:fs";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -23,6 +24,7 @@ import { loadInventoryLanes, suggestedBaseUrl } from "../providers/inventory.js"
 import { adminPage } from "./admin.js";
 import { loadedConfigDefaultsToZen } from "../plugin/config.js";
 import { buildModelCatalog, modelsListPayload, parseCatalogView, probeProvider } from "./models.js";
+import { probeProviderAccess } from "./model-access.js";
 import { chatStreamToResponses, chatJsonToResponses, responsesBodyToChat } from "./responses.js";
 import {
   RouteError,
@@ -157,13 +159,13 @@ async function handleChat(
   signal: AbortSignal,
   requestId: string,
   home?: string
-): Promise<void> {
+): Promise<Settings> {
   let lastHop: RouteHopInfo | null = null;
   const onHop: RouteHopObserver = (hop) => {
     lastHop = hop;
     void logRoute(home, { ...hop, requestId }, "route.attempt");
   };
-  let routed;
+  let routed: Awaited<ReturnType<typeof routeChat>>;
   try {
     routed = await routeChat(settings, body, undefined, signal, onHop, home);
   } catch (error) {
@@ -194,6 +196,7 @@ async function handleChat(
     );
     throw error;
   }
+  settings = routed.settings;
   await logRoute(
     home,
     routeResult(
@@ -217,7 +220,7 @@ async function handleChat(
     });
     if (!routed.response.body) {
       res.end();
-      return;
+      return settings;
     }
     const reader = routed.response.body.getReader();
     try {
@@ -230,11 +233,12 @@ async function handleChat(
       reader.releaseLock();
       res.end();
     }
-    return;
+    return settings;
   }
   const json = (await routed.response.json()) as Record<string, unknown>;
   json.model = routed.used.slug;
   send(res, 200, json, { "x-foc-model": routed.used.slug });
+  return settings;
 }
 
 function routeResult(
@@ -260,7 +264,7 @@ function routeResult(
   };
 }
 
-export function startProxy(initial?: Settings, home?: string): RunningProxy {
+export function startProxy(initial?: Settings, home: string = homedir()): RunningProxy {
   let settings = applyEnvOverrides(initial ?? loadSettings(home));
   // Restore cooldowns from the previous process so a restart does not re-hit a
   // model that was 402/429'd. Expired windows are dropped on load.
@@ -471,11 +475,16 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
           return;
         }
         settings = connectProvider(overlay, providerId, extra, probed.models);
+        if (providerId === "bai" || providerId.startsWith("bai@")) {
+          const access = await probeProviderAccess(settings, providerId, { force: true });
+          settings = access.settings;
+        }
         persist();
         send(res, 200, {
           ...probed,
           saved: true,
           model: settings.model,
+          modelAccess: settings.modelAccess,
         });
         return;
       }
@@ -537,7 +546,7 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         const body = (await readJson(req)) as ChatRequest;
-        await handleChat(res, settings, body, ac.signal, newRequestId(), home);
+        settings = await handleChat(res, settings, body, ac.signal, newRequestId(), home);
         return;
       }
 
@@ -560,6 +569,7 @@ export function startProxy(initial?: Settings, home?: string): RunningProxy {
             onHop,
             home
           );
+          settings = routed.settings;
         } catch (error) {
           const status = error instanceof RouteError ? error.status : null;
           const message = error instanceof Error ? error.message : String(error);

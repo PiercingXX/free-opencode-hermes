@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { DEFAULT_HOST, DEFAULT_PORT, settingsPath, stateDir } from "../paths.js";
 import { allProviders, providerById } from "../providers/catalog.js";
 import { suggestedBaseUrl, type FoundHost } from "../providers/inventory.js";
+import { parseModelAccessMap, type ModelAccessMap } from "../proxy/model-access.js";
 
 export type Account = {
   providerId: string;
@@ -24,6 +25,7 @@ export type Settings = {
   enabled: Record<string, boolean>;
   /** Last successful model list from Connect / probe, keyed by provider id. */
   discovered: Record<string, string[]>;
+  modelAccess: ModelAccessMap;
   foundHosts: FoundHost[];
   /** Optional named accounts per provider (compound provider@account ids). */
   accounts: Account[];
@@ -41,6 +43,7 @@ export function emptySettings(): Settings {
     extra: {},
     enabled: {},
     discovered: {},
+    modelAccess: {},
     foundHosts: [],
     accounts: [],
   };
@@ -118,6 +121,7 @@ export function normalizeSettings(raw: unknown): Settings {
           : [],
       ])
     ),
+    modelAccess: parseModelAccessMap(obj.modelAccess),
     foundHosts: Array.isArray(obj.foundHosts)
       ? obj.foundHosts
           .map((row) => asFoundHost(row))
@@ -180,6 +184,7 @@ export function applyEnvOverrides(settings: Settings): Settings {
     extra: { ...settings.extra },
     enabled: { ...settings.enabled },
     discovered: { ...settings.discovered },
+    modelAccess: { ...(settings.modelAccess ?? {}) },
     foundHosts: [...(settings.foundHosts ?? [])],
     accounts: [...(settings.accounts ?? [])],
   };
