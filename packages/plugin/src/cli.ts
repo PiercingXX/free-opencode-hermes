@@ -405,8 +405,10 @@ async function cmdService(action: string | undefined): Promise<void> {
     case "install": {
       // Stop any detached proxy first so the service owns the port cleanly.
       stopDetachedProxy();
+      let installed = false;
       try {
         serviceInstall();
+        installed = true;
         console.log("Keep-alive service installed.");
       } catch (error) {
         console.error(
@@ -414,6 +416,9 @@ async function cmdService(action: string | undefined): Promise<void> {
             error instanceof Error ? error.message : String(error)
           }`
         );
+        // Soft-fail for installers: still bring up a detached proxy, but exit
+        // non-zero so install-opencode.ps1 can print its fallback tip.
+        process.exitCode = 1;
       }
       // Give the unit/task a beat to bring the proxy up under the service. If it
       // is still down (e.g. systemd slow, or the unit could not be created), fall
@@ -421,7 +426,7 @@ async function cmdService(action: string | undefined): Promise<void> {
       // installers call `service install` and would otherwise hang forever.
       const settings = applyEnvOverrides(loadSettings());
       const url = `http://${settings.listen.host}:${settings.listen.port}`;
-      if (!(await waitUntilHealthy(url))) {
+      if (!installed || !(await waitUntilHealthy(url))) {
         await cmdStart(false);
       }
       return;

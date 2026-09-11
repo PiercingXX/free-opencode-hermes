@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
 import { repoRoot } from "../paths.js";
-import { nodeExecutable } from "../platform.js";
+import { nodeExecutable, userBinDir } from "../platform.js";
 import { appendLog } from "../proxy/route-log.js";
 
 const SERVICE_NAME = "free-opencode-proxy";
@@ -198,6 +198,7 @@ export function serviceUninstall(): void {
     } catch {
       // not installed
     }
+    removeIfExists(windowsTaskScriptPath());
   } else if (isMac()) {
     try {
       __serviceRuntime.execFileSync(
@@ -279,18 +280,51 @@ function installLaunchAgent(): void {
   }
 }
 
+/** Quote a path for a .cmd file (cmd.exe doubles embedded quotes). */
+function quoteForCmd(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+/**
+ * schtasks /TR cannot reliably parse nested quotes around node.exe + cli.js
+ * (ERROR: "The task XML contains a value which is incorrectly formatted…").
+ * Point /TR at a single helper .cmd with no further args instead.
+ */
+export function windowsTaskScriptPath(home = homeDir()): string {
+  return join(serviceDir(home), "start-proxy.cmd");
+}
+
+export function writeWindowsTaskScript(home = homeDir()): string {
+  mkdirSync(serviceDir(home), { recursive: true, mode: 0o700 });
+  const scriptPath = windowsTaskScriptPath(home);
+  const wrapper = join(userBinDir(home), "free-opencode.cmd");
+  const body = existsSync(wrapper)
+    ? `@echo off\r\n${quoteForCmd(wrapper)} start --foreground\r\n`
+    : (() => {
+        const [exe, script, ...rest] = execArgs();
+        return `@echo off\r\n${quoteForCmd(exe)} ${quoteForCmd(script)} ${rest.join(" ")}\r\n`;
+      })();
+  writeFileSync(scriptPath, body, "utf8");
+  return scriptPath;
+}
+
 function installScheduledTask(): void {
   // Per-user logon scheduled task (never SYSTEM). Runs the CLI in the
   // foreground; the proxy keeps :8082 up for that user.
-  const [exe, script, ...rest] = execArgs();
-  const commandLine = `"${exe}" "${script}" ${rest.join(" ")}`;
+  const scriptPath = writeWindowsTaskScript();
+  // One path token only — spaces get a single pair of quotes, no nesting.
+  const tr = /\s/.test(scriptPath) ? `"${scriptPath}"` : scriptPath;
   const result = __serviceRuntime.spawnSync(
     "schtasks",
-    ["/Create", "/TN", SERVICE_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", commandLine],
-    { stdio: "inherit", windowsHide: true }
+    ["/Create", "/TN", SERVICE_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", tr],
+    { encoding: "utf8", windowsHide: true }
   );
   if (result.error) {
     throw new Error(`schtasks /Create failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const detail = `${result.stderr ?? ""}${result.stdout ?? ""}`.trim() || `exit ${result.status}`;
+    throw new Error(`schtasks /Create failed: ${detail}`);
   }
 }
 

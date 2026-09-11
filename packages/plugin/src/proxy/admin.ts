@@ -201,14 +201,14 @@ export function adminPage(): string {
       <label>Default model</label>
       <input id="model" placeholder="nvidia_nim/nvidia/nemotron-3-super-120b-a12b" />
       <label>Fallback models (comma-separated)</label>
-      <input id="fallbacks" placeholder="open_router/openrouter/free, groq/llama-3.3-70b-versatile" />
+      <input id="fallbacks" placeholder="open_router/openrouter/free, groq" />
       <div class="row">
         <button id="save">Apply</button>
         <button id="refresh" class="secondary">Refresh models</button>
       </div>
       <p id="message" class="muted"></p>
       <h2 style="margin-top:20px">Cooldown</h2>
-      <p class="muted" style="margin:0 0 8px">Self-hosted is used only after free models fail or are in cooldown. A drained box is skipped until Retry-After elapses.</p>
+      <p class="muted" style="margin:0 0 8px">Self-hosted is used only after free models fail or are in cooldown. A drained box is skipped until Retry-After elapses. Fallbacks scope the hop chain — unlisted paid catalog ids and unconfigured providers do not auto-hop.</p>
       <div id="cooldowns" class="muted"></div>
       <h2 style="margin-top:20px">Free tool models</h2>
       <p class="muted" style="margin:0 0 8px">OpenCode Zen *-free / big-pickle, OpenRouter :free, and anything on your boxes. Use sets the default.</p>

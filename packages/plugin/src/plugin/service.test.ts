@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -13,6 +13,8 @@ import {
   serviceInstall,
   serviceStatus,
   serviceUninstall,
+  windowsTaskScriptPath,
+  writeWindowsTaskScript,
 } from "./service.js";
 
 type ExecCall = { cmd: string; args: string[] };
@@ -75,7 +77,7 @@ test("serviceInstall on linux writes a systemd unit into the temp HOME without r
   rmSync(home, { recursive: true, force: true });
 });
 
-test("serviceInstall on win32 records a schtasks /Create and writes nothing outside the temp HOME", () => {
+test("serviceInstall on win32 points schtasks /TR at a helper .cmd (no nested node quotes)", () => {
   const home = tempHome();
   __setTestHome(home);
   const calls = setUp({ platform: "win32" });
@@ -86,10 +88,48 @@ test("serviceInstall on win32 records a schtasks /Create and writes nothing outs
   assert.equal(schtasks.length, 1, "exactly one schtasks /Create is issued");
   assert.ok(schtasks[0].args.includes("/Create"));
   assert.ok(schtasks[0].args.includes("free-opencode-proxy"));
+  const trIdx = schtasks[0].args.indexOf("/TR");
+  assert.ok(trIdx >= 0);
+  const tr = schtasks[0].args[trIdx + 1];
+  assert.equal(tr, windowsTaskScriptPath(home), "/TR is the helper script path only");
+  assert.ok(!tr.includes("node"), "nested node.exe path must not appear in /TR");
+  assert.ok(existsSync(windowsTaskScriptPath(home)), "helper .cmd is written under the temp HOME");
+  const body = readFileSync(windowsTaskScriptPath(home), "utf8");
+  assert.ok(body.includes("start --foreground"));
   assert.ok(
     calls.spawn.every((c) => c.cmd === "schtasks"),
     "only schtasks is asked for on Windows (stubbed so real schtasks never runs)"
   );
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("writeWindowsTaskScript prefers free-opencode.cmd when present", () => {
+  const home = tempHome();
+  __setTestHome(home);
+  __setTestPlatform("win32");
+  const wrapperDir = join(home, ".local", "bin");
+  mkdirSync(wrapperDir, { recursive: true });
+  writeFileSync(join(wrapperDir, "free-opencode.cmd"), "@echo off\r\n");
+  const script = writeWindowsTaskScript(home);
+  const body = readFileSync(script, "utf8");
+  assert.ok(body.includes("free-opencode.cmd"));
+  assert.ok(body.includes("start --foreground"));
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("serviceInstall on win32 fails when schtasks returns non-zero", () => {
+  const home = tempHome();
+  __setTestHome(home);
+  __setTestPlatform("win32");
+  __setSpawnSync(() => ({
+    status: 1,
+    error: undefined as unknown as Error,
+    stdout: "",
+    stderr: "ERROR: The task XML contains a value which is incorrectly formatted or out of range.\r\n",
+  }));
+  __setExecFileSync(() => "");
+
+  assert.throws(() => serviceInstall(), /incorrectly formatted|schtasks \/Create failed/);
   rmSync(home, { recursive: true, force: true });
 });
 

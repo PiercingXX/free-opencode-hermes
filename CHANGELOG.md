@@ -7,6 +7,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Windows keep-alive install no longer hits schtasks formatting errors.**
+  `service install` writes `~\.config\free-opencode\start-proxy.cmd` and points
+  the ONLOGON task `/TR` at that single helper (no nested `node.exe` + `cli.js`
+  quotes). Non-zero `schtasks` exits are treated as failure; the installer still
+  soft-falls back to a detached proxy. `.cmd` wrappers quote with `""`; bad
+  `opencode.json` gets a clear host-setup error. `*.ps1` check out as CRLF.
+  Host-setup also unlinks dangling skill symlinks before replacing them
+  (`fs.rmSync` can leave those in place and then throw EEXIST).
+
+- **Alias hops stay on Admin default/fallbacks.** `free-opencode/default` no
+  longer auto-enumerates every ready provider's paid catalog (e.g. `bai/gpt-5.5`
+  when the default is another B.ai model). With fallbacks set, free fill-in is
+  limited to providers already named in default/fallbacks, so env-ready Zen
+  `big-pickle` does not appear unless Zen is configured. Empty fallbacks still
+  free-first across connected providers. Bare provider ids like `groq` expand
+  to that provider's listed models.
+
 - **Parallel local fan-out.** `parallel-execution-orchestrator` uses
   weakest-as-orchestrator: ready self-hosted boxes become `lane-*` Task
   agents pinned to concrete `free-opencode/<provider>/<model>` slugs so
@@ -119,9 +136,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (clear on restart) and surfaced on Admin, `/admin/api/state`, `/health`,
   and `free-opencode status`. Routing never edits `settings.model` on disk.
 
-- **Routing / observability refinements.** On catalog-alias traffic a connected
-  free model (OpenRouter `:free`, Zen `-free`) outranks a *paid* Admin default
-  even when the fallback list is empty. `last-route` now shows the hop that
+- **Routing / observability refinements.** On catalog-alias traffic with an
+  *empty* fallback list, a connected free model (OpenRouter `:free`, Zen
+  `-free`) outranks a *paid* Admin default. `last-route` now shows the hop that
   answered with real latency and its real fallback index (the ring records only
   the final result per request, so a hop is never double-counted). A repeat 429
   without `Retry-After` doubles the cooldown backoff off the live entry rather

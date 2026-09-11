@@ -69,6 +69,25 @@ function copyDir(src, dest) {
   }
 }
 
+/** Remove a path that may be a dangling symlink (rmSync can no-op those). */
+function removePath(dest) {
+  let st = null;
+  try {
+    st = fs.lstatSync(dest);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      fs.unlinkSync(dest);
+    } catch {
+      // raced
+    }
+    return;
+  }
+  fs.rmSync(dest, { recursive: true, force: true });
+}
+
 function copyPath(src, dest) {
   const srcStat = fs.lstatSync(src);
   if (srcStat.isSymbolicLink()) {
@@ -88,7 +107,7 @@ function copyPath(src, dest) {
       destStat = null;
     }
     if (destStat && (destStat.isSymbolicLink() || !destStat.isDirectory())) {
-      fs.rmSync(dest, { recursive: true, force: true });
+      removePath(dest);
     }
     copyDir(src, dest);
     return;
@@ -96,7 +115,7 @@ function copyPath(src, dest) {
   try {
     const destStat = fs.lstatSync(dest);
     if (destStat.isDirectory() || destStat.isSymbolicLink()) {
-      fs.rmSync(dest, { recursive: true, force: true });
+      removePath(dest);
     }
   } catch {
     // dest is missing
@@ -130,11 +149,11 @@ function gitLinkPlaceholderTarget(src, srcStat) {
 function copyResolved(target, dest) {
   const st = fs.statSync(target);
   if (st.isDirectory()) {
-    fs.rmSync(dest, { recursive: true, force: true });
+    removePath(dest);
     copyDir(target, dest);
     return;
   }
-  fs.rmSync(dest, { recursive: true, force: true });
+  removePath(dest);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.copyFileSync(target, dest);
 }
@@ -142,7 +161,7 @@ function copyResolved(target, dest) {
 function copySymlink(src, dest) {
   const raw = fs.readlinkSync(src);
   const target = path.resolve(path.dirname(src), raw);
-  fs.rmSync(dest, { recursive: true, force: true });
+  removePath(dest);
   let srcIsDir = false;
   try {
     srcIsDir = fs.statSync(src).isDirectory();
@@ -189,7 +208,8 @@ function copyAgentsSkippingNativePrimaries(src, dest) {
 }
 
 function quoteForCmd(value) {
-  return `"${value.replace(/"/g, '\\"')}"`;
+  // cmd.exe escapes embedded quotes by doubling them, not with backslash.
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 function quoteForSh(value) {
@@ -233,7 +253,15 @@ function loadJsonObject(configPath) {
   if (!fs.existsSync(configPath)) return {};
   const raw = fs.readFileSync(configPath, "utf8").trim();
   if (!raw) return {};
-  const parsed = JSON.parse(raw);
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    die(
+      `${configPath} is not valid JSON (${detail}). Fix or move it aside, then re-run the installer.`
+    );
+  }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
   return parsed;
 }
@@ -373,7 +401,7 @@ function hermesHost() {
   }
 }
 
-export { copyDir, copyAgentsSkippingNativePrimaries };
+export { copyDir, copyAgentsSkippingNativePrimaries, quoteForCmd };
 
 function isDirectRun() {
   const entry = process.argv[1];

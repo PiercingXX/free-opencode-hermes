@@ -62,23 +62,24 @@ function parseOrNull(raw: string): ModelRef | null {
  *
  * Policy (free-first, self-hosted-last):
  *   1. An explicit concrete slug always goes first (never rewritten).
- *   2. Free cloud — ready non-local models that look free, Admin free default
- *      and free fallbacks preferred first. For catalog-alias traffic, any
- *      connected free provider's discovered/default models participate, so no
- *      user fallback list is required.
- *   3. Other configured cloud — ready non-local, non-free, in Admin
- *      default/fallback order among themselves.
+ *   2. Free cloud — Admin free default/fallbacks first. On catalog-alias
+ *      traffic, other free listings may fill in (see below), so a paid Admin
+ *      default never outranks free when no fallback list is set.
+ *   3. Paid cloud — Admin paid default/fallbacks only. Alias traffic never
+ *      auto-enumerates other paid catalog defaults (no surprise gpt-5.5 hops).
  *   4. Self-hosted last — local boxes only after free and paid cloud cannot
  *      serve right now (not ready, in cooldown, or failed retryable).
  *
- * For an explicit concrete request, the tail is the user's Admin default and
- * fallbacks only (re-ordered free→paid→local); connected providers are not
- * enumerated so an explicit request behaves predictably. Alias traffic (the
- * pervasive OpenCode `free-opencode/default`) enumerates every ready cloud
- * provider and puts self-hosted at the very end.
+ * Alias free fill-in:
+ *   - Empty Admin fallbacks → every ready cloud provider's free models.
+ *   - Non-empty fallbacks → free models only from providers already named in
+ *     Admin default/fallbacks (so OpenRouter `:free` siblings can help, but
+ *     Zen `big-pickle` does not appear unless Zen is configured).
  *
- * Cooldowned slugs are skipped everywhere; the first request after expiry is
- * the recheck.
+ * Bare provider ids in Admin (e.g. `groq`) expand to that provider's listed
+ * models. Explicit concrete requests still use Admin default/fallbacks only
+ * for the tail (no free fill-in). Cooldowned slugs are skipped; the first
+ * request after expiry is the recheck.
  */
 export function routeTargets(settings: Settings, requestedModel: string): ModelRef[] {
   const aliasRequest = isCatalogAlias(requestedModel);
@@ -95,45 +96,59 @@ export function routeTargets(settings: Settings, requestedModel: string): ModelR
 
   if (!aliasRequest) push(requestedModel);
 
-  // Partition the user's Admin default + fallbacks into free cloud / paid cloud / local.
+  // Partition Admin default + fallbacks into free cloud / paid cloud / local.
+  // A bare provider id expands to that provider's listed models.
   const adminCloudFree: string[] = [];
   const adminCloudPaid: string[] = [];
   const adminLocal: string[] = [];
-  for (const raw of [settings.model, ...(settings.fallbacks ?? [])]) {
+  const adminProviderIds = new Set<string>();
+  const configuredFallbacks = (settings.fallbacks ?? []).filter(
+    (raw) => Boolean(raw?.trim()) && !isCatalogAlias(raw)
+  );
+
+  const partitionSlug = (slug: string): void => {
+    const ref = parseOrNull(slug);
+    if (!ref) return;
+    adminProviderIds.add(ref.baseProviderId);
+    if (isSelfHostedProvider(ref.providerId)) adminLocal.push(slug);
+    else if (isFreeModelSlug(ref)) adminCloudFree.push(slug);
+    else adminCloudPaid.push(slug);
+  };
+
+  for (const raw of [settings.model, ...configuredFallbacks]) {
     if (!raw || isCatalogAlias(raw)) continue;
-    const ref = parseOrNull(raw);
-    if (!ref) continue;
-    if (isSelfHostedProvider(ref.providerId)) adminLocal.push(raw);
-    else if (isFreeModelSlug(ref)) adminCloudFree.push(raw);
-    else adminCloudPaid.push(raw);
+    const trimmed = raw.trim();
+    const bare = providerById(trimmed);
+    if (bare) {
+      adminProviderIds.add(bare.id);
+      for (const model of listedModelsForProvider(settings, bare)) {
+        partitionSlug(`${bare.id}/${model}`);
+      }
+      continue;
+    }
+    partitionSlug(trimmed);
   }
 
-  // Free cloud always leads: the Admin free default/fallbacks first, then any
-  // other ready provider's free listing. On catalog-alias traffic this free
-  // pass precedes *every* paid slug, so a paid Admin default (e.g. NIM) never
-  // outranks a connected free OpenRouter / Zen model when no fallback is set.
+  // Free cloud always leads: Admin free default/fallbacks first.
   for (const raw of adminCloudFree) push(raw);
 
-  const readyCloudProviders = (): ProviderDescriptor[] =>
-    allProviders().filter((p) => !p.local && isProviderReady(settings, p.id));
-
   if (aliasRequest) {
-    for (const provider of readyCloudProviders()) {
+    const readyCloud = allProviders().filter((p) => !p.local && isProviderReady(settings, p.id));
+    // Empty fallbacks → any connected free. Otherwise only providers the
+    // operator already named in default/fallbacks.
+    const freeFillProviders =
+      configuredFallbacks.length === 0
+        ? readyCloud
+        : readyCloud.filter((p) => adminProviderIds.has(p.id));
+    for (const provider of freeFillProviders) {
       for (const model of listedModelsForProvider(settings, provider)) {
         const ref = parseOrNull(`${provider.id}/${model}`);
         if (!ref || seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
         if (isFreeModelSlug(ref)) push(ref.slug);
       }
     }
-    // Paid cloud after the free pass: Admin paid default then other ready paid.
+    // Paid cloud: Admin list only — never every ready provider's paid catalog.
     for (const raw of adminCloudPaid) push(raw);
-    for (const provider of readyCloudProviders()) {
-      for (const model of listedModelsForProvider(settings, provider)) {
-        const ref = parseOrNull(`${provider.id}/${model}`);
-        if (!ref || seen.has(ref.slug) || isCooldowned(ref.slug)) continue;
-        if (!isFreeModelSlug(ref)) push(ref.slug);
-      }
-    }
   } else {
     for (const raw of adminCloudPaid) push(raw);
   }

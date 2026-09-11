@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { copyAgentsSkippingNativePrimaries, copyDir } from "./host-setup.mjs";
+import { copyAgentsSkippingNativePrimaries, copyDir, quoteForCmd } from "./host-setup.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -164,4 +164,9 @@ test("copyAgentsSkippingNativePrimaries does not copy build/plan/general", () =>
     assert.equal(fs.existsSync(path.join(dest, "general.md")), false);
     assert.equal(fs.readFileSync(path.join(dest, "reviewer.md"), "utf8"), "keep");
   });
+});
+
+test("quoteForCmd doubles embedded quotes for cmd.exe", () => {
+  assert.equal(quoteForCmd(`C:\\Program Files\\node.exe`), `"C:\\Program Files\\node.exe"`);
+  assert.equal(quoteForCmd(`C:\\weird\\"quote\\node.exe`), `"C:\\weird\\""quote\\node.exe"`);
 });

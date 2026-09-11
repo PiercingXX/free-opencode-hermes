@@ -1,0 +1,2 @@
+# PowerShell here-strings and Windows PS 5.1 are reliable with CRLF checkouts.
+*.ps1 text eol=crlf

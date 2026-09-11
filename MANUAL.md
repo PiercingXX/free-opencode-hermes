@@ -100,18 +100,22 @@ Shell equivalents of Admin: `free-opencode connect <provider>`,
 `free-opencode set-model <provider/model>`, `free-opencode set-fallback …`.
 `free-opencode autofind` probes local Ollama (and similar) endpoints.
 
-**Routing is free-first.** OpenCode sends `free-opencode/default`; on that
-alias the proxy tries free cloud (OpenRouter `:free`, Zen `*-free` /
-`big-pickle`, any connected free listing) first, then paid cloud, and only
-then self-hosted boxes (Ollama / SGLang / LM Studio, Tailscale included).
-A concrete request like `tailscale_sglang/deepseek-v4-flash` is honored
-verbatim and always tried first. When a model returns 429 / 402 / a retryable
-5xx it is marked in cooldown (Retry-After, else 60s doubling to a 30-minute
-cap) and skipped on later turns until it should be back; the first request
-after that window is the recheck. Cooldowns live in memory and clear on proxy
-restart. `free-opencode status` and the Admin **Cooldown** panel show what is
-cooled down and when it returns. Admin shows "Self-hosted is used only after
-free models fail or are in cooldown."
+**Routing is free-first, Admin-scoped.** OpenCode sends `free-opencode/default`.
+The hop chain is the Admin **default** plus **fallback** list (free models
+first, then paid, self-hosted last). Bare provider ids in that list (e.g.
+`groq`) expand to that provider's listed models. With an empty fallback list,
+connected free cloud (OpenRouter `:free`, Zen `*-free` / `big-pickle`) still
+fills in ahead of a paid default. With fallbacks set, free fill-in is limited
+to providers already named in default/fallbacks — unlisted paid catalog ids
+(e.g. another B.ai model) and unconfigured Zen do not hop. A concrete request
+like `tailscale_sglang/deepseek-v4-flash` is honored verbatim and always tried
+first. When a model returns 429 / 402 / a retryable 5xx it is marked in
+cooldown (Retry-After, else 60s doubling to a 30-minute cap) and skipped on
+later turns until it should be back; the first request after that window is the
+recheck. Cooldowns live in memory and clear on proxy restart.
+`free-opencode status` and the Admin **Cooldown** panel show what is cooled
+down and when it returns. Admin shows "Self-hosted is used only after free
+models fail or are in cooldown."
 
 **Keep-alive service, log, update.** `free-opencode service install`
 registers a per-user unit that runs `…/cli.js start --foreground` so `:8082`
@@ -1200,12 +1204,20 @@ filter. The card title is **B.ai**. Paste the key and click **Connect**.
 **Windows installer: `'rm' is not recognized`.** The MCP `build` script used
 to call Unix `rm`. Pull and re-run `.\install-opencode.ps1`.
 
+**Windows installer: schtasks "incorrectly formatted or out of range".** Keep-alive
+used to put nested `"node.exe" "…\cli.js" start --foreground` into `schtasks /TR`,
+which Windows rejects. Pull, rebuild, and re-run the installer (or
+`free-opencode service install`). The task now runs a helper
+`%USERPROFILE%\.config\free-opencode\start-proxy.cmd`. If keep-alive still fails,
+the proxy still starts on demand via `free-opencode start`.
+
 **Install fails with `EEXIST` on `~/.config/opencode/skills`.** Re-run
 `./install-opencode.sh` or `.\install-opencode.ps1` — both call
 `scripts/host-setup.mjs`. A leftover `skills/design` symlink or junction
 from an older clone path used to make Node 26 `fs.cpSync` abort; host-setup
-now merges that tree. On Windows, Git symlink placeholders are copied as
-the directories they name.
+now unlinks dangling links (plain `rmSync` can leave them) and merges the
+tree. On Windows, Git symlink placeholders are copied as the directories
+they name.
 
 **`free-opencode` or `opencode` is not found.** Open a new terminal. Linux /
 macOS: `~/.local/bin` must be on `PATH`. Windows: the user PATH must include

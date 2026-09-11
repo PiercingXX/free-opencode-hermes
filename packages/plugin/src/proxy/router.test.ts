@@ -89,6 +89,27 @@ test("alias route: paid Admin default with empty fallbacks still tries free Open
   assert.equal(localIdx, slugs.length - 1, "self-hosted stays last");
 });
 
+test("alias route: configured fallbacks do not hop to unlisted paid or Zen free", () => {
+  __resetCooldowns();
+  // Repro: default bai/glm + fallbacks open_router/:free,groq — must not try
+  // bai/gpt-5.5 (unlisted paid catalog) or opencode_zen/big-pickle (env-ready Zen).
+  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  settings = setProviderKey(settings, "open_router", "or_test");
+  settings = setProviderKey(settings, "groq", "gsk_test");
+  settings = setProviderKey(settings, "opencode_zen", "zen_test");
+  settings.model = "bai/glm-5.3-flash";
+  settings.fallbacks = ["open_router/openrouter/free", "groq"];
+
+  const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
+  assert.ok(slugs.includes("open_router/openrouter/free"));
+  assert.ok(slugs.includes("open_router/qwen/qwen3-coder:free"), "OpenRouter free siblings still fill in");
+  assert.ok(slugs.includes("bai/glm-5.3-flash"));
+  assert.ok(slugs.includes("groq/llama-3.3-70b-versatile"), "bare groq expands to listed models");
+  assert.ok(!slugs.includes("bai/gpt-5.5"), "unlisted paid B.ai catalog must not hop");
+  assert.ok(!slugs.includes("opencode_zen/big-pickle"), "Zen free must not hop unless Zen is in Admin list");
+  assert.ok(slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("bai/glm-5.3-flash"));
+});
+
 test("explicit concrete local slug stays first and is never rewritten", async () => {
   __resetCooldowns();
   let settings = connectProvider(
