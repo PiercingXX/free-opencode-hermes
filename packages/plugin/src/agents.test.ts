@@ -99,6 +99,9 @@ test("stale xx-stack agent models are rewritten to the catalog alias", () => {
     agent: {
       build: { model: "ollama-local/qwen3-coder:30b-a3b-tq2_0", steps: 12 },
       plan: { model: "sglang-remote/qwen3-coder-next" },
+      "lane-tailscale_sglang": {
+        model: "free-opencode/tailscale_sglang/deepseek-v4-flash",
+      },
     },
   };
   applyRuntimeExtras(config);
@@ -108,9 +111,37 @@ test("stale xx-stack agent models are rewritten to the catalog alias", () => {
   assert.equal(plan.model, "free-opencode/default");
   pinAgentsToCatalog(config);
   assert.equal((config.agent?.build as { model: string }).model, "free-opencode/default");
+  assert.equal(
+    (config.agent?.["lane-tailscale_sglang"] as { model: string }).model,
+    "free-opencode/tailscale_sglang/deepseek-v4-flash"
+  );
   assert.deepEqual(catalogAgentOverlay(["build", "reviewer"]).build, {
     model: "free-opencode/default",
   });
+});
+
+test("applyRuntimeExtras registers lane agents and pins parallel orchestrator to weakest local", () => {
+  const config: MutableConfig = { agent: {} };
+  applyRuntimeExtras(config);
+  const parallel = config.agent?.["parallel-execution-orchestrator"] as {
+    model?: string;
+    prompt?: string;
+  };
+  assert.ok(parallel?.prompt);
+  assert.match(String(parallel?.prompt ?? ""), /lane-\*/);
+
+  // Live Admin may already have ready locals; when lanes exist, orchestrator
+  // must not stay on the catalog alias.
+  const laneAgents = Object.keys(config.agent ?? {}).filter((name) => name.startsWith("lane-"));
+  if (laneAgents.length > 0) {
+    assert.ok(parallel?.model && parallel.model !== catalogModelRef());
+    for (const name of laneAgents) {
+      const lane = config.agent?.[name] as { model?: string; mode?: string };
+      assert.equal(lane.mode, "subagent");
+      assert.ok(lane.model?.startsWith("free-opencode/"));
+      assert.notEqual(lane.model, catalogModelRef());
+    }
+  }
 });
 
 test("neutralizeVendorAgents drops native prompts and leaves xx-stack agents visible", () => {

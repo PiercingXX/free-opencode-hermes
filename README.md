@@ -55,7 +55,8 @@ If Admin is not listening: `free-opencode start`.
 
 Tab **execution-orchestrator** for one lane (free cloud → paid → your GPU
 last). Tab **parallel-execution-orchestrator** when the work splits into
-independent slices across several models/hosts.
+independent slices — it pins workers to distinct ready local hosts
+(`lane-*` agents) so all boxes run at once.
 
 ```bash
 free-opencode overnight              # single lane

@@ -3,7 +3,12 @@ import { join } from "node:path";
 
 import type { Config } from "@opencode-ai/plugin";
 
-import { applyEnvOverrides, loadSettings, readyProviderIds } from "../config/settings.js";
+import {
+  applyEnvOverrides,
+  loadSettings,
+  readyProviderIds,
+  type Settings,
+} from "../config/settings.js";
 import { catalogClientModel, modelConfigEntry } from "../launchers/opencode-config.js";
 import { nodeExecutable, opencodeConfigDir } from "../platform.js";
 import {
@@ -14,6 +19,12 @@ import {
   xxStackDir,
 } from "../paths.js";
 import { loadRuntimeAgents, loadSharedInstructions } from "./agents.js";
+import {
+  isLaneAgentName,
+  listReadyLocalLanes,
+  pickOrchestratorLane,
+  type ParallelLane,
+} from "./lanes.js";
 import { appendLog } from "../proxy/route-log.js";
 
 /**
@@ -117,14 +128,86 @@ export function catalogModelRef(): string {
   return `${PROVIDER_ID}/${CATALOG_MODEL_ID}`;
 }
 
-/** OpenCode only advertises free-opencode/default. xx-stack pins like ollama-local/* are invalid. */
+/**
+ * Pin agents to free-opencode/default so xx-stack pins like ollama-local/* stay
+ * valid. Parallel lane workers (`lane-*`) keep their concrete host model.
+ */
 export function pinAgentsToCatalog(config: MutableConfig): void {
   const model = catalogModelRef();
   if (!config.agent || typeof config.agent !== "object") return;
-  for (const def of Object.values(config.agent as Record<string, AgentConfig>)) {
+  for (const [name, def] of Object.entries(config.agent as Record<string, AgentConfig>)) {
     if (!def || typeof def !== "object") continue;
+    if (isLaneAgentName(name)) continue;
     def.model = model;
   }
+}
+
+const LANE_WORKER_PROMPT =
+  "You are a Free OpenCode **parallel lane worker** pinned to one self-hosted box. " +
+  "Execute only the assigned independent slice. Prefer tools over speculation. " +
+  "Do not spawn further parallel waves. When the slice is done, summarize files " +
+  "changed and checks run, then stop.";
+
+/** Advertise each ready local as a selectable free-opencode/<provider>/<model>. */
+export function localLaneModelEntries(
+  settings: Settings
+): Record<string, { name: string; reasoning?: boolean }> {
+  const out: Record<string, { name: string; reasoning?: boolean }> = {};
+  for (const lane of listReadyLocalLanes(settings)) {
+    out[lane.slug] = {
+      name: `Lane · ${lane.displayName}`,
+      reasoning: true,
+    };
+  }
+  return out;
+}
+
+/** Register Task-able subagents pinned to distinct local hosts. */
+export function registerParallelLaneAgents(
+  config: MutableConfig,
+  settings: Settings = applyEnvOverrides(loadSettings())
+): ParallelLane[] {
+  const lanes = listReadyLocalLanes(settings);
+  if (lanes.length === 0) return [];
+  config.agent = config.agent ?? {};
+  const agents = config.agent as Record<string, AgentConfig>;
+  for (const lane of lanes) {
+    const existing = (agents[lane.agentName] ?? {}) as AgentConfig;
+    agents[lane.agentName] = {
+      ...existing,
+      description: `Parallel lane on ${lane.displayName} (pinned host worker).`,
+      mode: "subagent",
+      hidden: false,
+      disable: false,
+      model: lane.wireModel,
+      temperature: 0,
+      prompt: LANE_WORKER_PROMPT,
+      steps: openCodeAgentSteps(existing.steps),
+      permission: {
+        ...((existing.permission as Record<string, unknown> | undefined) ?? {}),
+        bash: "allow",
+        edit: "allow",
+      },
+    };
+  }
+  return lanes;
+}
+
+/**
+ * Weakest-as-orchestrator: pin parallel-execution-orchestrator to the lightest
+ * ready local so stronger boxes stay free for concurrent Task workers.
+ */
+export function pinParallelOrchestratorToWeakestLane(
+  config: MutableConfig,
+  lanes: ParallelLane[]
+): ParallelLane | null {
+  const weakest = pickOrchestratorLane(lanes);
+  if (!weakest) return null;
+  const agents = config.agent as Record<string, AgentConfig> | undefined;
+  const orch = agents?.["parallel-execution-orchestrator"];
+  if (!orch || typeof orch !== "object") return null;
+  orch.model = weakest.wireModel;
+  return weakest;
 }
 
 export function catalogAgentOverlay(
@@ -361,6 +444,9 @@ export function applyRuntimeExtras(config: MutableConfig): void {
     }
   }
   pinAgentsToCatalog(config);
+  const settings = applyEnvOverrides(loadSettings());
+  const lanes = registerParallelLaneAgents(config, settings);
+  pinParallelOrchestratorToWeakestLane(config, lanes);
   enablePluginTools(config);
 
   config.command = config.command ?? {};
@@ -411,6 +497,7 @@ export function injectOpenCodeConfig(config: MutableConfig): void {
   const catalog = catalogClientModel();
   const models: Record<string, { name: string; reasoning?: boolean }> = {
     [catalog.wireSlug]: modelConfigEntry(catalog) as { name: string; reasoning?: boolean },
+    ...localLaneModelEntries(settings),
   };
 
   const token = settings.proxyAuthToken;

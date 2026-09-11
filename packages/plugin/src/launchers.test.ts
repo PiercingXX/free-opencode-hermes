@@ -59,6 +59,38 @@ test("OpenCode process config uses Responses SDK and overlay-forces the model", 
   assert.equal(config.overlay.agent, undefined);
 });
 
+test("OpenCode process config advertises ready local lanes alongside default", () => {
+  const withLocals = [
+    ...models,
+    {
+      wireSlug: "tailscale_sglang/deepseek-v4-flash",
+      providerModelRef: "tailscale_sglang/deepseek-v4-flash",
+      displayName: "Tailscale SGLang / deepseek-v4-flash",
+      supportsReasoning: true,
+      inputModalities: ["text"],
+      contextWindowTokens: null,
+      maxOutputTokens: null,
+    },
+    {
+      wireSlug: "ollama/qwen2.5-coder:14b",
+      providerModelRef: "ollama/qwen2.5-coder:14b",
+      displayName: "Ollama / qwen2.5-coder:14b",
+      supportsReasoning: true,
+      inputModalities: ["text"],
+      contextWindowTokens: null,
+      maxOutputTokens: null,
+    },
+  ];
+  const config = buildOpenCodeConfig(withLocals, "http://127.0.0.1:8082");
+  const provider = (config.file.provider as Record<string, Record<string, unknown>>)[PROVIDER_ID];
+  const advertised = Object.keys(provider.models as Record<string, unknown>);
+  assert.ok(advertised.includes(CATALOG_MODEL_ID));
+  assert.ok(advertised.includes("tailscale_sglang/deepseek-v4-flash"));
+  assert.ok(advertised.includes("ollama/qwen2.5-coder:14b"));
+  // Cloud models stay off the OpenCode picker — only local lanes are added.
+  assert.ok(!advertised.includes("groq/llama-3.3-70b-versatile"));
+});
+
 test("catalog alias tries free cloud first, then paid, self-hosted last", () => {
   let settings = setProviderKey(emptySettings(), "groq", "k1");
   settings = setProviderKey(settings, "open_router", "k2");

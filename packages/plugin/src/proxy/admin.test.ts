@@ -44,6 +44,9 @@ test("admin last-route template labels LOCAL hops and last-resort locals", () =>
   assert.ok(html.includes("LOCAL"));
   assert.ok(html.includes("local last-resort"));
   assert.ok(html.includes("last local hop"));
+  assert.ok(html.includes("local lanes:"));
+  assert.ok(html.includes("idle locals:"));
+  assert.ok(html.includes("answering"));
 });
 
 test("admin cardFor keeps ready/configured cards expanded", () => {

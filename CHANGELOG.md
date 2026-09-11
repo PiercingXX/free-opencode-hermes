@@ -7,6 +7,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Parallel local fan-out.** `parallel-execution-orchestrator` uses
+  weakest-as-orchestrator: ready self-hosted boxes become `lane-*` Task
+  agents pinned to concrete `free-opencode/<provider>/<model>` slugs so
+  dutchman / valkyrie / SGLang (or any ready locals) can run concurrent
+  slices. `foc_status` / `foc_models` list the lanes. Admin still shows
+  ready vs answering locals.
+
 - **Context overflow hops instead of killing the session.** A 400/413
   "too large to compact" / context-length error on a small free model no
   longer aborts the turn. Routing continues to the next model (then

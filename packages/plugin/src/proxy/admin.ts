@@ -404,13 +404,34 @@ export function adminPage(): string {
       const tried = (r.tried && r.tried.length > 1) ? (" · tried: " + r.tried.join("→")) : "";
       return kind + " " + r.slug + name + " · " + outcome + " · " + r.latencyMs + "ms" + tried + fb;
     }
+    function localLaneLabel(p) {
+      const models = (p.discovered && p.discovered.length) ? p.discovered.join(", ") : "?";
+      return p.id + "/" + models;
+    }
     function lastRouteHeader(data) {
       const r = data.lastRoute;
       let line = "last route: " + (r ? formatRoute(r) : "(none yet)");
       const localReady = (data.catalog || []).filter((p) => p.local && p.ready);
       const hops = (data.recentRoutes || []).slice();
       if (r) hops.push(r);
-      const lastLocal = hops.reverse().find((x) => isLocalProvider(x.providerId));
+      const usedLocalIds = new Set(
+        hops.filter((x) => isLocalProvider(x.providerId)).map((x) => x.providerId)
+      );
+      if (localReady.length) {
+        const used = localReady.filter((p) => usedLocalIds.has(p.id));
+        const idle = localReady.filter((p) => !usedLocalIds.has(p.id));
+        line +=
+          "\\nlocal lanes: " +
+          used.length +
+          "/" +
+          localReady.length +
+          " answering · " +
+          localReady.map(localLaneLabel).join("; ");
+        if (idle.length) {
+          line += "\\nidle locals: " + idle.map(localLaneLabel).join("; ");
+        }
+      }
+      const lastLocal = hops.slice().reverse().find((x) => isLocalProvider(x.providerId));
       if (lastLocal && (!r || lastLocal.slug !== r.slug)) {
         line += "\\nlast local hop: " + formatRoute(lastLocal);
       } else if (r && !isLocalProvider(r.providerId) && localReady.length) {

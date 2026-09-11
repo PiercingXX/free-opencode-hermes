@@ -1,4 +1,5 @@
 import { CATALOG_MODEL_ID, OPENCODE_LAUNCHER_TOKEN_ENV, PROVIDER_ID } from "../paths.js";
+import { isLocalClientModelSlug } from "../plugin/lanes.js";
 import { proxyV1Url } from "./common.js";
 import type { ClientModel } from "./client-models.js";
 
@@ -54,6 +55,16 @@ export function buildOpenCodeConfig(
   const modelConfig: Record<string, unknown> = {
     [catalog.wireSlug]: modelConfigEntry(catalog),
   };
+  // Ready self-hosted boxes become concrete free-opencode/<provider>/<model>
+  // entries so parallel lane agents can pin workers to distinct hosts.
+  for (const model of models) {
+    if (!isLocalClientModelSlug(model.wireSlug)) continue;
+    if (model.wireSlug === catalog.wireSlug) continue;
+    modelConfig[model.wireSlug] = modelConfigEntry({
+      ...model,
+      displayName: `Lane · ${model.displayName}`,
+    });
+  }
   const apiKey = options.apiKey ?? `{env:${OPENCODE_API_KEY_ENV}}`;
   const providerConfig = {
     name: "Free OpenCode",

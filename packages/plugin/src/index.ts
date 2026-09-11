@@ -5,6 +5,7 @@ import { applyEnvOverrides, loadSettings, readyProviderIds } from "./config/sett
 import { OPENCODE_LAUNCHER_TOKEN_ENV, PROVIDER_ID, TOKEN_ENV } from "./paths.js";
 import { buildAuthHook } from "./plugin/auth.js";
 import { injectOpenCodeConfig } from "./plugin/config.js";
+import { listReadyLocalLanes, pickOrchestratorLane } from "./plugin/lanes.js";
 import {
   ensureProxyInProcess,
   exportProxyToken,
@@ -50,7 +51,7 @@ export const FreeOpenCodePlugin: Plugin = async () => {
     tool: {
       foc_status: tool({
         description:
-          "Show Free OpenCode proxy status, ready providers, and default model. No required arguments; call with {}.",
+          "Show Free OpenCode proxy status, ready providers, parallel local lanes, and default model. No required arguments; call with {}.",
         args: {
           verbose: tool.schema
             .boolean()
@@ -61,11 +62,22 @@ export const FreeOpenCodePlugin: Plugin = async () => {
           try {
             const settings = applyEnvOverrides(loadSettings());
             const ready = readyProviderIds(settings);
+            const lanes = listReadyLocalLanes(settings);
+            const orchestrator = pickOrchestratorLane(lanes);
             const body: Record<string, unknown> = {
               provider: PROVIDER_ID,
               url: proxyUrlFromSettings(),
               defaultModel: settings.model,
               readyProviders: ready,
+              parallelLanes: lanes.map((lane) => ({
+                agent: lane.agentName,
+                model: lane.wireModel,
+                slug: lane.slug,
+                strength: lane.strength,
+              })),
+              orchestratorLane: orchestrator
+                ? { agent: "parallel-execution-orchestrator", model: orchestrator.wireModel }
+                : null,
             };
             if (args.verbose) body.fallbacks = settings.fallbacks;
             return {
@@ -82,7 +94,7 @@ export const FreeOpenCodePlugin: Plugin = async () => {
       }),
       foc_models: tool({
         description:
-          "List models currently routed through the Free OpenCode proxy. No required arguments; call with {}.",
+          "List models and parallel lane agents (lane-*) for ready self-hosted boxes. Call with {}.",
         args: {
           refresh: tool.schema
             .boolean()
@@ -95,9 +107,22 @@ export const FreeOpenCodePlugin: Plugin = async () => {
             const models = args.refresh
               ? await buildModelCatalog(settings)
               : defaultListedModels(settings);
-            const lines =
+            const lanes = listReadyLocalLanes(settings);
+            const modelLines =
               models.map((m) => m.id).join("\n") || "No models yet. Connect a provider.";
-            return { title: "Free OpenCode models", output: lines };
+            const laneLines =
+              lanes.length === 0
+                ? "No local parallel lanes ready."
+                : lanes
+                    .map(
+                      (lane) =>
+                        `${lane.agentName}\t${lane.wireModel}\tstrength=${lane.strength}`
+                    )
+                    .join("\n");
+            return {
+              title: "Free OpenCode models",
+              output: `Models:\n${modelLines}\n\nParallel lanes (Task subagent_type):\n${laneLines}`,
+            };
           } catch (error) {
             return {
               title: "Free OpenCode models",
