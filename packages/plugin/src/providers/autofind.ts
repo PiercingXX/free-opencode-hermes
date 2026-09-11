@@ -33,6 +33,30 @@ type ProbeSpec = {
   models: (body: Record<string, unknown>) => string[];
 };
 
+function openAiModelIds(body: Record<string, unknown>): string[] {
+  return ((body.data as Array<{ id?: string }> | undefined) ?? [])
+    .map((row) => row.id)
+    .filter((id): id is string => Boolean(id));
+}
+
+/**
+ * OpenAI-compatible servers share /v1/models. Prefer owned_by from the listing
+ * when present so llama.cpp on :30000/:30001 is not labeled as SGLang.
+ */
+export function kindFromOpenAiBody(body: Record<string, unknown>, fallback: string): string {
+  const rows = (body.data as Array<{ owned_by?: string }> | undefined) ?? [];
+  const owners = rows
+    .map((row) => row.owned_by?.trim().toLowerCase())
+    .filter((owner): owner is string => Boolean(owner));
+  for (const owner of owners) {
+    if (owner === "llamacpp" || owner === "llama.cpp" || owner === "llama-cpp") return "llamacpp";
+    if (owner === "sglang") return "sglang";
+    if (owner === "vllm") return "vllm";
+    if (owner === "lmstudio" || owner === "lm studio") return "lmstudio";
+  }
+  return fallback;
+}
+
 const PROBES: ProbeSpec[] = [
   {
     kind: "ollama",
@@ -47,37 +71,32 @@ const PROBES: ProbeSpec[] = [
     kind: "sglang",
     port: 30000,
     path: "/v1/models",
-    models: (body) =>
-      ((body.data as Array<{ id?: string }> | undefined) ?? [])
-        .map((row) => row.id)
-        .filter((id): id is string => Boolean(id)),
+    models: openAiModelIds,
+  },
+  // Common second OpenAI-compat port (llama.cpp next to SGLang on the same box).
+  {
+    kind: "llamacpp",
+    port: 30001,
+    path: "/v1/models",
+    models: openAiModelIds,
   },
   {
     kind: "vllm",
     port: 8000,
     path: "/v1/models",
-    models: (body) =>
-      ((body.data as Array<{ id?: string }> | undefined) ?? [])
-        .map((row) => row.id)
-        .filter((id): id is string => Boolean(id)),
+    models: openAiModelIds,
   },
   {
     kind: "llamacpp",
     port: 8080,
     path: "/v1/models",
-    models: (body) =>
-      ((body.data as Array<{ id?: string }> | undefined) ?? [])
-        .map((row) => row.id)
-        .filter((id): id is string => Boolean(id)),
+    models: openAiModelIds,
   },
   {
     kind: "lmstudio",
     port: 1234,
     path: "/v1/models",
-    models: (body) =>
-      ((body.data as Array<{ id?: string }> | undefined) ?? [])
-        .map((row) => row.id)
-        .filter((id): id is string => Boolean(id)),
+    models: openAiModelIds,
   },
 ];
 
@@ -178,12 +197,14 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
   return out;
 }
 
+type ProbeHit = { kind: string; models: string[] };
+
 async function probeOne(
   host: string,
   spec: ProbeSpec,
   timeoutMs: number,
   fetchImpl: typeof fetch
-): Promise<string[] | null> {
+): Promise<ProbeHit | null> {
   const url = `http://${host}:${spec.port}${spec.path}`;
   try {
     const response = await fetchImpl(url, {
@@ -192,7 +213,10 @@ async function probeOne(
     });
     if (!response.ok) return null;
     const body = (await response.json()) as Record<string, unknown>;
-    return toolModels(spec.models(body));
+    const models = toolModels(spec.models(body));
+    const kind =
+      spec.path === "/v1/models" ? kindFromOpenAiBody(body, spec.kind) : spec.kind;
+    return { kind, models };
   } catch {
     return null;
   }
@@ -286,16 +310,16 @@ export async function runAutofind(deps: AutofindDeps = {}): Promise<AutofindRepo
 
   const jobs = targets.flatMap((target) => PROBES.map((spec) => ({ ...target, spec })));
   const results = await mapPool(jobs, concurrency, async (job) => {
-    const models = await probeOne(job.host, job.spec, timeoutMs, fetchImpl);
-    if (!models) return null;
+    const probed = await probeOne(job.host, job.spec, timeoutMs, fetchImpl);
+    if (!probed) return null;
     const port = job.spec.port;
     const hit: AutofindHit = {
       scope: job.scope,
       host: job.host,
-      kind: job.spec.kind,
+      kind: probed.kind,
       port,
       baseUrl: `http://${job.host}:${port}/v1`,
-      models,
+      models: probed.models,
     };
     return hit;
   });
@@ -304,7 +328,8 @@ export async function runAutofind(deps: AutofindDeps = {}): Promise<AutofindRepo
   const seen = new Set<string>();
   for (const hit of results) {
     if (!hit) continue;
-    const key = `${hit.kind}|${hit.host}|${hit.port}`;
+    // One listener per host:port — kind may be refined from owned_by.
+    const key = `${hit.host}|${hit.port}`;
     if (seen.has(key)) continue;
     seen.add(key);
     hits.push(hit);

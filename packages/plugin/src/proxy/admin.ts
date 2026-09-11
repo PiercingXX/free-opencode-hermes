@@ -189,7 +189,7 @@ export function adminPage(): string {
       <input id="provider-filter" placeholder="B.ai, bai, groq…" autocomplete="off" />
       <div id="providers" class="grid"></div>
       <h2 style="margin-top:20px">Self-hosted</h2>
-      <p class="muted" style="margin:0 0 10px">Ollama, SGLang, LM Studio, llama.cpp. Autofind probes localhost, LAN neighbors, and Tailscale.</p>
+      <p class="muted" style="margin:0 0 10px">Ollama, SGLang, LM Studio, llama.cpp (:8080 and :30001). Autofind probes localhost, LAN neighbors, and Tailscale.</p>
       <div class="row" style="margin:0 0 12px">
         <button type="button" id="autofind" class="secondary">Autofind</button>
         <span id="autofind-status" class="muted"></span>

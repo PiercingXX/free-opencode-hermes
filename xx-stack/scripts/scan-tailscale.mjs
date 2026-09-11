@@ -54,6 +54,13 @@ const PROBES = [
     path: "/v1/models",
     models: (b) => (b.data ?? []).map((m) => m.id),
   },
+  // Second OpenAI-compat port — often llama.cpp beside SGLang on the same box.
+  {
+    kind: "llama-cpp",
+    port: 30001,
+    path: "/v1/models",
+    models: (b) => (b.data ?? []).map((m) => m.id),
+  },
   { kind: "vllm", port: 8000, path: "/v1/models", models: (b) => (b.data ?? []).map((m) => m.id) },
   {
     kind: "llama-cpp",
@@ -71,6 +78,21 @@ const PROBES = [
 
 /** sglang and llama-cpp both answer /v1/models; disambiguate by served model id. */
 const DEFAULT_HERMES_PRIORITY = { sglang: 100, vllm: 90, "llama-cpp": 80, localai: 75, ollama: 70 };
+
+function kindFromOpenAiBody(body, fallback) {
+  const owners = (body.data ?? [])
+    .map((row) => String(row?.owned_by ?? "")
+      .trim()
+      .toLowerCase())
+    .filter(Boolean);
+  for (const owner of owners) {
+    if (owner === "llamacpp" || owner === "llama.cpp" || owner === "llama-cpp") return "llama-cpp";
+    if (owner === "sglang") return "sglang";
+    if (owner === "vllm") return "vllm";
+    if (owner === "localai") return "localai";
+  }
+  return fallback;
+}
 
 function log(...args) {
   if (!AS_JSON) console.log(...args);
@@ -104,7 +126,8 @@ async function probe(host, spec) {
     clearTimeout(timer);
     if (!res.ok) return null;
     const body = await res.json();
-    return { kind: spec.kind, port: spec.port, models: spec.models(body).slice(0, 25) };
+    const kind = spec.path === "/v1/models" ? kindFromOpenAiBody(body, spec.kind) : spec.kind;
+    return { kind, port: spec.port, models: spec.models(body).slice(0, 25) };
   } catch {
     return null;
   }

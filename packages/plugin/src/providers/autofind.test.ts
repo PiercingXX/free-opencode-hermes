@@ -5,6 +5,7 @@ import { emptySettings, isProviderReady, removeProvider } from "../config/settin
 import {
   applyAutofindResults,
   assignProviderId,
+  kindFromOpenAiBody,
   lanHostsFromArpTable,
   runAutofind,
   scopeForHost,
@@ -15,6 +16,18 @@ test("scopeForHost classifies loopback, tailscale, and lan", () => {
   assert.equal(scopeForHost("127.0.0.1"), "loopback");
   assert.equal(scopeForHost("100.64.1.8"), "tailscale");
   assert.equal(scopeForHost("192.168.1.20"), "lan");
+});
+
+test("kindFromOpenAiBody prefers owned_by over the port guess", () => {
+  assert.equal(
+    kindFromOpenAiBody({ data: [{ id: "skippy-brain", owned_by: "llamacpp" }] }, "sglang"),
+    "llamacpp"
+  );
+  assert.equal(
+    kindFromOpenAiBody({ data: [{ id: "deepseek-v4-flash", owned_by: "sglang" }] }, "llamacpp"),
+    "sglang"
+  );
+  assert.equal(kindFromOpenAiBody({ data: [{ id: "mystery" }] }, "sglang"), "sglang");
 });
 
 test("assignProviderId fills canonical slots then unique extras", () => {
@@ -94,6 +107,48 @@ test("runAutofind probes localhost and tailscale, skips embeds, connects slots",
   assert.equal(applied.settings.extra.ollama.baseUrl, "http://127.0.0.1:11434/v1");
   assert.equal(applied.settings.extra.tailscale_sglang.baseUrl, "http://valkyrie:30000/v1");
   assert.deepEqual(applied.settings.discovered.ollama, ["qwen2.5-coder:14b"]);
+});
+
+test("runAutofind finds llama.cpp on :30001 and reclassifies :30000 via owned_by", async () => {
+  const report = await runAutofind({
+    timeoutMs: 200,
+    listTailscaleHosts: async () => ["dutchman", "valkyrie"],
+    listLanHosts: async () => [],
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url === "http://dutchman:30000/v1/models") {
+        return new Response(
+          JSON.stringify({ data: [{ id: "skippy-brain", owned_by: "llamacpp" }] }),
+          { status: 200 }
+        );
+      }
+      if (url === "http://valkyrie:30000/v1/models") {
+        return new Response(
+          JSON.stringify({ data: [{ id: "deepseek-v4-flash", owned_by: "sglang" }] }),
+          { status: 200 }
+        );
+      }
+      if (url === "http://valkyrie:30001/v1/models") {
+        return new Response(
+          JSON.stringify({ data: [{ id: "nagatha-brain", owned_by: "llamacpp" }] }),
+          { status: 200 }
+        );
+      }
+      return new Response("no", { status: 404 });
+    },
+  });
+  assert.equal(report.hits.length, 3);
+  const byUrl = Object.fromEntries(report.hits.map((hit) => [hit.baseUrl, hit]));
+  assert.equal(byUrl["http://dutchman:30000/v1"].kind, "llamacpp");
+  assert.equal(byUrl["http://valkyrie:30000/v1"].kind, "sglang");
+  assert.equal(byUrl["http://valkyrie:30001/v1"].kind, "llamacpp");
+  assert.deepEqual(byUrl["http://valkyrie:30001/v1"].models, ["nagatha-brain"]);
+
+  const applied = applyAutofindResults(emptySettings(), report);
+  assert.ok(applied.report.connected.includes("tailscale_sglang"));
+  assert.ok(applied.report.connected.includes("llamacpp-dutchman"));
+  assert.ok(applied.report.connected.includes("llamacpp-valkyrie"));
+  assert.equal(applied.settings.extra["llamacpp-valkyrie"].baseUrl, "http://valkyrie:30001/v1");
 });
 
 test("autofind reconnects a removed local slot", () => {
