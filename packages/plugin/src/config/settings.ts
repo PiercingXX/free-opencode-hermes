@@ -164,9 +164,16 @@ export function loadSettings(home?: string): Settings {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     return normalizeSettings(parsed);
   } catch {
-    const created = emptySettings();
-    saveSettings(created, home);
-    return created;
+    // Never clobber an existing file — a concurrent write or parse glitch
+    // used to replace ~/.free-opencode/config.json with empty settings.
+    try {
+      readFileSync(path, "utf8");
+      return emptySettings();
+    } catch {
+      const created = emptySettings();
+      saveSettings(created, home);
+      return created;
+    }
   }
 }
 

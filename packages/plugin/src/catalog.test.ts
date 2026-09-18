@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   isAdminListed,
   isProviderConfigured,
   isProviderReady,
+  loadSettings,
   normalizeSettings,
   removeProvider,
   saveSettings,
@@ -26,14 +27,18 @@ import {
   providerExtraFields,
 } from "./providers/catalog.js";
 import { PROVIDER_ID } from "./paths.js";
+import { ensureFreeOpenCodeAuth, opencodeAuthPath } from "./plugin/auth.js";
 import { restrictToFreeOpenCodeProvider, type MutableConfig } from "./plugin/config.js";
 import {
   defaultListedModels,
   discoverProviderModels,
   isFreeModelId,
   isNonToolModelId,
+  isOpenRouterStealthId,
   keepToolCapableModel,
   listedModel,
+  listedModelsForProvider,
+  listingIsFree,
   parseModelRef,
   preferDefaultModel,
   toolsSupportFromListing,
@@ -41,6 +46,7 @@ import {
 import {
   isContextOverflow,
   isRetryableStatus,
+  isUnavailableModel,
   shouldSkipToNextModel,
   routeChat,
   sanitizeChatPayload,
@@ -56,6 +62,13 @@ test("provider catalog ids are unique and non-empty", () => {
     assert.ok(provider.name);
     if (!provider.local) assert.ok(provider.env || provider.unsupported);
   }
+});
+
+test("OpenRouter curated free defaults include stealth/union-alpha", () => {
+  const provider = providerById("open_router");
+  assert.ok(provider);
+  assert.equal(provider.defaultModels[0], "stealth/union-alpha");
+  assert.ok(provider.defaultModels.includes("openrouter/free"));
 });
 
 test("B.ai is a connectable OpenAI-compatible provider", () => {
@@ -245,6 +258,14 @@ test("free model ids include Zen -free, OpenRouter :free, and big-pickle", () =>
   assert.equal(isFreeModelId("big-pickle"), true);
   assert.equal(isFreeModelId("mimo-v2.5-free"), true);
   assert.equal(isFreeModelId("qwen/qwen3-coder:free"), true);
+  assert.equal(isOpenRouterStealthId("stealth/union-alpha"), true);
+  assert.equal(isFreeModelId("stealth/union-alpha"), true);
+  assert.equal(isFreeModelId("union-alpha"), true);
+  assert.equal(isFreeModelId("union-alpha", "opencode_zen"), true);
+  assert.equal(isFreeModelId("stealth/union-alpha", "open_router"), true);
+  assert.equal(isFreeModelId("open_router/stealth/union-alpha"), true);
+  assert.equal(listingIsFree({ pricing: { prompt: "0", completion: "0" } }, "stealth/union-alpha"), true);
+  assert.equal(isFreeModelId("unbiased/pareto"), false);
   assert.equal(isFreeModelId("llama-3.3-70b-versatile"), false);
   // gpt-5-nano is free on Zen only — B.ai's same id is premium.
   assert.equal(isFreeModelId("gpt-5-nano"), false);
@@ -306,7 +327,23 @@ test("OpenRouter-style /models listings keep only tool-capable ids", async () =>
       { status: 200 }
     );
   });
-  assert.deepEqual(models, ["qwen/qwen3-coder:free"]);
+  assert.ok(models.includes("qwen/qwen3-coder:free"));
+  assert.ok(models.includes("stealth/union-alpha"), "curated stealth SKU survives a listing that omits it");
+  assert.ok(models.includes("openrouter/free"));
+  assert.ok(!models.includes("google/gemma-3-4b-it:free"));
+  assert.ok(!models.includes("openai/text-embedding-3-small"));
+  assert.equal(models[0], "stealth/union-alpha");
+});
+
+test("listed OpenRouter models keep stealth/union-alpha after Connect overwrites discovery", () => {
+  const provider = providerById("open_router");
+  assert.ok(provider);
+  const settings = setProviderKey(emptySettings(), "open_router", "or_test");
+  settings.discovered.open_router = ["qwen/qwen3-coder:free", "anthropic/claude-fable-5.1"];
+  const listed = listedModelsForProvider(settings, provider);
+  assert.ok(listed.includes("stealth/union-alpha"));
+  assert.ok(listed.includes("qwen/qwen3-coder:free"));
+  assert.equal(listed[0], "stealth/union-alpha");
 });
 
 test("Ollama /api/show capabilities.tools drops models without tools", async () => {
@@ -374,6 +411,21 @@ test("Ollama discovery falls back to /api/tags when /v1/models fails", async () 
   assert.ok(hits.some((url) => url.endsWith("/api/tags")));
 });
 
+test("ensureFreeOpenCodeAuth writes the proxy token without clobbering other keys", () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-auth-"));
+  mkdirSync(join(home, ".local", "share", "opencode"), { recursive: true });
+  const path = opencodeAuthPath(home);
+  writeFileSync(path, `${JSON.stringify({ opencode: { type: "api", key: "sk-keep-me" } })}\n`);
+  ensureFreeOpenCodeAuth("proxy-token", home);
+  const saved = JSON.parse(readFileSync(path, "utf8")) as {
+    opencode: { key: string };
+    "free-opencode": { type: string; key: string };
+  };
+  assert.equal(saved.opencode.key, "sk-keep-me");
+  assert.equal(saved["free-opencode"].type, "api");
+  assert.equal(saved["free-opencode"].key, "proxy-token");
+});
+
 test("OpenCode picker is restricted to the free-opencode provider", () => {
   const config = {
     enabled_providers: ["anthropic", "opencode"],
@@ -398,14 +450,24 @@ test("config overlay rewrites a Zen default model to the catalog alias", () => {
   assert.ok((config.provider as Record<string, unknown>).anthropic);
 });
 
-test("config overlay keeps a user-set non-Zen model", () => {
+test("config overlay rewrites a leftover SGLang/Groq default so the picker is not empty", () => {
   const config = {
-    model: "groq/llama-3.3-70b-versatile",
-    small_model: "groq/llama-3.1-8b-instant",
+    model: "sglang/qwen3-coder-next",
+    small_model: "groq/llama-3.3-70b-versatile",
   } as MutableConfig;
   restrictToFreeOpenCodeProvider(config);
-  assert.equal(config.model, "groq/llama-3.3-70b-versatile");
-  assert.equal(config.small_model, "groq/llama-3.1-8b-instant");
+  assert.equal(config.model, `${PROVIDER_ID}/default`);
+  assert.equal(config.small_model, `${PROVIDER_ID}/default`);
+});
+
+test("config overlay keeps an explicit free-opencode lane model", () => {
+  const config = {
+    model: "free-opencode/tailscale_sglang/deepseek-v4-flash",
+    small_model: "free-opencode/default",
+  } as MutableConfig;
+  restrictToFreeOpenCodeProvider(config);
+  assert.equal(config.model, "free-opencode/tailscale_sglang/deepseek-v4-flash");
+  assert.equal(config.small_model, "free-opencode/default");
 });
 
 test("parseModelRef splits provider/model including nested ids", () => {
@@ -413,6 +475,15 @@ test("parseModelRef splits provider/model including nested ids", () => {
   assert.equal(ref.providerId, "nvidia_nim");
   assert.equal(ref.model, "nvidia/nemotron-3-super-120b-a12b");
   assert.equal(ref.slug, "nvidia_nim/nvidia/nemotron-3-super-120b-a12b");
+});
+
+test("loadSettings does not overwrite a corrupt existing config file", () => {
+  const home = mkdtempSync(join(tmpdir(), "foc-"));
+  const path = join(home, ".free-opencode", "config.json");
+  mkdirSync(join(home, ".free-opencode"), { recursive: true });
+  writeFileSync(path, "{not-json");
+  loadSettings(home);
+  assert.equal(readFileSync(path, "utf8"), "{not-json");
 });
 
 test("settings round-trip keeps keys and fallbacks", () => {
@@ -499,9 +570,16 @@ test("429 and 5xx are retryable, 401 is not", () => {
   assert.equal(isRetryableStatus(429), true);
   assert.equal(isRetryableStatus(402), true);
   assert.equal(isRetryableStatus(403), true);
+  assert.equal(isRetryableStatus(404), true);
   assert.equal(isRetryableStatus(503), true);
   assert.equal(isRetryableStatus(401), false);
   assert.equal(isRetryableStatus(400), false);
+  assert.equal(isUnavailableModel(404, "Not Found"), true);
+  assert.equal(isUnavailableModel(400, "stealth/union-alpha is not a valid model ID"), true);
+  assert.equal(isUnavailableModel(400, "No endpoints found for stealth/union-alpha"), true);
+  assert.equal(isUnavailableModel(400, "invalid json"), false);
+  assert.equal(shouldSkipToNextModel(404, "Not Found"), true);
+  assert.equal(shouldSkipToNextModel(400, "is not a valid model"), true);
 });
 
 test("context overflow skips to the next model instead of killing the session", () => {

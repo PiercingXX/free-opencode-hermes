@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 
 import { applyEnvOverrides, loadSettings, readyProviderIds } from "./config/settings.js";
 import { OPENCODE_LAUNCHER_TOKEN_ENV, PROVIDER_ID, TOKEN_ENV } from "./paths.js";
-import { buildAuthHook } from "./plugin/auth.js";
+import { buildAuthHook, ensureFreeOpenCodeAuth } from "./plugin/auth.js";
 import { injectOpenCodeConfig } from "./plugin/config.js";
 import { listReadyLocalLanes, pickOrchestratorLane } from "./plugin/lanes.js";
 import {
@@ -13,13 +13,57 @@ import {
 } from "./plugin/lifecycle.js";
 import { buildModelCatalog, defaultListedModels } from "./proxy/models.js";
 
-export const FreeOpenCodePlugin: Plugin = async () => {
+async function bootProxyAndAuth(): Promise<void> {
   exportProxyToken();
+  try {
+    ensureFreeOpenCodeAuth(applyEnvOverrides(loadSettings()).proxyAuthToken);
+  } catch {
+    // auth.json is best-effort; config.provider.options.apiKey still applies.
+  }
   try {
     await ensureProxyInProcess();
   } catch {
     // OpenCode still loads; Admin/CLI can start the proxy later.
   }
+}
+
+/** OpenCode v2 plugin setup. V1 implementations do not run on 2.x. */
+async function setupOpenCodeV2(ctx: {
+  catalog?: { transform: (fn: (editor: unknown) => void) => unknown };
+  provider?: { transform: (fn: (editor: unknown) => void) => unknown };
+}): Promise<void> {
+  await bootProxyAndAuth();
+  const settings = applyEnvOverrides(loadSettings());
+  const token = settings.proxyAuthToken;
+  const baseURL = `${proxyUrlFromSettings()}/v1`;
+  const register = (editor: unknown): void => {
+    const add = (editor as { add?: (row: unknown) => void }).add;
+    if (typeof add === "function") {
+      (add as (row: unknown) => void)({
+        info: {
+          id: PROVIDER_ID,
+          name: "Free OpenCode",
+          activation: "enabled",
+          package: "@ai-sdk/openai-compatible",
+          env: [TOKEN_ENV],
+          settings: { baseURL, apiKey: token },
+        },
+        models: [
+          {
+            id: "default",
+            name: "Free OpenCode",
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+          },
+        ],
+      });
+    }
+  };
+  if (ctx.provider?.transform) await ctx.provider.transform(register);
+  else if (ctx.catalog?.transform) await ctx.catalog.transform(register);
+}
+
+export const FreeOpenCodePlugin: Plugin = async () => {
+  await bootProxyAndAuth();
 
   return {
     auth: buildAuthHook(),
@@ -133,4 +177,11 @@ export const FreeOpenCodePlugin: Plugin = async () => {
       }),
     },
   };
+};
+
+/** V2 reads `id` + `setup`; V1 1.18.29+ reads `server()`. Named export keeps older V1 loaders. */
+export default {
+  id: PROVIDER_ID,
+  setup: setupOpenCodeV2,
+  server: FreeOpenCodePlugin,
 };

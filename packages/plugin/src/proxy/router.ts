@@ -251,14 +251,25 @@ export function resolveAttempt(settings: Settings, ref: ModelRef): RouteAttempt 
 export function isRetryableStatus(status: number): boolean {
   // 402 Payment Required / 403 Access Restricted (B.ai deposit, etc.): this
   // model cannot serve the key. Skip the slug and keep walking — do not abort
-  // the session. 401 stays fatal (wrong key).
+  // the session. 401 stays fatal (wrong key). 404 is a vanished SKU (OpenRouter
+  // stealth previews drop off the catalog after reveal).
   return (
     status === 402 ||
     status === 403 ||
+    status === 404 ||
     status === 408 ||
     status === 409 ||
     status === 429 ||
     status >= 500
+  );
+}
+
+/** Upstream says this model id is gone / unknown — hop, do not kill the turn. */
+export function isUnavailableModel(status: number, message = ""): boolean {
+  if (status === 404) return true;
+  if (status !== 400) return false;
+  return /not found|no endpoints|is not a valid model|unknown model|model .* does not exist|invalid model/i.test(
+    message
   );
 }
 
@@ -289,6 +300,7 @@ export function isContextOverflow(status: number, message: string): boolean {
 export function shouldSkipToNextModel(status: number, message: string): boolean {
   return (
     isRetryableStatus(status) ||
+    isUnavailableModel(status, message) ||
     isContextOverflow(status, message) ||
     isPaywallMessage(status, message)
   );
@@ -381,14 +393,24 @@ export async function defaultTransport(
   const payload = sanitizeChatPayload(body, attempt.ref.model, attempt.ref.providerId);
   return fetch(`${attempt.baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${attempt.apiKey}`,
-      "Content-Type": "application/json",
-      Accept: payload.stream ? "text/event-stream" : "application/json",
-    },
+    headers: upstreamHeaders(attempt, Boolean(payload.stream)),
     body: JSON.stringify(payload),
     signal,
   });
+}
+
+/** OpenRouter free/stealth SKUs expect an identifying Referer; other providers ignore extras. */
+export function upstreamHeaders(attempt: RouteAttempt, stream: boolean): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${attempt.apiKey}`,
+    "Content-Type": "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
+  };
+  if (attempt.ref.baseProviderId === "open_router") {
+    headers["HTTP-Referer"] = "https://github.com/PiercingXX/free-opencode-hermes";
+    headers["X-Title"] = "Free OpenCode";
+  }
+  return headers;
 }
 
 export type RoutedResult = {
@@ -630,10 +652,7 @@ export async function probeOpenSiblings(
         const attempt = resolveAttempt(live, ref);
         const response = await fetch(`${attempt.baseUrl}/chat/completions`, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${attempt.apiKey}`,
-            "Content-Type": "application/json",
-          },
+          headers: upstreamHeaders(attempt, false),
           body: JSON.stringify({
             model: ref.model,
             messages: [{ role: "user", content: "." }],

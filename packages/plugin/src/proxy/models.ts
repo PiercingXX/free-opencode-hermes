@@ -32,7 +32,7 @@ export type ListedModel = {
   maxRetries?: 0;
   supportsReasoning?: boolean;
   supportsTools?: boolean;
-  /** No token charge: OpenRouter :free, OpenCode Zen *-free, or a self-hosted box. */
+  /** No token charge: OpenRouter :free / stealth/*, OpenCode Zen *-free, or a self-hosted box. */
   free?: boolean;
   supportsReasoningEffort?: boolean;
   inputModalities?: string[];
@@ -199,7 +199,7 @@ export type ModelListing = {
 };
 
 /** Global free leaves (any provider) that do not use a -free / :free suffix. */
-const FREE_MODEL_LEAVES = new Set(["big-pickle"]);
+const FREE_MODEL_LEAVES = new Set(["big-pickle", "union-alpha"]);
 
 /**
  * Provider-scoped free leaves. Zen `gpt-5-nano` is $0; the same id on B.ai is
@@ -207,16 +207,25 @@ const FREE_MODEL_LEAVES = new Set(["big-pickle"]);
  * is listed here — GET /models does not advertise pricing.
  */
 const FREE_MODEL_LEAVES_BY_PROVIDER: Record<string, ReadonlySet<string>> = {
-  opencode_zen: new Set(["big-pickle", "gpt-5-nano"]),
-  opencode: new Set(["big-pickle", "gpt-5-nano"]),
+  opencode_zen: new Set(["big-pickle", "gpt-5-nano", "union-alpha"]),
+  opencode: new Set(["big-pickle", "gpt-5-nano", "union-alpha"]),
+  // OpenRouter stealth SKUs are $0 during preview and omit the :free suffix
+  // (`stealth/union-alpha`). Prefix match in isFreeModelId covers the family.
   // B.ai has no static free leaf — GET /models lacks pricing. Auto-routing uses
   // probed `modelAccess` open entries only (see probeProviderAccess).
 };
+
+/** OpenRouter stealth preview SKUs (`stealth/union-alpha`) are $0 with no :free suffix. */
+export function isOpenRouterStealthId(id: string): boolean {
+  const n = id.trim().toLowerCase();
+  return n.startsWith("stealth/") || n.includes("/stealth/");
+}
 
 export function isFreeModelId(id: string, providerId?: string): boolean {
   const n = id.trim().toLowerCase();
   if (!n) return false;
   if (n.endsWith(":free") || n.endsWith("-free") || n.endsWith("/free")) return true;
+  if (isOpenRouterStealthId(n)) return true;
   const leaf = n.split("/").pop() ?? n;
   if (providerId) {
     const base = providerId.split("@")[0]?.toLowerCase() ?? "";
@@ -252,14 +261,37 @@ export function isBaiAutoRoutedModel(
   return settings.modelAccess?.[`${providerId}/${model}`]?.status === "open";
 }
 
+function isZeroPrice(value: unknown): boolean {
+  return value === 0 || value === "0" || value === "0.0";
+}
+
 export function listingIsFree(row: Record<string, unknown>, id: string): boolean {
   if (isFreeModelId(id)) return true;
   const pricing = row.pricing;
   if (pricing && typeof pricing === "object" && !Array.isArray(pricing)) {
     const prompt = (pricing as { prompt?: unknown }).prompt;
-    if (prompt === 0 || prompt === "0" || prompt === "0.0") return true;
+    const completion = (pricing as { completion?: unknown }).completion;
+    if (isZeroPrice(prompt) && (completion === undefined || isZeroPrice(completion))) return true;
   }
   return false;
+}
+
+/**
+ * Keep curated free defaults (OpenRouter stealth SKUs, :free leaves) even when
+ * GET /models omits them. Stealth previews are often missing from the public
+ * catalog while chat/completions still serves them.
+ */
+export function mergeCuratedFreeModels(provider: ProviderDescriptor, listed: string[]): string[] {
+  const seen = new Set<string>();
+  const extras: string[] = [];
+  for (const id of provider.defaultModels) {
+    if (seen.has(id)) continue;
+    if (!isFreeModelId(id, provider.baseProviderId ?? provider.id)) continue;
+    seen.add(id);
+    extras.push(id);
+  }
+  const rest = listed.filter((id) => !seen.has(id));
+  return extras.length === 0 ? listed : [...extras, ...rest];
 }
 
 const NON_TOOL_MODEL =
@@ -310,7 +342,9 @@ export function listedModelsForProvider(
 ): string[] {
   const discovered = settings.discovered[provider.id];
   const raw = discovered && discovered.length > 0 ? discovered : provider.defaultModels;
-  return raw.filter((id) => keepToolCapableModel({ id, supportsTools: null }));
+  return mergeCuratedFreeModels(provider, raw).filter((id) =>
+    keepToolCapableModel({ id, supportsTools: null })
+  );
 }
 
 export function defaultListedModels(
@@ -368,7 +402,10 @@ async function discoverOpenAiModels(
     throw new Error(`${provider.name} model list failed: HTTP ${response.status}`);
   }
   const body = (await response.json()) as OpenAIModelList;
-  return listingsFromOpenAiBody(body).map((row) => row.id);
+  return mergeCuratedFreeModels(
+    provider,
+    listingsFromOpenAiBody(body).map((row) => row.id)
+  );
 }
 
 export async function discoverProviderModels(

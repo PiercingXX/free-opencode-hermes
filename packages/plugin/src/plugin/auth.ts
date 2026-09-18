@@ -1,3 +1,7 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import type { AuthHook } from "@opencode-ai/plugin";
 
 import {
@@ -8,6 +12,39 @@ import {
 } from "../config/settings.js";
 import { PROVIDER_ID } from "../paths.js";
 import { PROVIDER_CATALOG, providerById } from "../providers/catalog.js";
+
+/** OpenCode v2 stores connected keys here; without this entry the TUI shows "No provider selected". */
+export function opencodeAuthPath(home = homedir()): string {
+  return join(home, ".local", "share", "opencode", "auth.json");
+}
+
+/** Merge the proxy token so OpenCode treats free-opencode as a connected provider. */
+export function ensureFreeOpenCodeAuth(token: string, home = homedir()): void {
+  const key = token.trim();
+  if (!key) return;
+  const path = opencodeAuthPath(home);
+  let current: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      current = parsed as Record<string, unknown>;
+    }
+  } catch {
+    current = {};
+  }
+  const existing = current[PROVIDER_ID];
+  if (
+    existing &&
+    typeof existing === "object" &&
+    !Array.isArray(existing) &&
+    (existing as { key?: unknown }).key === key
+  ) {
+    return;
+  }
+  current[PROVIDER_ID] = { type: "api", key };
+  mkdirSync(join(home, ".local", "share", "opencode"), { recursive: true, mode: 0o700 });
+  writeFileSync(path, `${JSON.stringify(current, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
 
 export function buildAuthHook(): AuthHook {
   const connectable = PROVIDER_CATALOG.filter((p) => !p.local && !p.unsupported && p.env);

@@ -52,7 +52,12 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     env: "OPENROUTER_API_KEY",
     credentialUrl: "https://openrouter.ai/keys",
     defaultBaseUrl: "https://openrouter.ai/api/v1",
-    defaultModels: ["openrouter/free", "qwen/qwen3-coder:free", "moonshotai/kimi-k2:free"],
+    defaultModels: [
+      "stealth/union-alpha",
+      "openrouter/free",
+      "qwen/qwen3-coder:free",
+      "moonshotai/kimi-k2:free",
+    ],
     modelsQuery: "supported_parameters=tools",
   },
   {
@@ -232,6 +237,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     credentialUrl: "https://opencode.ai/auth",
     defaultBaseUrl: "https://opencode.ai/zen/v1",
     defaultModels: [
+      "union-alpha",
       "big-pickle",
       "mimo-v2.5-free",
       "nemotron-3-ultra-free",

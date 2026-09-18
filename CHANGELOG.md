@@ -7,6 +7,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **OpenRouter stealth/union-alpha.** `stealth/union-alpha` is a $0 stealth
+  SKU without a `:free` suffix, so free-first routing skipped it and Connect
+  dropped it when GET /models omitted the preview. It is now a curated OpenRouter
+  default, treated as free, merged back in after discovery, and a 404 / "not a
+  valid model" hop continues to the next free slug instead of killing the
+  session. OpenRouter requests send `HTTP-Referer` / `X-Title`. OpenCode Zen's
+  `union-alpha` leaf is free too. The picker always pins `free-opencode/default`
+  (a leftover `sglang/*` default plus `enabled_providers: ["free-opencode"]`
+  made OpenCode v2 show "No provider selected"). OpenCode 2.x does not run V1
+  plugin hooks, so the provider is also written into `opencode.json` (`env` +
+  `apiKey` + `default` model) and the plugin default-exports a v2 `setup()`.
+  Restart the OpenCode service after install. OpenCode 2.x plugin entries must
+  be a package directory (not a `file://` `.ts` URL). `enabled_providers`
+  must not whitelist a custom provider that v2 has not authenticated or the
+  TUI shows "No provider selected". `loadSettings` no longer replaces a
+  corrupt on-disk config with empty keys.
+
 - **B.ai free routing.** B.ai auto-routes only models a hardened live probe
   marks open (`modelAccess`). Candidates: `glm-5.3-flash`, `qwen3.8-flash`,
   `hy3`, `mimo-v2.5` (DeepSeek flash is skipped — zero-balance accounts get

@@ -16,6 +16,7 @@ import {
   mcpServerEntrypoint,
   PROVIDER_ID,
   repoRoot,
+  TOKEN_ENV,
   xxStackDir,
 } from "../paths.js";
 import { loadRuntimeAgents, loadSharedInstructions } from "./agents.js";
@@ -505,6 +506,7 @@ export function injectOpenCodeConfig(config: MutableConfig): void {
   config.provider[PROVIDER_ID] = {
     name: "Free OpenCode",
     npm: "@ai-sdk/openai",
+    env: [TOKEN_ENV],
     options: {
       baseURL: proxyBaseUrl(),
       apiKey: token,
@@ -567,14 +569,20 @@ export function loadedConfigDefaultsToZen(home?: string): boolean {
   }
 }
 
+/** True when the picker already points at the Free OpenCode provider (catalog or a lane). */
+export function isFreeOpenCodeModelRef(raw: unknown): boolean {
+  return typeof raw === "string" && raw.trim().startsWith(`${PROVIDER_ID}/`);
+}
+
 /**
  * Pin the picker to the free-opencode provider. This mirrors what the
  * foc-opencode launcher overlay does, so a bare `opencode` session (which loads
- * ~/.config/opencode/opencode.json) cannot default to Zen: enabled_providers
- * carries only free-opencode, opencode stays in disabled_providers, and the
- * model/small_model are rewritten to the catalog when they are unset or still
- * point at a Zen model. The user's other provider blocks are left alone; only
- * the picker default is constrained.
+ * ~/.config/opencode/opencode.json) cannot default to Zen or a leftover
+ * SGLang/Groq slug: enabled_providers carries only free-opencode, opencode
+ * stays in disabled_providers, and model/small_model are rewritten to the
+ * catalog unless they already name a free-opencode slug. Leaving a foreign
+ * model (e.g. sglang/qwen3-coder-next) with only free-opencode enabled makes
+ * OpenCode v2 show "No provider selected".
  */
 export function restrictToFreeOpenCodeProvider(config: MutableConfig): void {
   config.enabled_providers = [PROVIDER_ID];
@@ -583,6 +591,6 @@ export function restrictToFreeOpenCodeProvider(config: MutableConfig): void {
   config.disabled_providers = disabled;
 
   const catalog = catalogModelRef();
-  if (!config.model || isZenModelRef(config.model)) config.model = catalog;
-  if (!config.small_model || isZenModelRef(config.small_model)) config.small_model = catalog;
+  if (!isFreeOpenCodeModelRef(config.model)) config.model = catalog;
+  if (!isFreeOpenCodeModelRef(config.small_model)) config.small_model = catalog;
 }

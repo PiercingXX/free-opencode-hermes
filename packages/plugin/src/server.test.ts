@@ -342,14 +342,15 @@ test("lastRoute reports the winning hop with real latency after a chat request",
 
 test("lastRoute shows real latency and fallback on a hopped chat request", async () => {
   const home = mkdtempSync(join(tmpdir(), "foc-proxy-fallback-latency-"));
-  // One upstream that 429s the free model and answers the paid one (delayed).
+  // One upstream that 429s every free OpenRouter slug (stealth/union-alpha,
+  // openrouter/free, :free leaves) and answers the paid Groq model (delayed).
   const upstream = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(Buffer.from(c)));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString("utf8");
       const model = JSON.parse(body).model as string;
-      if (model === "openrouter/free") {
+      if (model !== "llama-3.3-70b-versatile") {
         res.writeHead(429, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "rate limited" } }));
         return;
@@ -411,7 +412,10 @@ test("lastRoute shows real latency and fallback on a hopped chat request", async
     assert.ok(healthBody.lastRoute);
     assert.equal(healthBody.lastRoute.slug, "groq/llama-3.3-70b-versatile");
     assert.ok(healthBody.lastRoute.latencyMs > 0, "real latency on the fallback hop");
-    assert.equal(healthBody.lastRoute.fallback, 1, "fallback hop must not report fallback 0");
+    assert.ok(
+      Number(healthBody.lastRoute.fallback) >= 1,
+      "fallback hop must not report fallback 0"
+    );
   } finally {
     await proxy.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));

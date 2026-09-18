@@ -15,6 +15,7 @@ import {
   isContextOverflow,
   isRetryableStatus,
   isSelfHostedProvider,
+  isUnavailableModel,
   routeChat,
   routeTargets,
   type ChatRequest,
@@ -31,6 +32,25 @@ test("isSelfHostedProvider flags local and Tailscale boxes but not cloud", () =>
   assert.equal(isSelfHostedProvider("open_router"), false);
   assert.equal(isSelfHostedProvider("groq"), false);
   assert.equal(isSelfHostedProvider("nvidia_nim"), false);
+});
+
+test("alias route: OpenRouter stealth/union-alpha is free-first", () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "open_router", "or_test");
+  settings = setProviderKey(settings, "groq", "gsk_test");
+  settings.model = "groq/llama-3.3-70b-versatile";
+  settings.fallbacks = [];
+  settings.discovered.open_router = ["qwen/qwen3-coder:free"];
+
+  const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
+  assert.ok(slugs.includes("open_router/stealth/union-alpha"));
+  assert.ok(
+    slugs.indexOf("open_router/stealth/union-alpha") < slugs.indexOf("groq/llama-3.3-70b-versatile"),
+    "stealth union-alpha must rank as free cloud, not paid"
+  );
+  assert.ok(
+    slugs.indexOf("open_router/stealth/union-alpha") < slugs.indexOf("open_router/qwen/qwen3-coder:free")
+  );
 });
 
 test("alias route: free OpenRouter first, paid cloud, self-hosted last", () => {
@@ -261,6 +281,32 @@ test("403 deposit required hops past the premium slug", async () => {
   assert.equal(result.used.slug, "bai/glm-5.3-flash");
   assert.equal(result.tried[0], "bai/gpt-5-nano");
   assert.equal(isRetryableStatus(403), true);
+  __resetCooldowns();
+});
+
+test("404 on stealth/union-alpha hops to the next OpenRouter free slug", async () => {
+  __resetCooldowns();
+  let settings = setProviderKey(emptySettings(), "open_router", "or_test");
+  settings.model = "open_router/stealth/union-alpha";
+  settings.fallbacks = ["open_router/openrouter/free"];
+
+  const result = await routeChat(
+    settings,
+    { model: "free-opencode/default", stream: false } satisfies ChatRequest,
+    async (attempt: RouteAttempt) => {
+      if (attempt.ref.model === "stealth/union-alpha") {
+        return new Response(
+          JSON.stringify({ error: { message: "No endpoints found for stealth/union-alpha" } }),
+          { status: 404 }
+        );
+      }
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
+    }
+  );
+  assert.equal(isUnavailableModel(404, "No endpoints found"), true);
+  assert.equal(isRetryableStatus(404), true);
+  assert.equal(result.tried[0], "open_router/stealth/union-alpha");
+  assert.equal(result.used.slug, "open_router/openrouter/free");
   __resetCooldowns();
 });
 

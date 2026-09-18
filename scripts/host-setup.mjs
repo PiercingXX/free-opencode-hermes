@@ -266,23 +266,67 @@ function loadJsonObject(configPath) {
   return parsed;
 }
 
+function freeOpenCodeSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(home, ".free-opencode", "config.json"), "utf8"));
+    const host = typeof raw.listen?.host === "string" && raw.listen.host.trim() ? raw.listen.host.trim() : "127.0.0.1";
+    const port = Number.isInteger(raw.listen?.port) && raw.listen.port > 0 ? raw.listen.port : 8082;
+    const token = typeof raw.proxyAuthToken === "string" ? raw.proxyAuthToken.trim() : "";
+    return { baseURL: `http://${host}:${port}/v1`, token };
+  } catch {
+    return { baseURL: "http://127.0.0.1:8082/v1", token: "" };
+  }
+}
+
 function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
   const config = loadJsonObject(configPath);
   const plugins = Array.isArray(config.plugin)
     ? config.plugin.filter((entry) => {
         if (typeof entry !== "string") return true;
-        return !entry.includes("packages/plugin/src/index.ts");
+        return !entry.includes("packages/plugin");
       })
     : [];
   plugins.push(pluginRef);
+  // OpenCode v1 reads `plugin`; v2 reads `plugins`. V1 plugin code does not run on 2.x.
   config.plugin = plugins;
-  config.enabled_providers = ["free-opencode"];
-  if (!config.model) config.model = "free-opencode/default";
-  if (!config.small_model) config.small_model = "free-opencode/default";
-  const disabled = Array.isArray(config.disabled_providers) ? config.disabled_providers : [];
-  config.disabled_providers = Array.from(
-    new Set(disabled.filter((id) => id !== "free-opencode").concat(["opencode"]))
-  );
+  config.plugins = plugins;
+  const foc = freeOpenCodeSettings();
+  config.provider = config.provider && typeof config.provider === "object" ? config.provider : {};
+  config.provider["free-opencode"] = {
+    name: "Free OpenCode",
+    npm: "@ai-sdk/openai-compatible",
+    env: ["FREE_OPENCODE_API_KEY"],
+    options: {
+      baseURL: foc.baseURL,
+      ...(foc.token ? { apiKey: foc.token } : {}),
+    },
+    models: {
+      default: {
+        name: "Free OpenCode",
+        tool_call: true,
+        limit: { context: 1048576, output: 32768 },
+      },
+    },
+  };
+  const catalog = "free-opencode/default";
+  if (typeof config.model !== "string" || !config.model.startsWith("free-opencode/")) {
+    config.model = catalog;
+  }
+  if (typeof config.small_model !== "string" || !config.small_model.startsWith("free-opencode/")) {
+    config.small_model = catalog;
+  }
+  config.default_agent = "build";
+  config.agent = config.agent && typeof config.agent === "object" ? config.agent : {};
+  for (const name of ["build", "plan", "general"]) {
+    const existing = config.agent[name] && typeof config.agent[name] === "object" ? config.agent[name] : {};
+    config.agent[name] = {
+      ...existing,
+      mode: "primary",
+      model: catalog,
+      disable: false,
+      hidden: false,
+    };
+  }
   if (!config.$schema) config.$schema = "https://opencode.ai/config.json";
   if (mcpEntrypoint && fs.existsSync(mcpEntrypoint)) {
     config.mcp = config.mcp && typeof config.mcp === "object" ? config.mcp : {};
@@ -303,15 +347,17 @@ function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
 }
 
 function opencodeHost() {
-  const pluginEntry = path.join(repoRoot, "packages", "plugin", "src", "index.ts");
+  const pluginDir = path.join(repoRoot, "packages", "plugin");
+  const pluginEntry = path.join(pluginDir, "src", "index.ts");
   if (!fs.existsSync(pluginEntry)) die(`plugin entry missing: ${pluginEntry}`);
-  const cli = path.join(repoRoot, "packages", "plugin", "dist", "cli.js");
+  const cli = path.join(pluginDir, "dist", "cli.js");
   if (!fs.existsSync(cli)) die(`plugin CLI was not built: ${cli}`);
 
   const ocDir = configDir();
   fs.mkdirSync(ocDir, { recursive: true });
   const mcpEntrypoint = path.join(repoRoot, "xx-stack", "mcp-server", "dist", "index.js");
-  mergePlugin(path.join(ocDir, "opencode.json"), pathToFileURL(pluginEntry).href, mcpEntrypoint);
+  // OpenCode v2 requires a plugin directory, not a file:// .ts URL.
+  mergePlugin(path.join(ocDir, "opencode.json"), pluginDir, mcpEntrypoint);
 
   const skillsSrc = path.join(repoRoot, "xx-stack", "runtime", "skills");
   if (fs.existsSync(skillsSrc)) {

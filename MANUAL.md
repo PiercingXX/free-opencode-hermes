@@ -104,7 +104,8 @@ Shell equivalents of Admin: `free-opencode connect <provider>`,
 The hop chain is the Admin **default** plus **fallback** list (free models
 first, then paid, self-hosted last). Bare provider ids in that list (e.g.
 `groq`) expand to that provider's listed models. With an empty fallback list,
-connected free cloud (OpenRouter `:free`, Zen `*-free` / `big-pickle`) still
+connected free cloud (OpenRouter `:free` and `stealth/*` previews such as
+`union-alpha`, Zen `*-free` / `big-pickle`) still
 fills in ahead of a paid default. With fallbacks set, free fill-in is limited
 to providers already named in default/fallbacks — unlisted paid catalog ids
 (e.g. another B.ai model) and unconfigured Zen do not hop. A concrete request

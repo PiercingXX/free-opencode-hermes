@@ -211,7 +211,7 @@ export function adminPage(): string {
       <p class="muted" style="margin:0 0 8px">Self-hosted is used only after free models fail or are in cooldown. A drained box is skipped until Retry-After elapses. Fallbacks scope the hop chain — unlisted paid catalog ids and unconfigured providers do not auto-hop.</p>
       <div id="cooldowns" class="muted"></div>
       <h2 style="margin-top:20px">Free tool models</h2>
-      <p class="muted" style="margin:0 0 8px">OpenCode Zen *-free / big-pickle, OpenRouter :free, and anything on your boxes. Use sets the default.</p>
+      <p class="muted" style="margin:0 0 8px">OpenCode Zen *-free / big-pickle, OpenRouter :free and stealth/* (union-alpha), and anything on your boxes. Use sets the default.</p>
       <div id="free-models" class="muted"></div>
       <h2 style="margin-top:20px">Ready models</h2>
       <div id="models" class="muted"></div>
