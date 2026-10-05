@@ -42,7 +42,7 @@
   "type": "module",
   "private": true,
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.28.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "zod": "^4.6.2"
   },
   "devDependencies": {
