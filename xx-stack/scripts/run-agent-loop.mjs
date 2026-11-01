@@ -2,9 +2,11 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fail, slugify } from "./lib/cli.mjs";
 
 const DEFAULT_COMPLETION_PROMISE = "<promise>DONE</promise>";
 const DEFAULT_AGENT = "execution-orchestrator";
@@ -13,20 +15,6 @@ const MANIFEST_VERSION = 1;
 function usage() {
   process.stdout.write(
     `Usage:\n  node scripts/run-agent-loop.mjs --runner '<command>' --todo TODO.md [options]\n\nOptions:\n  --runner <command>            Shell command that reads prompt text from stdin and writes agent output to stdout.\n  --runner-timeout-ms <n>       Timeout per runner invocation. Defaults to 900000.\n  --runner-preflight <command>  Optional validation command. Defaults to --runner when preflight is enabled.\n  --preflight-input <text>      Optional small prompt sent to the preflight command before iteration 1.\n  --preflight-success <text>    Required substring expected in preflight output when preflight is enabled.\n  --preflight-timeout-ms <n>    Timeout for preflight execution. Defaults to 45000.\n  --todo <path>                 Todo or implementation plan file to execute end-to-end.\n  --goal <text>                 Optional explicit goal statement.\n  --cwd <path>                  Working directory for the loop. Defaults to current directory.\n  --state-dir <path>            Directory for loop state and logs. Defaults to .xx-stack/loops/<todo-name>.\n  --contract <path>             Path to active completion contract file. Defaults inside the state dir.\n  --prompt-template <path>      Prompt template file. Defaults to runtime/AUTONOMOUS_TODO_LOOP_PROMPT.md.\n  --max-iterations <n>          Maximum loop iterations. Defaults to 50.\n  --max-stalled <n>             Consecutive no-progress iterations before stopping. Defaults to 3.\n  --generation-size <n>         Optional. Close a generation every N iterations (and on <loop-state>GENERATION_CLOSE</loop-state>). Off by default.\n  --completion-promise <text>   Success marker. Defaults to <promise>DONE</promise>.\n  --agent <name>                Agent name inserted into the prompt. Defaults to execution-orchestrator.\n  --help                        Show this help.\n`
-  );
-}
-
-function fail(message, exitCode = 1) {
-  process.stderr.write(`${message}\n`);
-  process.exit(exitCode);
-}
-
-function slugify(value) {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "loop"
   );
 }
 
@@ -198,8 +186,62 @@ function buildContractSeed(goal, todoDisplayPath) {
   ].join("\n");
 }
 
-async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
-  return new Promise((resolveProcess) => {
+// A runner can stream for the whole 15-minute budget; holding all of it in a
+// JS string is unbounded memory. Each stream keeps its first HEAD characters
+// (where the first <loop-state> usually sits) and its last TAIL characters
+// (where the completion promise lands) in memory, and the FULL output goes to
+// the log file as it arrives.
+const CAPTURE_HEAD_CHARS = 64 * 1024;
+const CAPTURE_TAIL_CHARS = 1024 * 1024;
+
+/** Bounded head+tail text capture, optionally teeing everything to a file. */
+function createCapture(logPath) {
+  let head = "";
+  let tail = "";
+  let dropped = 0;
+  let closed = false;
+  const sink = logPath ? createWriteStream(logPath, { encoding: "utf-8" }) : null;
+  sink?.on("error", () => {
+    // A log write failure must not kill the loop; the in-memory view remains.
+  });
+  return {
+    push(chunk) {
+      // Orphaned grandchildren can keep writing after a forced settle.
+      if (closed) return;
+      sink?.write(chunk);
+      if (head.length < CAPTURE_HEAD_CHARS) {
+        const room = CAPTURE_HEAD_CHARS - head.length;
+        head += chunk.slice(0, room);
+        chunk = chunk.slice(room);
+      }
+      if (chunk.length === 0) return;
+      tail += chunk;
+      if (tail.length > CAPTURE_TAIL_CHARS) {
+        dropped += tail.length - CAPTURE_TAIL_CHARS;
+        tail = tail.slice(-CAPTURE_TAIL_CHARS);
+      }
+    },
+    text() {
+      if (dropped === 0) return head + tail;
+      return `${head}\n... [${dropped} chars elided from memory; full output in ${logPath ?? "no log file"}] ...\n${tail}`;
+    },
+    close() {
+      closed = true;
+      return new Promise((resolveClose) => {
+        if (!sink) return resolveClose();
+        sink.end(resolveClose);
+      });
+    },
+  };
+}
+
+async function runProcess(
+  command,
+  { cwd, input, shell = false, timeoutMs, stdoutPath, stderrPath }
+) {
+  const out = createCapture(stdoutPath);
+  const err = createCapture(stderrPath);
+  const outcome = await new Promise((resolveProcess) => {
     let settled = false;
     let timedOut = false;
     let timeoutHandle = null;
@@ -226,23 +268,15 @@ async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
       }
     };
 
-    let stdout = "";
-    let stderr = "";
-
     child.stdout.setEncoding("utf-8");
     child.stderr.setEncoding("utf-8");
 
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    child.stdout.on("data", (chunk) => out.push(chunk));
+    child.stderr.on("data", (chunk) => err.push(chunk));
 
     child.stdin.on("error", (error) => {
       if (error && error.code !== "EPIPE") {
-        stderr += `${String(error)}\n`;
+        err.push(`${String(error)}\n`);
       }
     });
 
@@ -261,12 +295,10 @@ async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
     };
 
     child.on("error", (error) => {
-      stderr += `${String(error)}\n`;
+      err.push(`${String(error)}\n`);
       finish({
         code: 1,
         signal: null,
-        stdout,
-        stderr,
         timedOut,
       });
     });
@@ -274,7 +306,7 @@ async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
     if (typeof timeoutMs === "number" && timeoutMs > 0) {
       timeoutHandle = setTimeout(() => {
         timedOut = true;
-        stderr += `Process timed out after ${timeoutMs}ms\n`;
+        err.push(`Process timed out after ${timeoutMs}ms\n`);
         killProcessTree("SIGTERM");
         forceKillHandle = setTimeout(() => {
           killProcessTree("SIGKILL");
@@ -283,8 +315,6 @@ async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
           finish({
             code: 124,
             signal: "SIGKILL",
-            stdout,
-            stderr,
             timedOut,
           });
         }, 5000);
@@ -297,14 +327,14 @@ async function runProcess(command, { cwd, input, shell = false, timeoutMs }) {
       finish({
         code: timedOut ? 124 : (code ?? 0),
         signal: signal ?? null,
-        stdout,
-        stderr,
         timedOut,
       });
     });
 
     child.stdin.end(input);
   });
+  await Promise.all([out.close(), err.close()]);
+  return { ...outcome, stdout: out.text(), stderr: err.text() };
 }
 
 async function getGitWorkspaceFingerprint(repoRoot) {
@@ -546,8 +576,30 @@ if (generationSize > 0) {
   manifest.generationSize = generationSize;
 }
 
-await writeJson(manifestPath, manifest);
-await writeOuterState(outerStatePath, manifest, repoRoot);
+/** Hashes whose change between iterations counts as progress. */
+async function progressSnapshot() {
+  return {
+    todoHash: await hashFile(todoPath),
+    contractHash: await hashFile(contractPath),
+    workspaceHash: await getGitWorkspaceFingerprint(repoRoot),
+  };
+}
+
+/** Machine manifest plus the human-readable outer state, always written together. */
+async function persistManifest() {
+  await writeJson(manifestPath, manifest);
+  await writeOuterState(outerStatePath, manifest, repoRoot);
+}
+
+function iterationStatus(completed, loopState, iteration) {
+  if (completed) return "completed";
+  if (loopState === "BLOCKED") return "blocked";
+  if (manifest.stalledIterations >= maxStalled) return "stalled";
+  if (iteration >= maxIterations) return "exhausted";
+  return "running";
+}
+
+await persistManifest();
 
 if (preflightInput) {
   const preflightStdoutPath = join(logsDir, "preflight-stdout.log");
@@ -559,10 +611,9 @@ if (preflightInput) {
     input: preflightInput,
     shell: true,
     timeoutMs: preflightTimeoutMs,
+    stdoutPath: preflightStdoutPath,
+    stderrPath: preflightStderrPath,
   });
-
-  await writeFile(preflightStdoutPath, preflightResult.stdout, "utf-8");
-  await writeFile(preflightStderrPath, preflightResult.stderr, "utf-8");
 
   const preflightOutput = `${preflightResult.stdout}\n${preflightResult.stderr}`;
   const preflightHealthy =
@@ -585,16 +636,14 @@ if (preflightInput) {
 
   if (!preflightHealthy) {
     manifest.status = "runner-unhealthy";
-    await writeJson(manifestPath, manifest);
-    await writeOuterState(outerStatePath, manifest, repoRoot);
+    await persistManifest();
     process.stderr.write(
       `[loop] runner preflight failed. See ${toDisplayPath(repoRoot, outerStatePath)}\n`
     );
     process.exit(5);
   }
 
-  await writeJson(manifestPath, manifest);
-  await writeOuterState(outerStatePath, manifest, repoRoot);
+  await persistManifest();
 }
 
 for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations; iteration += 1) {
@@ -603,11 +652,7 @@ for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations;
   const stdoutPath = join(logsDir, `${prefix}-stdout.log`);
   const stderrPath = join(logsDir, `${prefix}-stderr.log`);
 
-  const preSnapshot = {
-    todoHash: await hashFile(todoPath),
-    contractHash: await hashFile(contractPath),
-    workspaceHash: await getGitWorkspaceFingerprint(repoRoot),
-  };
+  const preSnapshot = await progressSnapshot();
 
   const prompt = renderTemplate(promptTemplate, {
     AGENT_NAME: agentName,
@@ -631,16 +676,11 @@ for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations;
     input: prompt,
     shell: true,
     timeoutMs: runnerTimeoutMs,
+    stdoutPath,
+    stderrPath,
   });
 
-  await writeFile(stdoutPath, result.stdout, "utf-8");
-  await writeFile(stderrPath, result.stderr, "utf-8");
-
-  const postSnapshot = {
-    todoHash: await hashFile(todoPath),
-    contractHash: await hashFile(contractPath),
-    workspaceHash: await getGitWorkspaceFingerprint(repoRoot),
-  };
+  const postSnapshot = await progressSnapshot();
 
   let progressDetected =
     preSnapshot.todoHash !== postSnapshot.todoHash ||
@@ -672,17 +712,7 @@ for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations;
     manifest.history = manifest.history.slice(-20);
   }
 
-  if (completed) {
-    manifest.status = "completed";
-  } else if (loopState === "BLOCKED") {
-    manifest.status = "blocked";
-  } else if (manifest.stalledIterations >= maxStalled) {
-    manifest.status = "stalled";
-  } else if (iteration >= maxIterations) {
-    manifest.status = "exhausted";
-  } else {
-    manifest.status = "running";
-  }
+  manifest.status = iterationStatus(completed, loopState, iteration);
 
   const iterationsInGen = iteration - Number(manifest.generationStartIteration ?? 1) + 1;
   const sizeHit =
@@ -698,7 +728,6 @@ for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations;
       manifest.generationStartIteration = 1;
     }
     const boundaryPath = await writeGenerationBoundary(stateDir, manifest, nowIso);
-    manifest.generationStatus = "closed";
     manifest.generationIndex = Number(manifest.generationIndex) + 1;
     manifest.generationOpenedAt = nowIso;
     manifest.generationStartIteration = iteration + 1;
@@ -708,8 +737,7 @@ for (let iteration = Number(manifest.iteration) + 1; iteration <= maxIterations;
     );
   }
 
-  await writeJson(manifestPath, manifest);
-  await writeOuterState(outerStatePath, manifest, repoRoot);
+  await persistManifest();
 
   process.stdout.write(
     `[loop] outcome=${completed ? "DONE" : loopState} exit=${result.code} timeout=${result.timedOut ? "yes" : "no"} progress=${progressDetected ? "yes" : "no"}\n`

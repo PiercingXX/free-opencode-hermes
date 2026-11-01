@@ -1,5 +1,5 @@
 import { foundHostProviders, inventoryProviders } from "./inventory.js";
-import { type Settings, accountIdsFor, loadSettings } from "../config/settings.js";
+import { settingsSnapshot } from "../config/settings-snapshot.js";
 
 export type ExtraField = {
   key: string;
@@ -571,34 +571,22 @@ export function isOllamaFamily(provider: ProviderDescriptor): boolean {
 }
 
 function accountExpanded(provider: ProviderDescriptor): ProviderDescriptor[] {
-  try {
-    const settings: Settings = loadSettings();
-    const accounts = accountIdsFor(settings, provider.id);
-    if (accounts.length === 0) return [provider];
-    // Always include the base provider (for "Add account" UI and legacy refs)
-    // plus one descriptor per account.
-    return [
-      { ...provider, baseProviderId: provider.id },
-      ...accounts.map((accountId) => {
-        const account = (settings.accounts ?? []).find(
-          (a) => a.providerId === provider.id && a.id === accountId
-        );
-        const display = account?.label?.trim() || accountId;
-        return {
-          ...provider,
-          id: `${provider.id}@${accountId}`,
-          name: `${provider.name} · ${display}`,
-          baseProviderId: provider.id,
-        };
-      }),
-    ];
-  } catch {
-    return [provider];
-  }
+  const accounts = (settingsSnapshot()?.accounts ?? []).filter((a) => a.providerId === provider.id);
+  if (accounts.length === 0) return [provider];
+  // Always include the base provider (for "Add account" UI and legacy refs)
+  // plus one descriptor per account.
+  return [
+    { ...provider, baseProviderId: provider.id },
+    ...accounts.map((account) => ({
+      ...provider,
+      id: `${provider.id}@${account.id}`,
+      name: `${provider.name} · ${account.label?.trim() || account.id}`,
+      baseProviderId: provider.id,
+    })),
+  ];
 }
 
 export function allProviders(): ProviderDescriptor[] {
-  const inventory = inventoryProviders();
   const seen = new Set<string>();
   const out: ProviderDescriptor[] = [];
   const push = (provider: ProviderDescriptor): void => {
@@ -606,12 +594,14 @@ export function allProviders(): ProviderDescriptor[] {
     seen.add(provider.id);
     out.push(provider);
   };
-  for (const provider of inventory) for (const p of accountExpanded(provider)) push(p);
-  for (const provider of foundHostProviders()) for (const p of accountExpanded(provider)) push(p);
-  for (const provider of PROVIDER_CATALOG.filter((p) => p.local))
-    for (const p of accountExpanded(provider)) push(p);
-  for (const provider of PROVIDER_CATALOG.filter((p) => !p.local))
-    for (const p of accountExpanded(provider)) push(p);
+  // First id wins: inventory hosts, then autofound hosts, then built-in local, then cloud.
+  const sources = [
+    ...inventoryProviders(),
+    ...foundHostProviders(),
+    ...PROVIDER_CATALOG.filter((p) => p.local),
+    ...PROVIDER_CATALOG.filter((p) => !p.local),
+  ];
+  for (const provider of sources) accountExpanded(provider).forEach(push);
   return out;
 }
 
@@ -620,15 +610,11 @@ export function providerById(id: string): ProviderDescriptor | undefined {
   // account is registered; otherwise fall back to the base descriptor so
   // connect/probe flows can resolve provider metadata before the account
   // entry is persisted.
+  const providers = allProviders();
+  const exact = providers.find((p) => p.id === id);
+  if (exact) return exact;
   const at = id.indexOf("@");
-  if (at > 0) {
-    const base = allProviders().find((p) => p.id === id);
-    if (base) return base;
-    const baseId = id.slice(0, at);
-    const baseProvider = allProviders().find((p) => p.id === baseId);
-    if (baseProvider) return baseProvider;
-  }
-  return allProviders().find((provider) => provider.id === id);
+  return at > 0 ? providers.find((p) => p.id === id.slice(0, at)) : undefined;
 }
 
 export function catalogIds(): string[] {

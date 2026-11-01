@@ -10,14 +10,12 @@ import {
   buildLeaseFenceSections,
   buildRevokedClaimSections,
   collectForceSynthesisRecordedFacts,
-  isDotenvPath,
-  redactDotenvAssignments,
-  redactSecrets,
   VERIFY_DONT_TRUST_PREAMBLE,
   type ForceSynthesisRecordedFacts,
   type HandoffInput,
   type LeasedTaskFence,
-} from "./supervisor_completion_tools.js";
+} from "./supervisor_prompts.js";
+import { isDotenvPath, redactDotenvAssignments, redactSecrets } from "./secret_redaction.js";
 import { LEASE_SELF_FENCING_CLAUSE, type GoalContract } from "./task_runtime.js";
 import {
   buildCompletionRepairChecklist,

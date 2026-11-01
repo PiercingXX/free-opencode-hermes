@@ -1,10 +1,47 @@
-import { accessSync, constants, existsSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
-import { proxyHealth } from "../proxy/server.js";
+import { ensureProxyRunning } from "../plugin/lifecycle.js";
 
-export const PROXY_PREFLIGHT_TIMEOUT_MS = 1500;
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The local proxy (started if needed), or exit with a start hint. */
+export async function requireRunningProxy(): Promise<{ url: string; token: string }> {
+  try {
+    return await ensureProxyRunning();
+  } catch (error) {
+    console.error(`Free OpenCode proxy is not reachable: ${errorText(error)}`);
+    console.error("Start it with: free-opencode start");
+    process.exit(1);
+  }
+}
+
+/** Run a catalog/config build step; on failure print `<what>: <error>` and exit 1. */
+export async function orExit<T>(what: string, build: () => Promise<T>): Promise<T> {
+  try {
+    return await build();
+  } catch (error) {
+    console.error(`${what}: ${errorText(error)}`);
+    process.exit(1);
+  }
+}
+
+/** A fresh 0700 temp directory, removed (best effort) when this process exits. */
+export function privateTempDir(prefix: string): string {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  process.on("exit", () => {
+    try {
+      rmSync(directory, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  });
+  return directory;
+}
 
 export function proxyV1Url(proxyRootUrl: string): string {
   const stripped = proxyRootUrl.replace(/\/+$/, "");
@@ -82,11 +119,6 @@ export function binaryVersion(
   } catch {
     return null;
   }
-}
-
-export async function preflightProxy(proxyRootUrl: string): Promise<string | null> {
-  const ok = await proxyHealth(proxyRootUrl);
-  return ok ? null : "health check failed";
 }
 
 export async function runClientProcess(command: string[], env: NodeJS.ProcessEnv): Promise<never> {

@@ -51,7 +51,22 @@ function stripLocalProviderPrefix(raw: string): string {
   return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
 }
 
-const CATALOG_ALIASES = new Set([CATALOG_MODEL_ID, "auto", "catalog"]);
+/** Routing presets layered on the Admin default + fallbacks chain. */
+export const ALIAS_PRESETS = { "auto/fast": "fast", "auto/sticky": "sticky" } as const;
+export type AliasPreset = (typeof ALIAS_PRESETS)[keyof typeof ALIAS_PRESETS];
+
+const CATALOG_ALIASES = new Set<string>([
+  CATALOG_MODEL_ID,
+  "auto",
+  "catalog",
+  ...Object.keys(ALIAS_PRESETS),
+]);
+
+/** The preset an alias selects, or null for the plain default chain. */
+export function catalogAliasPreset(raw: string): AliasPreset | null {
+  const key = stripLocalProviderPrefix(raw.trim()) as keyof typeof ALIAS_PRESETS;
+  return ALIAS_PRESETS[key] ?? null;
+}
 
 /** OpenCode sends this instead of a provider/model slug; Admin default + fallbacks apply. */
 export function isCatalogAlias(raw: string): boolean {
@@ -105,9 +120,7 @@ export function parseModelRef(raw: string, fallbackProvider?: string): ModelRef 
 
 export function normalizeBaseUrl(url: string): string {
   const trimmed = url.trim().replace(/\/+$/, "");
-  if (trimmed.endsWith("/v1")) return trimmed;
-  if (trimmed.endsWith("/openai")) return `${trimmed}/v1`;
-  return `${trimmed}/v1`;
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
 export function providerBaseUrl(settings: Settings, provider: ProviderDescriptor): string {
@@ -241,14 +254,10 @@ export function isFreeOrLearnedOpen(
   providerId: string,
   model: string
 ): boolean {
-  const base = providerId.split("@")[0]?.toLowerCase() ?? "";
+  const learnedOpen = settings.modelAccess?.[`${providerId}/${model}`]?.status === "open";
   // B.ai: probed-open only — never trust a static leaf or unprobed flash name.
-  if (base === "bai") {
-    return settings.modelAccess?.[`${providerId}/${model}`]?.status === "open";
-  }
-  if (isFreeModelId(model, providerId)) return true;
-  const slug = `${providerId}/${model}`;
-  return settings.modelAccess?.[slug]?.status === "open";
+  if (providerId.split("@")[0].toLowerCase() === "bai") return learnedOpen;
+  return isFreeModelId(model, providerId) || learnedOpen;
 }
 
 /** B.ai auto-route: only models a hardened probe marked open. */
@@ -413,26 +422,38 @@ export async function discoverProviderModels(
   provider: ProviderDescriptor,
   fetchImpl: typeof fetch = fetch
 ): Promise<string[]> {
+  const ollama = isOllamaFamily(provider);
   let openaiError: Error | null = null;
   try {
     const ids = await discoverOpenAiModels(settings, provider, fetchImpl);
     if (ids.length > 0) return ids;
   } catch (error) {
-    openaiError = error instanceof Error ? error : new Error(String(error));
-    if (!isOllamaFamily(provider)) throw openaiError;
+    openaiError = asError(error);
+    if (!ollama) throw openaiError;
   }
-  if (isOllamaFamily(provider)) {
+  // Ollama: the OpenAI-compat list is often empty or missing; fall back to /api/tags.
+  if (ollama) {
+    let tags: string[];
     try {
-      const tags = await discoverOllamaToolModels(providerBaseUrl(settings, provider), fetchImpl);
-      if (tags.length > 0) return tags;
+      tags = await discoverOllamaToolModels(providerBaseUrl(settings, provider), fetchImpl);
     } catch (error) {
-      throw openaiError ?? (error instanceof Error ? error : new Error(String(error)));
+      throw openaiError ?? asError(error);
     }
+    if (tags.length > 0) return tags;
   }
   const cached = listedModelsForProvider(settings, provider);
   if (cached.length > 0) return cached;
   if (openaiError) throw openaiError;
   return [];
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+/** Ollama native API root (the OpenAI-compat base minus `/v1`). */
+function ollamaRoot(openaiBaseUrl: string): string {
+  return openaiBaseUrl.replace(/\/v1$/i, "");
 }
 
 type OllamaTagList = {
@@ -443,8 +464,7 @@ async function discoverOllamaTags(
   openaiBaseUrl: string,
   fetchImpl: typeof fetch
 ): Promise<string[]> {
-  const root = openaiBaseUrl.replace(/\/v1$/i, "");
-  const response = await fetchImpl(`${root}/api/tags`, {
+  const response = await fetchImpl(`${ollamaRoot(openaiBaseUrl)}/api/tags`, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(4000),
   });
@@ -495,7 +515,7 @@ async function discoverOllamaToolModels(
   const names = (await discoverOllamaTags(openaiBaseUrl, fetchImpl)).filter((id) =>
     keepToolCapableModel({ id, supportsTools: null })
   );
-  const root = openaiBaseUrl.replace(/\/v1$/i, "");
+  const root = ollamaRoot(openaiBaseUrl);
   const kept: string[] = [];
   for (const name of names) {
     const tools = await ollamaModelSupportsTools(root, name, fetchImpl);
@@ -517,29 +537,24 @@ export async function probeProvider(
   provider: ProviderDescriptor,
   fetchImpl: typeof fetch = fetch
 ): Promise<ProbeResult> {
+  const failed = (baseUrl: string, error: unknown): ProbeResult => ({
+    ok: false,
+    providerId: provider.id,
+    baseUrl,
+    models: [],
+    error: asError(error).message,
+  });
   let baseUrl: string;
   try {
     baseUrl = providerBaseUrl(settings, provider);
   } catch (error) {
-    return {
-      ok: false,
-      providerId: provider.id,
-      baseUrl: provider.defaultBaseUrl ?? "",
-      models: [],
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return failed(provider.defaultBaseUrl ?? "", error);
   }
   try {
     const models = await discoverProviderModels(settings, provider, fetchImpl);
     return { ok: true, providerId: provider.id, baseUrl, models };
   } catch (error) {
-    return {
-      ok: false,
-      providerId: provider.id,
-      baseUrl,
-      models: [],
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return failed(baseUrl, error);
   }
 }
 
@@ -558,12 +573,9 @@ export async function buildModelCatalog(
 
   for (const provider of allProviders()) {
     if (!isProviderReady(settings, provider.id)) continue;
-    let models = listedModelsForProvider(settings, provider);
-    try {
-      models = await discoverProviderModels(settings, provider, fetchImpl);
-    } catch {
-      models = listedModelsForProvider(settings, provider);
-    }
+    const models = await discoverProviderModels(settings, provider, fetchImpl).catch(() =>
+      listedModelsForProvider(settings, provider)
+    );
     for (const model of models) {
       push(listedModel(provider.id, model, `${provider.name} / ${model}`, view, settings));
     }

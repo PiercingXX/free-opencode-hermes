@@ -11,6 +11,17 @@ import { startProxy, waitForListen } from "./proxy/server.js";
 import { logRoute } from "./proxy/route-log.js";
 import { __resetCooldowns, recordCooldown } from "./proxy/cooldown.js";
 
+/** Admin API calls carry the per-process token the Admin page embeds. */
+function adminFetch(
+  proxy: { adminToken: string },
+  url: string,
+  init: RequestInit = {}
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("x-foc-admin", proxy.adminToken);
+  return fetch(url, { ...init, headers });
+}
+
 test("proxy health and models endpoints", async () => {
   const home = mkdtempSync(join(tmpdir(), "foc-proxy-"));
   const settings = setProviderKey(emptySettings(), "groq", "gsk_test");
@@ -63,7 +74,7 @@ test("proxy health and models endpoints", async () => {
       headers: { Authorization: "Bearer " + "x".repeat(settings.proxyAuthToken.length) },
     });
     assert.equal(wrong.status, 401);
-    const state = await fetch(`${base}/admin/api/state`);
+    const state = await adminFetch(proxy, `${base}/admin/api/state`);
     assert.equal(state.status, 200);
     const payload = (await state.json()) as {
       catalog: Array<{
@@ -82,7 +93,7 @@ test("proxy health and models endpoints", async () => {
     assert.ok(payload.catalog.find((row) => row.id === "sglang"));
     assert.ok(payload.catalog.find((row) => row.id === "tailscale_sglang"));
     assert.ok(payload.catalog.find((row) => row.id === "tailscale_ollama"));
-    const probe = await fetch(`${base}/admin/api/probe`, {
+    const probe = await adminFetch(proxy, `${base}/admin/api/probe`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ providerId: "ollama", extra: { baseUrl: "http://127.0.0.1:9/v1" } }),
@@ -91,7 +102,7 @@ test("proxy health and models endpoints", async () => {
     const probed = (await probe.json()) as { ok: boolean; error?: string };
     assert.equal(probed.ok, false);
     assert.ok(probed.error);
-    const connectFail = await fetch(`${base}/admin/api/connect`, {
+    const connectFail = await adminFetch(proxy, `${base}/admin/api/connect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ providerId: "ollama", extra: { baseUrl: "http://127.0.0.1:9/v1" } }),
@@ -101,7 +112,7 @@ test("proxy health and models endpoints", async () => {
     assert.equal(connectedFail.ok, false);
     assert.equal(connectedFail.saved, undefined);
 
-    const removed = await fetch(`${base}/admin/api/remove`, {
+    const removed = await adminFetch(proxy, `${base}/admin/api/remove`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ providerId: "groq" }),
@@ -110,7 +121,7 @@ test("proxy health and models endpoints", async () => {
     const removedBody = (await removed.json()) as { ok: boolean; providerId: string };
     assert.equal(removedBody.ok, true);
     assert.equal(removedBody.providerId, "groq");
-    const after = await fetch(`${base}/admin/api/state`);
+    const after = await adminFetch(proxy, `${base}/admin/api/state`);
     const afterPayload = (await after.json()) as {
       catalog: Array<{ id: string; ready?: boolean; configured?: boolean }>;
     };
@@ -139,7 +150,7 @@ test("remove local providers hides cards and Apply does not restore them", async
   const addr = proxy.server.address() as AddressInfo;
   const base = `http://127.0.0.1:${addr.port}`;
   try {
-    const before = await fetch(`${base}/admin/api/state`);
+    const before = await adminFetch(proxy, `${base}/admin/api/state`);
     const beforePayload = (await before.json()) as {
       catalog: Array<{ id: string; ready?: boolean }>;
       models: Array<{ id: string }>;
@@ -147,14 +158,14 @@ test("remove local providers hides cards and Apply does not restore them", async
     assert.equal(beforePayload.catalog.find((row) => row.id === "ollama")?.ready, true);
     assert.ok(beforePayload.models.some((row) => row.id.startsWith("ollama/")));
 
-    const removed = await fetch(`${base}/admin/api/remove`, {
+    const removed = await adminFetch(proxy, `${base}/admin/api/remove`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ providerId: "ollama" }),
     });
     assert.equal(removed.status, 200);
 
-    const afterRemove = await fetch(`${base}/admin/api/state`);
+    const afterRemove = await adminFetch(proxy, `${base}/admin/api/state`);
     const afterRemovePayload = (await afterRemove.json()) as {
       catalog: Array<{ id: string }>;
       models: Array<{ id: string }>;
@@ -168,7 +179,7 @@ test("remove local providers hides cards and Apply does not restore them", async
       false
     );
 
-    const applied = await fetch(`${base}/admin/api/settings`, {
+    const applied = await adminFetch(proxy, `${base}/admin/api/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -177,7 +188,7 @@ test("remove local providers hides cards and Apply does not restore them", async
     });
     assert.equal(applied.status, 200);
 
-    const afterApply = await fetch(`${base}/admin/api/state`);
+    const afterApply = await adminFetch(proxy, `${base}/admin/api/state`);
     const afterApplyPayload = (await afterApply.json()) as {
       catalog: Array<{ id: string }>;
       models: Array<{ id: string }>;
@@ -220,7 +231,7 @@ test("admin state and health expose lastRoute after a recorded hop", async () =>
       },
       "route.result"
     );
-    const state = await fetch(`${base}/admin/api/state`);
+    const state = await adminFetch(proxy, `${base}/admin/api/state`);
     const body = (await state.json()) as {
       lastRoute: { slug: string; status: number; tried: string[] };
     };
@@ -236,7 +247,7 @@ test("admin state and health expose lastRoute after a recorded hop", async () =>
     const healthBody = (await health.json()) as { lastRoute: { slug: string } };
     assert.equal(healthBody.lastRoute.slug, "groq/llama-3.3-70b-versatile");
 
-    const lastRoute = await fetch(`${base}/admin/api/last-route`);
+    const lastRoute = await adminFetch(proxy, `${base}/admin/api/last-route`);
     const lastRouteBody = (await lastRoute.json()) as {
       lastRoute: { slug: string };
       recent: unknown[];
@@ -264,7 +275,7 @@ test("admin state and health surface active cooldowns", async () => {
       status: 429,
       retryAfter: 60_000,
     });
-    const state = await fetch(`${base}/admin/api/state`);
+    const state = await adminFetch(proxy, `${base}/admin/api/state`);
     const body = (await state.json()) as {
       cooldowns: Array<{ slug: string; availableAt: number }>;
     };

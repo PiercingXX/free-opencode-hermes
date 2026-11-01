@@ -1,48 +1,47 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-import {
-  addAccount,
-  applyAdminSettingsPatch,
-  applyEnvOverrides,
-  connectProvider,
-  isAdminListed,
-  isProviderConfigured,
-  isProviderReady,
-  loadSettings,
-  readyProviderIds,
-  removeProvider,
-  saveSettings,
-  type Settings,
-} from "../config/settings.js";
-import { allProviders, providerById, providerExtraFields } from "../providers/catalog.js";
-import { applyAutofindResults, runAutofind } from "../providers/autofind.js";
-import { loadInventoryLanes, suggestedBaseUrl } from "../providers/inventory.js";
+import { applyEnvOverrides, loadSettings, type Settings } from "../config/settings.js";
 import { adminPage } from "./admin.js";
-import { loadedConfigDefaultsToZen } from "../plugin/config.js";
-import { buildModelCatalog, modelsListPayload, parseCatalogView, probeProvider } from "./models.js";
-import { probeProviderAccess } from "./model-access.js";
-import { chatStreamToResponses, chatJsonToResponses, responsesBodyToChat } from "./responses.js";
+import { ADMIN_ROUTES, routingHealth } from "./admin-api.js";
+import { compactionMode } from "./compact.js";
+import { loadCooldowns } from "./cooldown.js";
+import {
+  HttpError,
+  MAX_ADMIN_BODY_BYTES,
+  MAX_API_BODY_BYTES,
+  SSE_HEADERS,
+  assertTrustedRequest,
+  bearerToken,
+  clientAddress,
+  isLoopback,
+  pipeToClient,
+  readBody,
+  readJson,
+  send,
+  sendError,
+  tokensEqual,
+} from "./http.js";
+import { buildModelCatalog, modelsListPayload, parseCatalogView } from "./models.js";
+import { chatJsonToResponses, chatStreamToResponses, responsesBodyToChat } from "./responses.js";
 import {
   RouteError,
   routeChat,
   type ChatRequest,
   type RouteHopInfo,
-  type RouteHopObserver,
+  type RoutedResult,
 } from "./router.js";
 import {
   appendLog,
   currentLastRoute,
   logRoute,
-  readLogTail,
-  recentRoutes,
   type LastRoute,
   type RouteHopRecord,
 } from "./route-log.js";
-import { activeCooldowns, loadCooldowns } from "./cooldown.js";
+import { SettingsStore } from "./settings-store.js";
 
 const PROXY_BUILT_AT: number = ((): number => {
   try {
@@ -56,6 +55,7 @@ export type ProxyHealth = {
   ok: boolean;
   service?: string;
   builtAt?: number;
+  pid?: number;
   lastRoute?: LastRoute;
   cooldowns?: Array<{
     slug: string;
@@ -69,12 +69,10 @@ export type RunningProxy = {
   server: Server;
   settings: () => Settings;
   url: string;
+  /** Per-process secret the Admin page sends as `x-foc-admin`. */
+  adminToken: string;
   close: () => Promise<void>;
 };
-
-function clientAddress(req: IncomingMessage): string {
-  return (req.socket.remoteAddress || "").replace("::ffff:", "");
-}
 
 let requestSeq = 0;
 function newRequestId(): string {
@@ -82,568 +80,247 @@ function newRequestId(): string {
   return `req_${Date.now().toString(36)}_${requestSeq}`;
 }
 
-function isLoopback(addr: string): boolean {
-  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost" || addr === "";
-}
-
-function send(
-  res: ServerResponse,
-  status: number,
-  body: unknown,
-  extra: Record<string, string> = {}
-): void {
-  const payload = typeof body === "string" ? body : JSON.stringify(body);
-  const type =
-    typeof body === "string" && body.startsWith("<!")
-      ? "text/html; charset=utf-8"
-      : "application/json";
-  res.writeHead(status, { "Content-Type": type, "Cache-Control": "no-store", ...extra });
-  res.end(payload);
-}
-
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw.trim()) return {};
-  const parsed: unknown = JSON.parse(raw);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("JSON object required");
-  }
-  return parsed as Record<string, unknown>;
-}
-
-function normalizeSecret(value: string | undefined): string | null {
-  const token = value?.trim() ?? "";
-  if (!token) return null;
-  if (token === "undefined" || token === "null") return null;
-  if (token.startsWith("{env:")) return null;
-  return token;
-}
-
-function bearerToken(req: IncomingMessage): string | null {
-  const header = req.headers.authorization;
-  if (header?.toLowerCase().startsWith("bearer ")) {
-    const token = normalizeSecret(header.slice(7));
-    if (token) return token;
-  }
-  const apiKey = req.headers["x-api-key"];
-  if (typeof apiKey === "string") return normalizeSecret(apiKey);
-  if (Array.isArray(apiKey) && apiKey[0]) return normalizeSecret(apiKey[0]);
-  return null;
-}
-
-function tokensEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
-function requireProxyAuth(req: IncomingMessage, settings: Settings, res: ServerResponse): boolean {
-  if (!settings.proxyAuthEnabled) return true;
+/**
+ * /v1 auth. A request without any token from loopback is allowed: OpenCode
+ * often never interpolates {env:FREE_OPENCODE_API_KEY}. That is only safe
+ * because assertTrustedRequest already rejected browser-originated traffic.
+ */
+function requireProxyAuth(req: IncomingMessage, settings: Settings): void {
+  if (!settings.proxyAuthEnabled) return;
   const token = bearerToken(req);
-  if (token && tokensEqual(token, settings.proxyAuthToken)) return true;
-  // OpenCode often never interpolates {env:FREE_OPENCODE_API_KEY}. The proxy
-  // only binds loopback by default, so a missing token from 127.0.0.1 is the
-  // local client, not a stranger.
-  if (!token && isLoopback(clientAddress(req))) return true;
-  send(res, 401, { error: { message: "Unauthorized", type: "authentication_error" } });
-  return false;
+  if (token && tokensEqual(token, settings.proxyAuthToken)) return;
+  if (!token && isLoopback(clientAddress(req))) return;
+  throw new HttpError(401, "Unauthorized", "authentication_error");
 }
 
-async function handleChat(
-  res: ServerResponse,
-  settings: Settings,
-  body: ChatRequest,
-  signal: AbortSignal,
+/** Admin: loopback only, and either the page's admin token or the proxy token. */
+function requireAdminAuth(req: IncomingMessage, settings: Settings, adminToken: string): void {
+  if (!isLoopback(clientAddress(req)))
+    throw new HttpError(403, "Admin is loopback-only", "forbidden");
+  const header = req.headers["x-foc-admin"];
+  const supplied = Array.isArray(header) ? header[0] : header;
+  if (supplied && tokensEqual(supplied, adminToken)) return;
+  const bearer = bearerToken(req);
+  if (bearer && tokensEqual(bearer, settings.proxyAuthToken)) return;
+  throw new HttpError(401, "Admin token required", "authentication_error");
+}
+
+function hopRecord(
   requestId: string,
-  home?: string
-): Promise<Settings> {
+  hop: Pick<
+    RouteHopInfo,
+    "slug" | "providerId" | "status" | "latencyMs" | "ok" | "fallback" | "tried"
+  >
+): RouteHopRecord {
+  return { at: new Date().toISOString(), requestId, ...hop };
+}
+
+/** Route one chat request through the fallback chain, logging every hop and the result. */
+async function routeLogged(
+  store: SettingsStore,
+  body: ChatRequest,
+  req: IncomingMessage,
+  signal: AbortSignal,
+  home: string
+): Promise<RoutedResult> {
+  const requestId = newRequestId();
   let lastHop: RouteHopInfo | null = null;
-  const onHop: RouteHopObserver = (hop) => {
-    lastHop = hop;
-    void logRoute(home, { ...hop, requestId }, "route.attempt");
-  };
-  let routed: Awaited<ReturnType<typeof routeChat>>;
   try {
-    routed = await routeChat(settings, body, undefined, signal, onHop, home);
-  } catch (error) {
-    const status = error instanceof RouteError ? error.status : null;
-    const message = error instanceof Error ? error.message : String(error);
-    // lastHop is mutated in the onHop closure, so TS narrows it to null here;
-    // the cast keeps the safest-read path without lying about the runtime state.
-    const hop: RouteHopInfo | null = lastHop as RouteHopInfo | null;
-    const slug = hop?.slug ?? body.model;
-    const providerId = hop?.providerId ?? "";
-    const fallback = hop ? hop.fallback : false;
+    const routed = await routeChat(store.get(), body, undefined, {
+      signal,
+      home,
+      compaction: compactionMode(req.headers["x-foc-compaction"]),
+      onHop: (hop) => {
+        lastHop = hop;
+        void logRoute(home, { ...hop, requestId }, "route.attempt");
+      },
+      onLearned: (delta) => store.learnAccess(delta),
+    });
     await logRoute(
       home,
       {
-        ...routeResult(
-          slug,
-          providerId,
-          status,
-          hop?.latencyMs ?? 0,
-          false,
-          fallback,
-          hop?.tried ?? [],
-          requestId
-        ),
-        message,
+        ...hopRecord(requestId, {
+          slug: routed.used.slug,
+          providerId: routed.used.providerId,
+          status: 200,
+          latencyMs: routed.latencyMs,
+          ok: true,
+          fallback: routed.fallback,
+          tried: routed.tried,
+        }),
+        ...(routed.compaction.savedChars > 0 ? { compaction: routed.compaction } : {}),
+      },
+      "route.result"
+    );
+    return routed;
+  } catch (error) {
+    // Assigned inside the onHop closure; TS cannot see that and narrows to null.
+    const hop = lastHop as RouteHopInfo | null;
+    await logRoute(
+      home,
+      {
+        ...hopRecord(requestId, {
+          slug: hop?.slug ?? body.model,
+          providerId: hop?.providerId ?? "",
+          status: error instanceof RouteError ? error.status : null,
+          latencyMs: hop?.latencyMs ?? 0,
+          ok: false,
+          fallback: hop ? hop.fallback : false,
+          tried: hop?.tried ?? [],
+        }),
+        message: error instanceof Error ? error.message : String(error),
       },
       "route.result"
     );
     throw error;
   }
-  settings = routed.settings;
-  await logRoute(
-    home,
-    routeResult(
-      routed.used.slug,
-      routed.used.providerId,
-      200,
-      routed.latencyMs ?? 0,
-      true,
-      routed.fallback ?? 0,
-      routed.tried,
-      requestId
-    ),
-    "route.result"
-  );
-  if (body.stream) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      "x-foc-model": routed.used.slug,
-    });
-    if (!routed.response.body) {
-      res.end();
-      return settings;
-    }
-    const reader = routed.response.body.getReader();
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) res.write(value);
-      }
-    } finally {
-      reader.releaseLock();
-      res.end();
-    }
-    return settings;
-  }
-  const json = (await routed.response.json()) as Record<string, unknown>;
-  json.model = routed.used.slug;
-  send(res, 200, json, { "x-foc-model": routed.used.slug });
-  return settings;
 }
 
-function routeResult(
-  slug: string,
-  providerId: string,
-  status: number | null,
-  latencyMs: number,
-  ok: boolean,
-  fallback: boolean | number,
-  tried: string[],
-  requestId: string
-): RouteHopRecord {
+function routedHeaders(routed: RoutedResult): Record<string, string> {
   return {
-    at: new Date().toISOString(),
-    requestId,
-    slug,
-    providerId,
-    status,
-    latencyMs,
-    ok,
-    fallback,
-    tried,
+    "x-foc-model": routed.used.slug,
+    ...(routed.compaction.savedChars > 0
+      ? { "x-foc-compacted-chars": String(routed.compaction.savedChars) }
+      : {}),
   };
+}
+
+async function handleChatCompletions(
+  res: ServerResponse,
+  routed: RoutedResult,
+  stream: boolean
+): Promise<void> {
+  if (!stream) {
+    const json = (await routed.response.json()) as Record<string, unknown>;
+    json.model = routed.used.slug;
+    send(res, 200, json, routedHeaders(routed));
+    return;
+  }
+  res.writeHead(200, { ...SSE_HEADERS, ...routedHeaders(routed) });
+  if (routed.response.body) await pipeToClient(res, readBody(routed.response.body));
+  res.end();
+}
+
+async function handleResponses(
+  res: ServerResponse,
+  routed: RoutedResult,
+  stream: boolean
+): Promise<void> {
+  if (!stream) {
+    const json = (await routed.response.json()) as Record<string, unknown>;
+    send(res, 200, chatJsonToResponses(json, routed.used.slug), routedHeaders(routed));
+    return;
+  }
+  if (!routed.response.body) {
+    throw new RouteError(`${routed.used.slug} returned an empty stream`, 502);
+  }
+  res.writeHead(200, { ...SSE_HEADERS, ...routedHeaders(routed) });
+  await pipeToClient(
+    res,
+    chatStreamToResponses(routed.response.body, routed.used.slug, `resp_${Date.now()}`)
+  );
+  res.end();
+}
+
+/** Abort upstream work when the client hangs up before we finish responding. */
+function clientAbortSignal(req: IncomingMessage, res: ServerResponse): AbortSignal {
+  const ac = new AbortController();
+  // IncomingMessage "close" also fires after the body is fully read, so only
+  // abort while a response is still owed.
+  const abortIfClientGone = (): void => {
+    if (!res.writableEnded && !res.writableFinished && !ac.signal.aborted) ac.abort();
+  };
+  req.on("aborted", abortIfClientGone);
+  res.on("close", abortIfClientGone);
+  return ac.signal;
+}
+
+function sendFailure(res: ServerResponse, error: unknown): void {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  if (error instanceof HttpError) {
+    sendError(res, error.status, error.message, error.type);
+  } else if (error instanceof RouteError) {
+    send(res, error.status, error.body);
+  } else {
+    sendError(res, 500, error instanceof Error ? error.message : String(error), "internal_error");
+  }
 }
 
 export function startProxy(initial?: Settings, home: string = homedir()): RunningProxy {
-  let settings = applyEnvOverrides(initial ?? loadSettings(home));
+  const store = new SettingsStore(applyEnvOverrides(initial ?? loadSettings(home)), home);
   // Restore cooldowns from the previous process so a restart does not re-hit a
   // model that was 402/429'd. Expired windows are dropped on load.
   loadCooldowns(home);
-  const persist = (): void => {
-    saveSettings(settings, home);
-  };
-  const host = settings.listen.host;
-  const port = settings.listen.port;
+  const { host, port } = store.get().listen;
+  const adminToken = randomBytes(24).toString("hex");
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    assertTrustedRequest(req, host);
+    const url = new URL(req.url || "/", `http://${host}:${port}`);
+    const method = req.method ?? "GET";
+
+    if (method === "GET" && url.pathname === "/health") {
+      send(res, 200, {
+        ok: true,
+        service: "free-opencode",
+        builtAt: PROXY_BUILT_AT,
+        pid: process.pid,
+        lastRoute: currentLastRoute(),
+        ...routingHealth(),
+      });
+      return;
+    }
+
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+      if (!isLoopback(clientAddress(req))) {
+        throw new HttpError(403, "Admin is loopback-only", "forbidden");
+      }
+      if (method === "GET" && url.pathname === "/admin") {
+        send(res, 200, adminPage(adminToken));
+        return;
+      }
+      const handler = ADMIN_ROUTES[`${method} ${url.pathname}`];
+      if (!handler) throw new HttpError(404, "Not found", "not_found");
+      requireAdminAuth(req, store.get(), adminToken);
+      const body = method === "POST" ? await readJson(req, MAX_ADMIN_BODY_BYTES) : {};
+      send(res, 200, await handler({ store, home, body, query: url.searchParams }));
+      return;
+    }
+
+    requireProxyAuth(req, store.get());
+
+    if (method === "GET" && url.pathname === "/v1/models") {
+      const view = parseCatalogView(url.searchParams.get("view"));
+      send(res, 200, modelsListPayload(await buildModelCatalog(store.get(), fetch, view)));
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/chat/completions") {
+      const signal = clientAbortSignal(req, res);
+      const body = (await readJson(req, MAX_API_BODY_BYTES)) as ChatRequest;
+      const routed = await routeLogged(store, body, req, signal, home);
+      await handleChatCompletions(res, routed, Boolean(body.stream));
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/responses") {
+      const signal = clientAbortSignal(req, res);
+      const chat = responsesBodyToChat(await readJson(req, MAX_API_BODY_BYTES));
+      const stream = chat.stream !== false;
+      const routed = await routeLogged(store, { ...chat, stream }, req, signal, home);
+      await handleResponses(res, routed, stream);
+      return;
+    }
+
+    throw new HttpError(404, "Not found", "not_found");
+  }
 
   const server = createServer((req, res) => {
-    void (async (): Promise<void> => {
-      const url = new URL(req.url || "/", `http://${host}:${port}`);
-      const addr = clientAddress(req);
-
-      if (url.pathname.startsWith("/admin") && !isLoopback(addr)) {
-        send(res, 403, { error: { message: "Admin is loopback-only" } });
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/health") {
-        send(res, 200, {
-          ok: true,
-          service: "free-opencode",
-          builtAt: PROXY_BUILT_AT,
-          lastRoute: currentLastRoute(),
-          cooldowns: activeCooldowns().map((c) => ({
-            slug: c.slug,
-            providerId: c.providerId,
-            availableAt: c.availableAt,
-            reason: c.reason,
-          })),
-        });
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/admin/api/last-route") {
-        send(res, 200, {
-          lastRoute: currentLastRoute(),
-          recent: recentRoutes(),
-          cooldowns: activeCooldowns().map((c) => ({
-            slug: c.slug,
-            providerId: c.providerId,
-            availableAt: c.availableAt,
-            reason: c.reason,
-          })),
-        });
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/admin/api/log") {
-        const raw = Number(url.searchParams.get("limit"));
-        const limit = Number.isInteger(raw) && raw > 0 ? Math.min(raw, 500) : 50;
-        const lines = await readLogTail(limit, home);
-        send(res, 200, { limit, lines });
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/admin") {
-        send(res, 200, adminPage());
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/admin/api/state") {
-        const models = await buildModelCatalog(settings).catch(() => []);
-        send(res, 200, {
-          listen: settings.listen,
-          model: settings.model,
-          fallbacks: settings.fallbacks,
-          lastRoute: currentLastRoute(),
-          recentRoutes: recentRoutes(),
-          cooldowns: activeCooldowns().map((c) => ({
-            slug: c.slug,
-            providerId: c.providerId,
-            availableAt: c.availableAt,
-            reason: c.reason,
-          })),
-          zenDefault: loadedConfigDefaultsToZen(home),
-          models,
-          accounts: settings.accounts ?? [],
-          catalog: allProviders()
-            .filter((p) => isAdminListed(settings, p.id))
-            .map((p) => {
-              const accountQualified = p.baseProviderId && p.id.includes("@");
-              return {
-                id: p.id,
-                name: p.name,
-                env: p.env,
-                local: Boolean(p.local),
-                notes: p.notes ?? "",
-                credentialUrl: p.credentialUrl,
-                defaultBaseUrl: p.defaultBaseUrl ?? "",
-                extra: providerExtraFields(p).map((field) => ({
-                  key: field.key,
-                  label: field.label,
-                  placeholder:
-                    field.placeholder ||
-                    (field.key === "baseUrl"
-                      ? suggestedBaseUrl(p.id) || p.defaultBaseUrl || ""
-                      : ""),
-                  required: Boolean(field.required),
-                  value: settings.extra[p.id]?.[field.key] ?? "",
-                })),
-                ready: isProviderReady(settings, p.id),
-                configured: isProviderConfigured(settings, p.id),
-                discovered: settings.discovered[p.id] ?? [],
-                baseProviderId: p.baseProviderId,
-                account: accountQualified
-                  ? {
-                      id: p.id.split("@")[1] ?? "",
-                      isAccount: true,
-                    }
-                  : null,
-              };
-            }),
-          inventory: loadInventoryLanes().map((lane) => ({
-            providerId: lane.providerId,
-            label: lane.label,
-            endpoint: lane.endpoint,
-            enabled: lane.enabled,
-            kind: lane.kind,
-            scope: lane.scope,
-          })),
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/settings") {
-        const patch = await readJson(req);
-        settings = applyAdminSettingsPatch(settings, patch);
-        persist();
-        send(res, 200, { ok: true });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/probe") {
-        const body = await readJson(req);
-        const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-        const provider = providerById(providerId);
-        if (!provider) {
-          send(res, 400, { error: { message: `Unknown provider '${providerId}'` } });
-          return;
-        }
-        const overlay = applyEnvOverrides({
-          ...settings,
-          keys: { ...settings.keys },
-          extra: { ...settings.extra },
-        });
-        if (typeof body.apiKey === "string" && body.apiKey.trim()) {
-          overlay.keys[providerId] = body.apiKey.trim();
-        }
-        if (body.extra && typeof body.extra === "object" && !Array.isArray(body.extra)) {
-          overlay.extra[providerId] = {
-            ...overlay.extra[providerId],
-            ...(body.extra as Record<string, string>),
-          };
-        }
-        send(res, 200, await probeProvider(overlay, provider));
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/account") {
-        const body = await readJson(req);
-        const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-        const accountId = typeof body.accountId === "string" ? body.accountId.trim() : "";
-        const label = typeof body.label === "string" ? body.label.trim() : undefined;
-        if (!providerId || !accountId) {
-          send(res, 400, { error: { message: "providerId and accountId are required" } });
-          return;
-        }
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(accountId)) {
-          send(res, 400, {
-            error: { message: "accountId must be a slug: letters, digits, _ and -" },
-          });
-          return;
-        }
-        const result = addAccount(settings, providerId, accountId, label);
-        settings = result.settings;
-        persist();
-        send(res, 200, { ok: true, providerId: result.providerId, accounts: settings.accounts });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/connect") {
-        const body = await readJson(req);
-        const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-        const provider = providerById(providerId);
-        if (!provider) {
-          send(res, 400, { error: { message: `Unknown provider '${providerId}'` } });
-          return;
-        }
-        const overlay = applyEnvOverrides({
-          ...settings,
-          keys: { ...settings.keys },
-          extra: { ...settings.extra },
-        });
-        if (typeof body.apiKey === "string" && body.apiKey.trim()) {
-          overlay.keys[providerId] = body.apiKey.trim();
-        }
-        const extra =
-          body.extra && typeof body.extra === "object" && !Array.isArray(body.extra)
-            ? (body.extra as Record<string, string>)
-            : {};
-        overlay.extra[providerId] = { ...overlay.extra[providerId], ...extra };
-        const probed = await probeProvider(overlay, provider);
-        if (!probed.ok) {
-          send(res, 200, probed);
-          return;
-        }
-        settings = connectProvider(overlay, providerId, extra, probed.models);
-        if (providerId === "bai" || providerId.startsWith("bai@")) {
-          const access = await probeProviderAccess(settings, providerId, { force: true });
-          settings = access.settings;
-        }
-        persist();
-        send(res, 200, {
-          ...probed,
-          saved: true,
-          model: settings.model,
-          modelAccess: settings.modelAccess,
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/autofind") {
-        const report = await runAutofind();
-        const applied = applyAutofindResults(settings, report);
-        settings = applied.settings;
-        persist();
-        send(res, 200, {
-          ok: true,
-          hits: applied.report.hits,
-          connected: applied.report.connected,
-          notes: applied.report.notes,
-          model: settings.model,
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/admin/api/remove") {
-        const body = await readJson(req);
-        const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-        const provider = providerById(providerId);
-        if (!provider) {
-          send(res, 400, { error: { message: `Unknown provider '${providerId}'` } });
-          return;
-        }
-        settings = removeProvider(settings, providerId);
-        persist();
-        send(res, 200, {
-          ok: true,
-          providerId,
-          model: settings.model,
-          fallbacks: settings.fallbacks,
-          ready: readyProviderIds(settings),
-        });
-        return;
-      }
-
-      if (!requireProxyAuth(req, settings, res)) return;
-
-      if (req.method === "GET" && url.pathname === "/v1/models") {
-        const view = parseCatalogView(url.searchParams.get("view"));
-        const models = await buildModelCatalog(settings, fetch, view);
-        send(res, 200, modelsListPayload(models));
-        return;
-      }
-
-      const ac = new AbortController();
-      // IncomingMessage "close" also fires after the body is fully read. Abort
-      // only if the client dropped the connection while we still owe a response.
-      const abortIfClientGone = (): void => {
-        if (!res.writableEnded && !res.writableFinished && !ac.signal.aborted) {
-          ac.abort();
-        }
-      };
-      req.on("aborted", abortIfClientGone);
-      res.on("close", abortIfClientGone);
-
-      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        const body = (await readJson(req)) as ChatRequest;
-        settings = await handleChat(res, settings, body, ac.signal, newRequestId(), home);
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/responses") {
-        const raw = await readJson(req);
-        const chat = responsesBodyToChat(raw);
-        const requestId = newRequestId();
-        let lastHop: RouteHopInfo | null = null;
-        const onHop: RouteHopObserver = (hop) => {
-          lastHop = hop;
-          void logRoute(home, { ...hop, requestId }, "route.attempt");
-        };
-        let routed;
-        try {
-          routed = await routeChat(
-            settings,
-            { ...chat, stream: chat.stream !== false },
-            undefined,
-            ac.signal,
-            onHop,
-            home
-          );
-          settings = routed.settings;
-        } catch (error) {
-          const status = error instanceof RouteError ? error.status : null;
-          const message = error instanceof Error ? error.message : String(error);
-          const hop: RouteHopInfo | null = lastHop as RouteHopInfo | null;
-          await logRoute(
-            home,
-            {
-              ...routeResult(
-                hop?.slug ?? chat.model,
-                hop?.providerId ?? "",
-                status,
-                hop?.latencyMs ?? 0,
-                false,
-                hop ? hop.fallback : false,
-                hop?.tried ?? [],
-                requestId
-              ),
-              message,
-            },
-            "route.result"
-          );
-          throw error;
-        }
-        await logRoute(
-          home,
-          routeResult(
-            routed.used.slug,
-            routed.used.providerId,
-            200,
-            routed.latencyMs ?? 0,
-            true,
-            routed.fallback ?? 0,
-            routed.tried,
-            requestId
-          ),
-          "route.result"
-        );
-        if (chat.stream !== false && routed.response.body) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-            "x-foc-model": routed.used.slug,
-          });
-          for await (const chunk of chatStreamToResponses(
-            routed.response.body,
-            routed.used.slug,
-            `resp_${Date.now()}`
-          )) {
-            res.write(chunk);
-          }
-          res.end();
-          return;
-        }
-        const json = (await routed.response.json()) as Record<string, unknown>;
-        send(res, 200, chatJsonToResponses(json, routed.used.slug));
-        return;
-      }
-
-      send(res, 404, { error: { message: "Not found" } });
-    })().catch((error: unknown) => {
-      if (res.headersSent) {
-        res.end();
-        return;
-      }
-      if (error instanceof RouteError) {
-        send(res, error.status, error.body);
-        return;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      send(res, 500, { error: { message, type: "internal_error" } });
-    });
+    handle(req, res).catch((error: unknown) => sendFailure(res, error));
   });
-
   server.listen(port, host);
 
   void appendLog(
@@ -654,8 +331,9 @@ export function startProxy(initial?: Settings, home: string = homedir()): Runnin
 
   return {
     server,
-    settings: () => settings,
+    settings: () => store.get(),
     url: `http://${host}:${port}`,
+    adminToken,
     close: () =>
       new Promise((resolve, reject) => {
         server.close((err) => {
@@ -688,17 +366,13 @@ export async function fetchProxyHealth(url: string, token?: string): Promise<Pro
       ok: true,
       service: body.service,
       builtAt: body.builtAt,
+      pid: body.pid,
       lastRoute: body.lastRoute,
       cooldowns: body.cooldowns,
     };
   } catch {
     return null;
   }
-}
-
-export async function proxyHealth(url: string, token?: string): Promise<boolean> {
-  const health = await fetchProxyHealth(url, token);
-  return Boolean(health?.ok);
 }
 
 export function isStaleProxy(health: ProxyHealth | null, localBuiltAt: number): boolean {

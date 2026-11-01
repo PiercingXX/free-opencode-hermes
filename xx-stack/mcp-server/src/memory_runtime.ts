@@ -1,12 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 
 import { AgentMemoryScope, readJson } from "./config_runtime.js";
 import { estimateTokens, selectContext } from "./context_selection_runtime.js";
-import { atomicWriteTextFile } from "./io_runtime.js";
+import { atomicWriteTextFile, withFileLock } from "./io_runtime.js";
 import { PATH_CONSTANTS } from "./runtime_constants.js";
 
 export interface CompletionMemorySyncGuard {
@@ -355,6 +355,103 @@ export function parseMemoryEntries(content: string): ParsedMemoryDocument {
 
   const preamble = firstEntryLine === -1 ? content : lines.slice(0, firstEntryLine).join("\n");
   return { preamble, entries };
+}
+
+// ---------------------------------------------------------------------------
+// Size cap + compaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard ceiling on a MEMORY.md file. agent_memory_append is an O_APPEND with no
+ * other bound, so an agent that logs a note per step grows the file without
+ * limit — and every recall reads (and token-budgets) the whole thing.
+ */
+export const MAX_MEMORY_FILE_BYTES = 256 * 1024;
+
+/**
+ * Compaction trims to this fraction of the cap, not to the cap itself, so a
+ * file at the ceiling is not rewritten on every subsequent append.
+ */
+export const MEMORY_COMPACTION_TARGET_RATIO = 0.75;
+
+export const MEMORY_COMPACTION_MARKER = "[memory-compacted]";
+
+export interface MemoryCompactionResult {
+  content: string;
+  droppedEntries: number;
+  droppedBytes: number;
+}
+
+/**
+ * Drop entries until `content` fits in `targetBytes`: superseded entries go
+ * first (they are already flagged as stale), then the oldest live entries in
+ * file order. Header and other non-entry lines are always kept. A one-line
+ * `[memory-compacted]` entry records what was dropped, so the loss is visible
+ * to the next reader rather than silent. Returns the input unchanged when it
+ * already fits.
+ */
+export function compactMemoryContent(
+  content: string,
+  targetBytes: number,
+  at: string = new Date().toISOString()
+): MemoryCompactionResult {
+  const originalBytes = Buffer.byteLength(content, "utf8");
+  if (originalBytes <= targetBytes) return { content, droppedEntries: 0, droppedBytes: 0 };
+
+  const lines = content.split("\n");
+  const doc = parseMemoryEntries(content);
+  const dropOrder = [
+    ...doc.entries.filter((entry) => entry.superseded),
+    ...doc.entries.filter((entry) => !entry.superseded),
+  ];
+  const dropped = new Set<number>();
+  // Reserve room for the marker line (an upper bound on its length).
+  const markerReserve = 160;
+  let bytes = originalBytes;
+  for (const entry of dropOrder) {
+    if (bytes + markerReserve <= targetBytes) break;
+    dropped.add(entry.line);
+    bytes -= Buffer.byteLength(entry.text, "utf8") + 1;
+  }
+
+  const kept = lines.filter((_, lineNo) => !dropped.has(lineNo));
+  const droppedBytes = originalBytes - Buffer.byteLength(kept.join("\n"), "utf8");
+  const marker = `- ${at} ${MEMORY_COMPACTION_MARKER} dropped ${dropped.size} oldest/superseded note(s) (${droppedBytes} bytes) to stay under the ${MAX_MEMORY_FILE_BYTES}-byte memory cap`;
+  // Keep the trailing-newline invariant appends depend on.
+  const body = kept.join("\n").replace(/\n*$/, "\n");
+  return { content: `${body}${marker}\n`, droppedEntries: dropped.size, droppedBytes };
+}
+
+/**
+ * Compact the memory file at `path` if it exceeds `capBytes`. Concurrent
+ * compactors are serialized with the shared cross-process lockfile. Appends
+ * are lock-free O_APPEND, so bytes appended while this compaction computed its
+ * rewrite are carried over onto the compacted document before the atomic
+ * replace (the remaining window is the rename itself).
+ */
+export async function compactMemoryFileIfOversized(
+  path: string,
+  capBytes: number = MAX_MEMORY_FILE_BYTES
+): Promise<MemoryCompactionResult | null> {
+  // Cheap pre-check so the common under-cap append never touches a lockfile.
+  try {
+    if ((await stat(path)).size <= capBytes) return null;
+  } catch {
+    return null;
+  }
+  return withFileLock(path, async () => {
+    const before = await readMemoryEntrypoint(path);
+    if (Buffer.byteLength(before, "utf8") <= capBytes) return null;
+    const result = compactMemoryContent(
+      before,
+      Math.floor(capBytes * MEMORY_COMPACTION_TARGET_RATIO)
+    );
+    if (result.droppedEntries === 0) return null;
+    const now = await readMemoryEntrypoint(path);
+    const appendedMeanwhile = now.startsWith(before) ? now.slice(before.length) : "";
+    await atomicWriteTextFile(path, result.content + appendedMeanwhile);
+    return result;
+  });
 }
 
 // ---------------------------------------------------------------------------

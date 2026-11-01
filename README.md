@@ -77,4 +77,8 @@ the last route and active cooldowns under **Routing**. Keep `:8082` alive
 across logins with `free-opencode service install`, and tail what routed
 where with `free-opencode log --lines 50`.
 
+Pick `free-opencode/auto/fast` for the lowest-latency model in each tier, or
+`free-opencode/auto/sticky` to keep hitting the model that last answered. Run
+`free-opencode doctor` when something is off.
+
 Hermes, skip-flags, launchers, and internals: [MANUAL.md](MANUAL.md).

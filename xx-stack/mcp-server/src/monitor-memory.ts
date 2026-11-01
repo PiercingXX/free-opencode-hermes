@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   DEFAULT_CONTEXT_RESERVE_PERCENT,
   bytesToGb,
@@ -13,6 +11,7 @@ import {
   usableVramGb,
 } from "./host_memory_runtime.js";
 import { PATH_CONSTANTS, liveRegistryPath, repoCompatFileCandidates } from "./runtime_constants.js";
+import { isDirectExecution } from "./entrypoint.js";
 
 type ModelEntry = {
   name?: string;
@@ -363,22 +362,10 @@ async function main(): Promise<void> {
   printHuman(results, args);
 }
 
-// --- Direct execution guard (same realpath pattern as cli.ts / index.ts) ---
+// --- Direct execution guard (entrypoint.ts) ---
 // Without it, importing this module from a test would run the monitor.
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return fs.realpathSync(candidate);
-    } catch {
-      return path.resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`monitor-memory failed: ${message}`);

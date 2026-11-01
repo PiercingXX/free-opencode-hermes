@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from .inventory import (
     build_inventory_report,
     cache_has_required_tool_probe_data,
+    capability_cache_path,
     candidate_healthy_from_cache,
     load_json,
     maybe_refresh_capability_cache,
@@ -125,6 +125,107 @@ def choose_primary_lane(cfg: Dict[str, Any], allow_cloud: bool, reason_code: str
     )
 
 
+def _meta_matches_model(required_model: str, meta: Any) -> bool:
+    """model_matches_requirement against a capability-cache lane record."""
+    models = meta.get("models") if isinstance(meta.get("models"), list) else []
+    return model_matches_requirement(required_model, list(models), str(meta.get("configured_model", "")))
+
+
+def _lane_usable(cfg: Dict[str, Any], lane: Lane, meta: Any) -> bool:
+    """Trust a healthy cache record for an enabled lane; otherwise probe live."""
+    if lane.enabled and candidate_healthy_from_cache(meta):
+        return True
+    ok, _ = check_lane_health(cfg, lane)
+    return ok
+
+
+def _subagent_capability_cache(
+    cfg: Dict[str, Any],
+    strict_tools: bool,
+    cloud_for_profile: bool,
+    require_live_inventory: bool,
+) -> Dict[str, Any]:
+    """Capability data the subagent selection reads, refreshed as policy demands."""
+    cache_path = capability_cache_path(cfg)
+    use_cache = bool(cfg["execution"].get("use_capability_cache_for_subagents", True))
+
+    if not use_cache:
+        if not (strict_tools or require_live_inventory):
+            return {}
+        return build_inventory_report(
+            cfg,
+            include_cloud=cloud_for_profile,
+            probe_tool_calls=strict_tools,
+            previous=load_json(cache_path),
+        )
+
+    if require_live_inventory:
+        cached = build_inventory_report(
+            cfg,
+            include_cloud=cloud_for_profile,
+            probe_tool_calls=strict_tools,
+            previous=load_json(cache_path),
+        )
+        save_json(cache_path, cached)
+    else:
+        cached = maybe_refresh_capability_cache(cfg)
+    if strict_tools and not cache_has_required_tool_probe_data(cached, self_hosted_lane_keys(cfg)):
+        cached = maybe_refresh_capability_cache(cfg, force=True)
+    return cached
+
+
+def _strict_tool_lane(
+    cfg: Dict[str, Any],
+    lane_map: Dict[str, Lane],
+    lanes_meta: Dict[str, Any],
+    candidate_order: List[str],
+    required_model: str,
+) -> Tuple[str, Lane]:
+    """Highest-scoring healthy lane that passed the tool-call probe (cloud exempt)."""
+    strict_candidates: List[Tuple[int, str]] = []
+    for lane_key in candidate_order:
+        meta = lanes_meta.get(lane_key)
+        if not isinstance(meta, dict) or not bool(meta.get("healthy", False)):
+            continue
+        if not is_cloud_lane(cfg, lane_key) and meta.get("tool_call_supported") is not True:
+            continue
+        if not _meta_matches_model(required_model, meta):
+            continue
+        strict_candidates.append((int(meta.get("subagent_score", 0)), lane_key))
+
+    for _, lane_key in sorted(strict_candidates, reverse=True):
+        if _lane_usable(cfg, lane_map[lane_key], lanes_meta.get(lane_key)):
+            return lane_key, lane_map[lane_key]
+
+    raise OrchestratorError(
+        "Strict subagent tool-call mode is enabled but no healthy lane passed tool-call probe. "
+        "Run 'inventory --probe-tool-calls' and verify model tool support."
+    )
+
+
+def _recommended_lane_key(
+    cfg: Dict[str, Any],
+    cached: Dict[str, Any],
+    lane_map: Dict[str, Lane],
+    lanes_meta: Dict[str, Any],
+    cloud_for_profile: bool,
+    required_model: str,
+) -> str:
+    """The cache's recommended_subagent lane if policy and model allow it, else ""."""
+    recommendation = cached.get("recommended_subagent")
+    if not isinstance(recommendation, dict):
+        return ""
+    lane_key = recommendation.get("lane")
+    if not isinstance(lane_key, str) or lane_key not in lane_map:
+        return ""
+    if is_cloud_lane(cfg, lane_key) and not cloud_for_profile:
+        return ""
+    meta = lanes_meta.get(lane_key)
+    if isinstance(meta, dict) and not _meta_matches_model(required_model, meta):
+        return ""
+    return lane_key
+
+
 def resolve_subagent_lane(
     cfg: Dict[str, Any],
     allow_cloud: bool,
@@ -138,103 +239,28 @@ def resolve_subagent_lane(
     strict_tools = bool(cfg["execution"].get("require_tool_call_for_subagents", False))
     cloud_for_profile = cloud_allowed_for_subagents(cfg, allow_cloud=allow_cloud, task_profile=task_profile)
     require_live_inventory = bool(required_model.strip()) or task_profile != "default"
-    cache_path = Path(cfg["execution"].get("capability_cache_file", "logs/capability-cache.json"))
 
-    cached: Dict[str, Any] = {}
-    if bool(cfg["execution"].get("use_capability_cache_for_subagents", True)):
-        if require_live_inventory:
-            cached = build_inventory_report(
-                cfg,
-                include_cloud=cloud_for_profile,
-                probe_tool_calls=strict_tools,
-                previous=load_json(cache_path),
-            )
-            save_json(cache_path, cached)
-        else:
-            cached = maybe_refresh_capability_cache(cfg)
-        if strict_tools and not cache_has_required_tool_probe_data(cached, self_hosted_lane_keys(cfg)):
-            cached = maybe_refresh_capability_cache(cfg, force=True)
-    elif strict_tools or require_live_inventory:
-        cached = build_inventory_report(
-            cfg,
-            include_cloud=cloud_for_profile,
-            probe_tool_calls=strict_tools,
-            previous=load_json(cache_path),
-        )
+    cached = _subagent_capability_cache(cfg, strict_tools, cloud_for_profile, require_live_inventory)
+    if not isinstance(cached, dict):
+        cached = {}
+    lanes_meta = cached.get("lanes", {})
+    if not isinstance(lanes_meta, dict):
+        lanes_meta = {}
+    candidate_order = subagent_candidate_order(cfg, allow_cloud_for_profile=cloud_for_profile, task_profile=task_profile)
 
     if strict_tools:
-        lanes_meta = cached.get("lanes", {}) if isinstance(cached, dict) else {}
-        strict_candidates: List[Tuple[int, str]] = []
-        for lane_key in subagent_candidate_order(cfg, allow_cloud_for_profile=cloud_for_profile, task_profile=task_profile):
-            meta = lanes_meta.get(lane_key) if isinstance(lanes_meta, dict) else None
-            if not isinstance(meta, dict):
-                continue
-            if not bool(meta.get("healthy", False)):
-                continue
-            if not is_cloud_lane(cfg, lane_key) and meta.get("tool_call_supported") is not True:
-                continue
-            if not model_matches_requirement(
-                required_model,
-                list(meta.get("models", [])) if isinstance(meta.get("models"), list) else [],
-                str(meta.get("configured_model", "")),
-            ):
-                continue
-            score = int(meta.get("subagent_score", 0))
-            strict_candidates.append((score, lane_key))
-
-        for _, lane_key in sorted(strict_candidates, reverse=True):
-            candidate = lane_map[lane_key]
-            meta = lanes_meta.get(lane_key) if isinstance(lanes_meta, dict) else None
-            if candidate.enabled and candidate_healthy_from_cache(meta):
-                return lane_key, candidate
-            ok, _ = check_lane_health(cfg, candidate)
-            if ok:
-                return lane_key, candidate
-
-        raise OrchestratorError(
-            "Strict subagent tool-call mode is enabled but no healthy lane passed tool-call probe. "
-            "Run 'inventory --probe-tool-calls' and verify model tool support."
-        )
+        return _strict_tool_lane(cfg, lane_map, lanes_meta, candidate_order, required_model)
 
     if bool(cfg["execution"].get("use_capability_cache_for_subagents", True)):
-        recommendation = cached.get("recommended_subagent") if isinstance(cached, dict) else None
-        if isinstance(recommendation, dict):
-            recommended_lane = recommendation.get("lane")
-            if isinstance(recommended_lane, str) and recommended_lane in lane_map:
-                if is_cloud_lane(cfg, recommended_lane) and not cloud_for_profile:
-                    pass
-                else:
-                    lanes_meta = cached.get("lanes", {}) if isinstance(cached, dict) else {}
-                    recommended_meta = lanes_meta.get(recommended_lane) if isinstance(lanes_meta, dict) else None
-                    if isinstance(recommended_meta, dict) and not model_matches_requirement(
-                        required_model,
-                        list(recommended_meta.get("models", [])) if isinstance(recommended_meta.get("models"), list) else [],
-                        str(recommended_meta.get("configured_model", "")),
-                    ):
-                        pass
-                    else:
-                        recommended = lane_map[recommended_lane]
-                        if recommended.enabled and candidate_healthy_from_cache(recommended_meta):
-                            return recommended_lane, recommended
-                        recommended_ok, _ = check_lane_health(cfg, recommended)
-                        if recommended_ok:
-                            return recommended_lane, recommended
+        recommended = _recommended_lane_key(cfg, cached, lane_map, lanes_meta, cloud_for_profile, required_model)
+        if recommended and _lane_usable(cfg, lane_map[recommended], lanes_meta.get(recommended)):
+            return recommended, lane_map[recommended]
 
-    lanes_meta = cached.get("lanes", {}) if isinstance(cached, dict) else {}
-    for lane_key in subagent_candidate_order(cfg, allow_cloud_for_profile=cloud_for_profile, task_profile=task_profile):
-        meta = lanes_meta.get(lane_key) if isinstance(lanes_meta, dict) else None
-        if isinstance(meta, dict) and not model_matches_requirement(
-            required_model,
-            list(meta.get("models", [])) if isinstance(meta.get("models"), list) else [],
-            str(meta.get("configured_model", "")),
-        ):
+    for lane_key in candidate_order:
+        meta = lanes_meta.get(lane_key)
+        if isinstance(meta, dict) and not _meta_matches_model(required_model, meta):
             continue
-        lane = lane_map[lane_key]
-        if lane.enabled and candidate_healthy_from_cache(meta):
-            return lane_key, lane
-        ok, _ = check_lane_health(cfg, lane)
-        if ok:
-            return lane_key, lane
+        if _lane_usable(cfg, lane_map[lane_key], meta):
+            return lane_key, lane_map[lane_key]
 
     raise OrchestratorError("No healthy lane for subagent execution")
-

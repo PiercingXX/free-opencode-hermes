@@ -4,30 +4,17 @@ import { spawn } from "node:child_process";
 import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fail, slugify } from "./lib/cli.mjs";
 
 const DEFAULT_AGENT = "execution-orchestrator";
 const DEFAULT_PREFLIGHT_AGENT = "ping";
 const DEFAULT_PREFLIGHT_INPUT = "Run the OpenCode transport preflight.";
 const DEFAULT_PREFLIGHT_SUCCESS = "OPENCODE_PREFLIGHT_OK";
 
-function slugify(value) {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "loop"
-  );
-}
-
 function usage() {
   process.stdout.write(
     `Usage:\n  node scripts/run-opencode-loop.mjs --todo TODO.md [options]\n\nOptions:\n  --todo <path>                     Required todo or plan file.\n  --goal <text>                     Optional explicit goal statement.\n  --cwd <path>                      Working directory for the loop. Defaults to current directory.\n  --state-dir <path>                Optional loop state directory.\n  --contract <path>                 Optional completion contract path.\n  --prompt-template <path>          Optional prompt template path.\n  --max-iterations <n>              Optional max iteration override.\n  --max-stalled <n>                 Optional max stalled override.\n  --completion-promise <text>       Optional completion promise override.\n  --agent <name>                    OpenCode worker agent. Defaults to execution-orchestrator.\n  --preflight-agent <name>          OpenCode health probe agent. Defaults to ping.\n  --model <provider/model>          Optional model override applied to runner and preflight.\n  --variant <value>                 Optional model variant for runner and preflight.\n  --runner-timeout-ms <n>           Per-iteration runner timeout. Defaults to run-agent-loop default.\n  --preflight-timeout-ms <n>        Preflight timeout. Defaults to run-agent-loop default.\n  --opencode-bin <path>             OpenCode executable. Defaults to opencode.\n  --host-config <path>              Source OpenCode config.json used to copy provider definitions. Defaults to $HOME/.config/opencode/config.json.\n  --isolated-home <path>            Optional job-scoped HOME root. Defaults to <state-dir>/opencode-home.\n  --use-live-home                   Use the current host HOME/config directly instead of building an isolated runtime.\n  --print-logs                      Forward OpenCode logs to stderr.\n  --pure                            Run OpenCode without external plugins.\n  --thinking                        Show thinking blocks.\n  --dangerously-skip-permissions    Auto-approve non-denied permissions.\n  --dry-run                         Print the generated loop wiring as JSON and exit.\n  --help                            Show this help.\n`
   );
-}
-
-function fail(message, exitCode = 1) {
-  process.stderr.write(`${message}\n`);
-  process.exit(exitCode);
 }
 
 function parseArgs(argv) {

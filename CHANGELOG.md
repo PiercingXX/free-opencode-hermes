@@ -7,6 +7,87 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Proxy Admin API could be driven by any website.** `/admin/*` trusted any
+  loopback request, and bodies were parsed regardless of content type, so a
+  page in the user's browser could POST a `text/plain` probe that sent a stored
+  API key to an attacker-chosen `baseUrl`, or rewrite settings. DNS rebinding
+  could read Admin state and relay chats on the user's keys. The proxy now
+  validates `Host` and `Origin`, requires JSON bodies with size caps (32 MB /
+  1 MB), and requires a per-process Admin token (or the proxy token) on every
+  `/admin/api/*` call.
+- **`verify_edit` could read any file or run arbitrary code.** `cat`, `echo`
+  and free-form `node`/`npx` were allowlisted and `cwd` was unchecked. Only
+  verification-shaped invocations remain (`npm test` / `npm run <script>`,
+  `npx --no-install tsc|eslint|prettier|vitest|jest|mocha|biome`,
+  `node --test`, `ruff`, `pytest`), and `cwd` plus path arguments are confined
+  to the workspace.
+- **Execution denylist failed open** when `dangerous-patterns.txt` could not
+  load; it now fails closed (`XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS=1`
+  opts out), and the file ships in `dist/`.
+- **Hermes command allowlist.** Glued short options (`pytest -pevilmod`) no
+  longer slip past the denylist; test runners that execute repo-controlled
+  code (`pytest`, `npm test`, …) are opt-in via
+  `execution.allow_repo_code_execution`. The Hermes proxy refuses a
+  non-loopback bind without auth, and with auth needs `--allow-remote`.
+  `api_key_command` strings run without a shell unless `{shell: true}` is set,
+  and a failing command marks the lane unhealthy instead of sending no key.
+- **Dependencies.** `zod` overridden to 4.6.7 (memory-exhaustion advisory);
+  `@modelcontextprotocol/sdk` ≥ 1.32.1; `npm audit fix` cleared the critical
+  `proxy-addr` and other transitive advisories. `npm audit --omit=dev`
+  reports 0. Dev tooling: ESLint 8 → 10 (flat `eslint.config.mjs`, replacing
+  `.eslintrc.json`), Prettier 3.9, `@types/node` 26, `@opencode-ai/plugin`
+  1.18.31. TypeScript stays on 6.0 everywhere (typescript-eslint does not
+  support 7.0 yet); the plugin keeps `@types/node` 20 to match `engines`.
+
+### Fixed
+
+- `free-opencode stop` / `update` could SIGTERM the user's OpenCode session:
+  the in-process proxy recorded OpenCode's own pid in the pidfile. Pidfile
+  records now say whether the proxy is detached, and a pid is only killed after
+  `/health` or its command line proves it is the proxy.
+- A long streaming request no longer reverts Admin edits made while it ran;
+  the router no longer saves a stale settings snapshot mid-request. Settings
+  have one owner (`SettingsStore`) and routing reports only the model-access
+  entries it learned.
+- Settings, OpenCode `auth.json`, the pidfile and service units are written
+  atomically, and secret files are re-tightened to 0600 on every write. An
+  unparseable `auth.json` is left untouched instead of being replaced by one
+  holding only the Free OpenCode entry.
+- `/v1/responses` with a streaming request and an empty upstream body returns
+  a 502 instead of crashing; streaming honors client backpressure and cancels
+  the upstream when the client disconnects.
+- `free-opencode update` on Windows (npm is `npm.cmd`) and preflight checks
+  before `git pull`; `service install` reports `systemctl` / `launchctl`
+  failures instead of claiming success.
+- Installers download vendor scripts to a temp file and sanity-check them
+  instead of piping into `bash`; `host-setup` accepts JSONC `opencode.json`
+  and keeps a `.bak`.
+- MCP task and supervisor stores take a cross-process file lock (two servers
+  or the CLI no longer lose updates or double-grant leases). `MEMORY.md` is
+  capped at 256 KB with compaction; session logs rotate and are pruned;
+  `run-agent-loop` keeps a bounded head + tail of runner output in memory.
+- `allProviders()` re-read and re-parsed the settings file once per catalog
+  entry on every call; account expansion is now cached by file mtime.
+- Root `typecheck` no longer emits a build (`--noEmit` reached the wrong
+  command); lint and format pass again.
+
+### Added
+
+- **Provider circuit breaker**: three consecutive network errors / 408 / 5xx
+  skip every model of a provider for 30s (doubling on a failed retry).
+- **Key rotation**: the same model on a provider's other accounts follows in
+  the hop chain, so a 429 on one key tries the next key first.
+- **Routing presets** `free-opencode/auto/fast` (latency-ordered within each
+  tier) and `free-opencode/auto/sticky` (last model that answered first).
+- **Learned context fit**: a model that overflowed on a request of a given
+  size is skipped for requests at least that large.
+- **Tool-output compaction**: duplicate tool results become pointers and huge
+  ones keep head + tail; opt out with `x-foc-compaction: off` or
+  `FREE_OPENCODE_COMPACTION=off`.
+- **`free-opencode doctor [--fix]`**.
+
 - **OpenRouter stealth/union-alpha.** `stealth/union-alpha` is a $0 stealth
   SKU without a `:free` suffix, so free-first routing skipped it and Connect
   dropped it when GET /models omitted the preview. It is now a curated OpenRouter

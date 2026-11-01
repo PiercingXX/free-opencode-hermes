@@ -1,5 +1,4 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -7,6 +6,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { atomicWriteTextFile } from "./io_runtime.js";
+import { isDirectExecution } from "./entrypoint.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -278,22 +278,10 @@ async function main(): Promise<void> {
   throw new Error(`Unsupported action: ${action}. Use check-drift or log-artifact.`);
 }
 
-// --- Direct execution guard (same realpath pattern as cli.ts / index.ts) ---
+// --- Direct execution guard (entrypoint.ts) ---
 // Without it, importing this module from a test would execute a live check.
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return realpathSync(candidate);
-    } catch {
-      return resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${message}\n`);

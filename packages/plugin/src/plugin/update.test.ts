@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import { cmdUpdate } from "./update.js";
+import { cmdUpdate, npmCommand } from "./update.js";
 
 function tempRepo(): string {
   return mkdtempSync(join(tmpdir(), "foc-update-"));
@@ -82,3 +82,34 @@ function isStatusClean(root: string): string {
     .trim();
   return out ? "dirty" : "clean";
 }
+
+test("update refuses a branch other than main before touching anything", async () => {
+  const root = tempRepo();
+  cleanGitRepo(root);
+  git(root, ["checkout", "-q", "-b", "feature"]);
+  pointAt(root);
+  const result = await cmdUpdate();
+  assert.ok(
+    result.errors.some((e) => e.includes("only runs on branch 'main'")),
+    `got: ${result.errors.join(" | ")}`
+  );
+  assert.equal(result.steps.length, 0);
+});
+
+test("update requires main to track an upstream", async () => {
+  const root = tempRepo();
+  cleanGitRepo(root);
+  pointAt(root);
+  const result = await cmdUpdate();
+  assert.ok(
+    result.errors.some((e) => e.includes("no upstream")),
+    `got: ${result.errors.join(" | ")}`
+  );
+  assert.equal(result.steps.length, 0);
+});
+
+test("npm resolves to npm.cmd via a shell only on Windows", () => {
+  assert.deepEqual(npmCommand("win32"), { cmd: "npm.cmd", shell: true });
+  assert.deepEqual(npmCommand("linux"), { cmd: "npm", shell: false });
+  assert.deepEqual(npmCommand("darwin"), { cmd: "npm", shell: false });
+});

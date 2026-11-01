@@ -9,7 +9,7 @@ import {
   readJson,
   toPositiveNumber,
 } from "./config_runtime.js";
-import { atomicWriteTextFile } from "./io_runtime.js";
+import { atomicWriteTextFile, createStoreLock } from "./io_runtime.js";
 import type { CompletionMemorySyncGuard } from "./memory_runtime.js";
 
 export interface ReliabilityConfig {
@@ -152,22 +152,14 @@ export const DEFAULT_RELIABILITY: ReliabilityConfig = {
   completionValidationWindowMs: 90_000,
 };
 
-let supervisorStoreLock: Promise<void> = Promise.resolve();
-
-export async function withSupervisorStoreLock<T>(work: () => Promise<T>): Promise<T> {
-  const previous = supervisorStoreLock;
-  let release: () => void = () => {};
-  supervisorStoreLock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  await previous;
-  try {
-    return await work();
-  } finally {
-    release();
-  }
-}
+/**
+ * Serializes supervisor-store read -> mutate -> write across this process AND
+ * every other process sharing the store file. Callers must re-read the store
+ * inside the lock. Non-reentrant.
+ */
+export const withSupervisorStoreLock: <T>(work: () => Promise<T>) => Promise<T> = createStoreLock(
+  () => getSupervisorStatePath()
+);
 
 export function emptySupervisorStore(): SupervisorStore {
   return {
@@ -334,51 +326,65 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export async function readSupervisorStore(): Promise<SupervisorStore> {
-  const path = getSupervisorStatePath();
+/**
+ * Read a whole-document JSON store strictly. Returns null only for a missing
+ * file — the one "empty store" case. Anything else (EACCES, EIO, EISDIR, a
+ * parse error, a non-object root or a non-object `recordFields` entry) raises
+ * StoreAccessError: every handler is read → mutate → write-whole-document, so
+ * healing a bad read into an empty store would make the next write truncate
+ * the whole document (MCP-1).
+ */
+export async function readJsonStoreDocument(
+  store: StoreAccessError["store"],
+  path: string,
+  recordFields: readonly string[]
+): Promise<Record<string, unknown> | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf-8");
   } catch (error) {
-    // A missing file is the only "empty store" case. Anything else (EACCES,
-    // EIO, EISDIR, ...) must fail loudly: the next write would truncate the
-    // whole document.
-    if (isMissingFileError(error)) return emptySupervisorStore();
-    throw new StoreAccessError("supervisor", path, error);
+    if (isMissingFileError(error)) return null;
+    throw new StoreAccessError(store, path, error);
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new StoreAccessError("supervisor", path, error);
+    throw new StoreAccessError(store, path, error);
   }
 
   if (!isPlainRecord(parsed)) {
-    throw new StoreAccessError("supervisor", path, new Error("store root is not a JSON object"));
+    throw new StoreAccessError(store, path, new Error("store root is not a JSON object"));
   }
-  const sessions = parsed.sessions;
-  const hostModelFailures = parsed.hostModelFailures;
-  if (sessions !== undefined && !isPlainRecord(sessions)) {
-    throw new StoreAccessError("supervisor", path, new Error("sessions is not a JSON object"));
+  for (const field of recordFields) {
+    const value = parsed[field];
+    if (value !== undefined && !isPlainRecord(value)) {
+      throw new StoreAccessError(store, path, new Error(`${field} is not a JSON object`));
+    }
   }
-  if (hostModelFailures !== undefined && !isPlainRecord(hostModelFailures)) {
-    throw new StoreAccessError(
-      "supervisor",
-      path,
-      new Error("hostModelFailures is not a JSON object")
-    );
-  }
+  return parsed;
+}
 
+/** Atomically replace a whole-document JSON store, creating its directory. */
+export async function writeJsonStoreDocument(path: string, document: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await atomicWriteTextFile(path, JSON.stringify(document, null, 2) + "\n");
+}
+
+export async function readSupervisorStore(): Promise<SupervisorStore> {
+  const parsed = await readJsonStoreDocument("supervisor", getSupervisorStatePath(), [
+    "sessions",
+    "hostModelFailures",
+  ]);
+  if (!parsed) return emptySupervisorStore();
   return {
     version: SUPERVISOR_STORE_VERSION,
-    sessions: (sessions as SupervisorStore["sessions"]) ?? {},
-    hostModelFailures: (hostModelFailures as SupervisorStore["hostModelFailures"]) ?? {},
+    sessions: (parsed.sessions as SupervisorStore["sessions"]) ?? {},
+    hostModelFailures: (parsed.hostModelFailures as SupervisorStore["hostModelFailures"]) ?? {},
   };
 }
 
 export async function writeSupervisorStore(store: SupervisorStore): Promise<void> {
-  const path = getSupervisorStatePath();
-  await mkdir(dirname(path), { recursive: true });
-  await atomicWriteTextFile(path, JSON.stringify(store, null, 2) + "\n");
+  await writeJsonStoreDocument(getSupervisorStatePath(), store);
 }

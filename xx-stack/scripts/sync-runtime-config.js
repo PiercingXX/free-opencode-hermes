@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const { writeFileAtomic } = require("./lib/fs-atomic.js");
 const { HOST_IDS, PROVIDER_IDS, TIER_IDS } = require("./lib/runtime-constants.js");
 const {
   agentModelNames,
@@ -46,119 +47,66 @@ const LLAMA_CPP_LOCAL_PROVIDER = PROVIDER_IDS.llamaCppLocal;
 const SGLANG_REMOTE_PROVIDER = PROVIDER_IDS.sglangRemote;
 const CLOUD_TIER = TIER_IDS.cloud;
 
-function writeFileAtomic(filePath, data) {
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    fs.writeFileSync(tempPath, data);
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw error;
-  }
+/** Discovered models and reachability for one registry host (or empty when absent). */
+function hostSnapshot(host, tierId) {
+  if (!host) return { host, discovered: [], reachable: false };
+  return {
+    host,
+    discovered: hostModelNames(host),
+    reachable: registryHostReachable(registry, tierId, host.id),
+  };
+}
+
+/** A tier counts as inventoried when reachable and it has any model, discovered or configured. */
+function inventoryPresent(snapshot, providerId) {
+  const configuredNames = unique([
+    ...snapshot.discovered,
+    ...providerModelNames(config, providerId),
+    ...providerModelNames(source, providerId),
+  ]);
+  return snapshot.reachable && configuredNames.length > 0;
 }
 
 function buildInventorySnapshot() {
   const localDiscovered = registryHostModels(registry, TIER_IDS.local, HOST_IDS.localWorkstation);
-  const remotePrimaryHost = primaryTierHost(registry, TIER_IDS.tailscaleOllama);
-  const remotePrimaryDiscovered = remotePrimaryHost ? hostModelNames(remotePrimaryHost) : [];
-  const remoteReachable = remotePrimaryHost
-    ? registryHostReachable(registry, TIER_IDS.tailscaleOllama, remotePrimaryHost.id)
-    : false;
-  const remote5090Host = providerTierHost(registry, TIER_IDS.tailscaleOllama, OLLAMA_5090_PROVIDER);
-  const remote5090Discovered = remote5090Host ? hostModelNames(remote5090Host) : [];
-  const remote5090Reachable = remote5090Host
-    ? registryHostReachable(registry, TIER_IDS.tailscaleOllama, remote5090Host.id)
-    : false;
-  const openAiLocalHost = providerTierHost(
-    registry,
-    TIER_IDS.tailscaleOpenAiCompatible,
-    LLAMA_CPP_LOCAL_PROVIDER
+  const remotePrimary = hostSnapshot(
+    primaryTierHost(registry, TIER_IDS.tailscaleOllama),
+    TIER_IDS.tailscaleOllama
   );
-  const openAiLocalDiscovered = openAiLocalHost ? hostModelNames(openAiLocalHost) : [];
-  const openAiLocalReachable = openAiLocalHost
-    ? registryHostReachable(registry, TIER_IDS.tailscaleOpenAiCompatible, openAiLocalHost.id)
-    : false;
-  const openAiRemoteHost =
+  const remote5090 = hostSnapshot(
+    providerTierHost(registry, TIER_IDS.tailscaleOllama, OLLAMA_5090_PROVIDER),
+    TIER_IDS.tailscaleOllama
+  );
+  const openAiLocal = hostSnapshot(
+    providerTierHost(registry, TIER_IDS.tailscaleOpenAiCompatible, LLAMA_CPP_LOCAL_PROVIDER),
+    TIER_IDS.tailscaleOpenAiCompatible
+  );
+  const openAiRemote = hostSnapshot(
     providerTierHost(registry, TIER_IDS.tailscaleOpenAiCompatible, SGLANG_REMOTE_PROVIDER, {
       reachableOnly: true,
-    }) || primaryTierHost(registry, TIER_IDS.tailscaleOpenAiCompatible);
-  const openAiRemoteDiscovered = openAiRemoteHost ? hostModelNames(openAiRemoteHost) : [];
-  const openAiRemoteReachable = openAiRemoteHost
-    ? registryHostReachable(registry, TIER_IDS.tailscaleOpenAiCompatible, openAiRemoteHost.id)
-    : false;
-
-  const remoteConfiguredNames = unique(
-    remotePrimaryDiscovered.length > 0
-      ? [
-          ...remotePrimaryDiscovered,
-          ...providerModelNames(config, OLLAMA_REMOTE_PROVIDER),
-          ...providerModelNames(source, OLLAMA_REMOTE_PROVIDER),
-        ]
-      : [
-          ...providerModelNames(config, OLLAMA_REMOTE_PROVIDER),
-          ...providerModelNames(source, OLLAMA_REMOTE_PROVIDER),
-        ]
-  );
-  const remote5090ConfiguredNames = unique(
-    remote5090Discovered.length > 0
-      ? [
-          ...remote5090Discovered,
-          ...providerModelNames(config, OLLAMA_5090_PROVIDER),
-          ...providerModelNames(source, OLLAMA_5090_PROVIDER),
-        ]
-      : [
-          ...providerModelNames(config, OLLAMA_5090_PROVIDER),
-          ...providerModelNames(source, OLLAMA_5090_PROVIDER),
-        ]
-  );
-  const openAiLocalConfiguredNames = unique(
-    openAiLocalDiscovered.length > 0
-      ? [
-          ...openAiLocalDiscovered,
-          ...providerModelNames(config, LLAMA_CPP_LOCAL_PROVIDER),
-          ...providerModelNames(source, LLAMA_CPP_LOCAL_PROVIDER),
-        ]
-      : [
-          ...providerModelNames(config, LLAMA_CPP_LOCAL_PROVIDER),
-          ...providerModelNames(source, LLAMA_CPP_LOCAL_PROVIDER),
-        ]
-  );
-  const openAiRemoteConfiguredNames = unique(
-    openAiRemoteDiscovered.length > 0
-      ? [
-          ...openAiRemoteDiscovered,
-          ...providerModelNames(config, SGLANG_REMOTE_PROVIDER),
-          ...providerModelNames(source, SGLANG_REMOTE_PROVIDER),
-        ]
-      : [
-          ...providerModelNames(config, SGLANG_REMOTE_PROVIDER),
-          ...providerModelNames(source, SGLANG_REMOTE_PROVIDER),
-        ]
+    }) || primaryTierHost(registry, TIER_IDS.tailscaleOpenAiCompatible),
+    TIER_IDS.tailscaleOpenAiCompatible
   );
 
   return {
     localDiscovered,
     localInventoryPresent: localDiscovered.length > 0,
-    openAiLocalDiscovered,
-    openAiLocalHost,
-    openAiLocalInventoryPresent: openAiLocalReachable && openAiLocalConfiguredNames.length > 0,
-    openAiLocalReachable,
-    openAiRemoteDiscovered,
-    openAiRemoteHost,
-    openAiRemoteInventoryPresent: openAiRemoteReachable && openAiRemoteConfiguredNames.length > 0,
-    openAiRemoteReachable,
-    remote5090Discovered,
-    remote5090Host,
-    remote5090InventoryPresent: remote5090Reachable && remote5090ConfiguredNames.length > 0,
-    remote5090Reachable,
-    remotePrimaryDiscovered,
-    remotePrimaryHost,
-    remoteInventoryPresent: remoteReachable && remoteConfiguredNames.length > 0,
-    remoteReachable,
+    openAiLocalDiscovered: openAiLocal.discovered,
+    openAiLocalHost: openAiLocal.host,
+    openAiLocalInventoryPresent: inventoryPresent(openAiLocal, LLAMA_CPP_LOCAL_PROVIDER),
+    openAiLocalReachable: openAiLocal.reachable,
+    openAiRemoteDiscovered: openAiRemote.discovered,
+    openAiRemoteHost: openAiRemote.host,
+    openAiRemoteInventoryPresent: inventoryPresent(openAiRemote, SGLANG_REMOTE_PROVIDER),
+    openAiRemoteReachable: openAiRemote.reachable,
+    remote5090Discovered: remote5090.discovered,
+    remote5090Host: remote5090.host,
+    remote5090InventoryPresent: inventoryPresent(remote5090, OLLAMA_5090_PROVIDER),
+    remote5090Reachable: remote5090.reachable,
+    remotePrimaryDiscovered: remotePrimary.discovered,
+    remotePrimaryHost: remotePrimary.host,
+    remoteInventoryPresent: inventoryPresent(remotePrimary, OLLAMA_REMOTE_PROVIDER),
+    remoteReachable: remotePrimary.reachable,
   };
 }
 

@@ -77,37 +77,6 @@ export function confineCwdToLaunchDir(rawCwd: string): ConfinedCwd {
   };
 }
 
-export function buildCoordinatorContract(
-  agentId: string,
-  strict: boolean,
-  structuredResults: boolean
-): string {
-  const lines: string[] = [
-    `Coordinator contract for ${agentId}:`,
-    "1. Treat worker notifications as internal signals, not user conversation turns.",
-    "2. Never fabricate worker outcomes; only summarize received deterministic results.",
-    "3. Worker prompts must be self-contained and include exact files, commands, and acceptance checks.",
-    "4. Reuse the same worker for follow-up when context continuity matters.",
-    "5. Stop or reroute workers immediately when requirements change.",
-    "6. For parallel work, fan out independent research/verification slices in one batch.",
-  ];
-
-  if (strict) {
-    lines.push(
-      "7. Strict mode: do not delegate trivial readback tasks that can be answered directly."
-    );
-    lines.push(
-      "8. Strict mode: require a concise synthesis step before issuing implementation follow-ups."
-    );
-  }
-  if (structuredResults) {
-    lines.push(
-      "9. Require worker outputs to include scope, result, changed files, and open issues."
-    );
-  }
-  return lines.join("\n");
-}
-
 export function resolveAgentContext(
   agentId: string,
   memoryScope: "user" | "project" | "local" | undefined,

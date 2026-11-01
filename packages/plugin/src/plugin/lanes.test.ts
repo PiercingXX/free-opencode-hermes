@@ -41,10 +41,11 @@ test("listReadyLocalLanes returns one lane per ready local provider", () => {
 
   const lanes = listReadyLocalLanes(settings);
   assert.equal(lanes.length, 3);
-  assert.deepEqual(
-    lanes.map((l) => l.agentName).sort(),
-    ["lane-llamacpp", "lane-ollama", "lane-tailscale_sglang"]
-  );
+  assert.deepEqual(lanes.map((l) => l.agentName).sort(), [
+    "lane-llamacpp",
+    "lane-ollama",
+    "lane-tailscale_sglang",
+  ]);
   assert.ok(lanes.every((l) => l.wireModel.startsWith("free-opencode/")));
 
   const orch = pickOrchestratorLane(lanes);

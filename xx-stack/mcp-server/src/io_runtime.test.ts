@@ -1,11 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, open, readFile, readdir, rename, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { fork } from "node:child_process";
+import { mkdtemp, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FileHandle } from "node:fs/promises";
 
-import { atomicWriteTextFile, type AtomicWriteIo } from "./io_runtime.js";
+import {
+  atomicWriteTextFile,
+  createStoreLock,
+  FileLockTimeoutError,
+  withFileLock,
+  type AtomicWriteIo,
+} from "./io_runtime.js";
 
 /**
  * D5: `atomicWriteTextFile` renamed a temp file into place with no fsync
@@ -226,6 +233,144 @@ test("the real filesystem path still writes the content and leaves no temp file 
 
     assert.equal(await readFile(path, "utf-8"), '{"version":2}\n');
     assert.deepEqual(await readdir(dir), ["state.json"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Cross-process store lock ---------------------------------------------
+
+/** A read -> yield -> write increment: loses updates unless the lock serializes it. */
+async function lockedIncrement(storePath: string): Promise<void> {
+  await withFileLock(storePath, async () => {
+    let count: number;
+    try {
+      count = Number(JSON.parse(await readFile(storePath, "utf-8")).count);
+    } catch {
+      count = 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    await atomicWriteTextFile(storePath, JSON.stringify({ count: count + 1 }));
+  });
+}
+
+test("two processes incrementing one store under withFileLock lose no updates", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-file-lock-"));
+  try {
+    const storePath = join(dir, "store.json");
+    const childPath = join(dir, "child.mjs");
+    const ioUrl = new URL("./io_runtime.js", import.meta.url).href;
+    await writeFile(
+      childPath,
+      `import { readFile } from "node:fs/promises";
+import { atomicWriteTextFile, withFileLock } from ${JSON.stringify(ioUrl)};
+const [storePath, iterations] = process.argv.slice(2);
+for (let i = 0; i < Number(iterations); i += 1) {
+  await withFileLock(storePath, async () => {
+    let count;
+    try { count = Number(JSON.parse(await readFile(storePath, "utf-8")).count); } catch { count = 0; }
+    await new Promise((r) => setTimeout(r, 1));
+    await atomicWriteTextFile(storePath, JSON.stringify({ count: count + 1 }));
+  });
+}
+`
+    );
+    const iterations = 25;
+    const runChild = () =>
+      new Promise<number | null>((resolve, reject) => {
+        const child = fork(childPath, [storePath, String(iterations)], { stdio: "inherit" });
+        child.on("error", reject);
+        child.on("exit", (code) => resolve(code));
+      });
+    // Two child processes plus this process all contend for the same lock.
+    const parentWork = (async () => {
+      for (let i = 0; i < iterations; i += 1) await lockedIncrement(storePath);
+    })();
+    const codes = await Promise.all([runChild(), runChild(), parentWork]);
+    assert.deepEqual(codes.slice(0, 2), [0, 0]);
+    const final = JSON.parse(await readFile(storePath, "utf-8")) as { count: number };
+    assert.equal(final.count, iterations * 3, "every increment must survive");
+    const leftovers = (await readdir(dir)).filter((name) => name.includes(".lock"));
+    assert.deepEqual(leftovers, [], "the lockfile is released after the last holder");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a lock left by a dead pid on this host is broken immediately", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-file-lock-"));
+  try {
+    const storePath = join(dir, "store.json");
+    // A pid that cannot be running: far above any real pid_max.
+    await writeFile(
+      `${storePath}.lock`,
+      JSON.stringify({ pid: 2 ** 30, host: hostname(), acquiredAt: Date.now(), token: "dead" })
+    );
+    const ran = await withFileLock(storePath, async () => "ran", { timeoutMs: 1_000 });
+    assert.equal(ran, "ran");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a lock older than staleMs is broken even when its holder looks alive", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-file-lock-"));
+  try {
+    const storePath = join(dir, "store.json");
+    await writeFile(
+      `${storePath}.lock`,
+      JSON.stringify({ pid: process.ppid, host: "other-host", acquiredAt: 0, token: "old" })
+    );
+    const ran = await withFileLock(storePath, async () => "ran", { timeoutMs: 1_000 });
+    assert.equal(ran, "ran");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a live, fresh lock is waited on and then times out with a named holder", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-file-lock-"));
+  try {
+    const storePath = join(dir, "store.json");
+    await writeFile(
+      `${storePath}.lock`,
+      JSON.stringify({ pid: process.pid, host: hostname(), acquiredAt: Date.now(), token: "live" })
+    );
+    await assert.rejects(
+      withFileLock(storePath, async () => "ran", { timeoutMs: 150 }),
+      (error: unknown) =>
+        error instanceof FileLockTimeoutError && error.message.includes(`pid ${process.pid}`)
+    );
+    // The waiter must not have deleted the live holder's lock.
+    const still = JSON.parse(await readFile(`${storePath}.lock`, "utf-8")) as { token: string };
+    assert.equal(still.token, "live");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("createStoreLock serializes in-process callers and releases on a throwing body", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-file-lock-"));
+  try {
+    const storePath = join(dir, "store.json");
+    const lock = createStoreLock(() => storePath);
+    const order: string[] = [];
+    await assert.rejects(
+      lock(async () => {
+        throw new Error("boom");
+      })
+    );
+    await Promise.all([
+      lock(async () => {
+        order.push("a-start");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        order.push("a-end");
+      }),
+      lock(async () => {
+        order.push("b");
+      }),
+    ]);
+    assert.deepEqual(order, ["a-start", "a-end", "b"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

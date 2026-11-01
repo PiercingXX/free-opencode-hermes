@@ -257,9 +257,7 @@ class CommandSafetyTests(TempDirMixin):
             "git status --short",
             "git diff",
             "git log --oneline -n 5",
-            "python3 -m pytest",
-            "python3 -m pytest sub",
-            "npm test",
+            "git log -n5",
         ]:
             with self.subTest(command=command):
                 self.assertTrue(self.allowed(command), self.reason(command))
@@ -305,6 +303,14 @@ class CommandSafetyTests(TempDirMixin):
         self.assertIsNone(ho.parse_command_argv("find . -exec sh {} +"))
         self.assertIn("+", ho.UNSAFE_TOKEN_CHARS)
 
+    # Runners, opted in, so the per-argument layer is what is under test.
+    RUNNERS = SHIPPED_ALLOWLIST + ["python3 -m pytest", "npm test"]
+
+    def runner_reason(self, command):
+        return ho.command_rejection_reason(
+            command, self.RUNNERS, workspace=self.workspace, allow_repo_code_execution=True
+        )
+
     def test_process_spawning_flags_rejected_for_every_command(self):
         for command in [
             "npm test --prefix /tmp",
@@ -313,9 +319,68 @@ class CommandSafetyTests(TempDirMixin):
             "python3 -m pytest -c /tmp/pytest.ini",
         ]:
             with self.subTest(command=command):
-                reason = self.reason(command)
+                reason = self.runner_reason(command)
                 self.assertIsNotNone(reason)
                 self.assertTrue(reason.startswith("denied_argument"), reason)
+
+    # --- glued / clustered short options ------------------------------------
+
+    def test_glued_short_option_values_cannot_hide_denied_flags(self):
+        for command in [
+            "python3 -m pytest -pevilmod",
+            "python3 -m pytest -xpevilmod",
+            "python3 -m pytest -p=evilmod",
+            "python3 -m pytest -c/tmp/pytest.ini",
+            "python3 -m pytest -o/tmp/x",
+            "git log -ofoo",
+            "git diff -zq",
+        ]:
+            with self.subTest(command=command):
+                reason = self.runner_reason(command)
+                self.assertIsNotNone(reason)
+                self.assertTrue(reason.startswith("denied_argument:"), reason)
+
+    def test_glued_short_option_paths_are_workspace_checked(self):
+        for command in [
+            "git diff -O/etc/passwd",
+            "git diff -lO/etc/passwd",
+            "git diff -O../outside",
+            "git diff -O~/.hermes/config.yaml",
+            "git log --format=x --output-indicator-new=/etc/x",
+        ]:
+            with self.subTest(command=command):
+                reason = self.reason(command)
+                self.assertIsNotNone(reason)
+                self.assertTrue(reason.startswith("argument_outside_workspace:"), reason)
+        self.assertIsNone(self.reason("git diff -Osub"))
+
+    # --- repo-code runners are opt-in ---------------------------------------
+
+    def test_shipped_allowlist_excludes_repo_code_runners(self):
+        self.assertFalse(SHIPPED_CFG["execution"].get("allow_repo_code_execution", False))
+        for prefix in SHIPPED_ALLOWLIST:
+            for runner in ho.REPO_CODE_EXECUTION_PREFIXES:
+                with self.subTest(prefix=prefix, runner=runner):
+                    self.assertNotEqual(tuple(prefix.split()[: len(runner)]), runner)
+
+    def test_repo_code_runner_refused_without_opt_in_even_if_listed(self):
+        for command in ["python3 -m pytest", "npm test", "python3 -m pytest sub"]:
+            with self.subTest(command=command):
+                reason = self.reason(command, self.RUNNERS)
+                self.assertTrue(reason.startswith("repo_code_execution_disabled:"), reason)
+                self.assertIsNone(self.runner_reason(command))
+
+    def test_repo_code_runner_still_needs_allowlist_entry(self):
+        reason = ho.command_rejection_reason(
+            "npm test", SHIPPED_ALLOWLIST, workspace=self.workspace, allow_repo_code_execution=True
+        )
+        self.assertEqual(reason, "not_allowlisted")
+
+    def test_run_actions_explains_repo_code_refusal(self):
+        results = ho.run_actions(["npm test"], self.RUNNERS, workspace=self.workspace)
+        self.assertEqual(results[0]["status"], "rejected")
+        self.assertEqual(results[0]["reason"], "repo_code_execution_disabled:npm test")
+        self.assertIn("allow_repo_code_execution", results[0]["hint"])
 
     def test_shipped_allowlist_has_no_argument_spawning_readers(self):
         # find/rg were dropped: their escape hatches are numerous and version
@@ -422,18 +487,16 @@ class CloudGateDefaultTests(unittest.TestCase):
 class ApiKeyResolutionTests(unittest.TestCase):
     """HERMES-7: a hanging credential helper must not park the thread."""
 
+    @staticmethod
+    def lane(command, key="x"):
+        return ho.Lane(key=key, name=key, base_url="", model="m", enabled=True, api_key_command=command)
+
     def test_api_key_command_timeout_is_bounded(self):
-        lane = ho.Lane(
-            key="x",
-            name="x",
-            base_url="",
-            model="m",
-            enabled=True,
-            api_key_command="sleep 30",
-        )
         start = time.monotonic()
-        self.assertEqual(ho.resolve_api_key(lane, timeout=1), "")
+        with self.assertRaises(ho.ApiKeyCommandError) as ctx:
+            ho.resolve_api_key(self.lane("sleep 30"), timeout=1)
         self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("timed out", str(ctx.exception))
 
     def test_env_var_short_circuits_command(self):
         os.environ["HERMES_TEST_KEY"] = "from-env"
@@ -473,18 +536,95 @@ class ApiKeyResolutionTests(unittest.TestCase):
         )
         self.assertEqual(ho.resolve_api_key(lane), "$HOME;`id`")
 
-    def test_api_key_command_string_form_still_interpreted_by_shell(self):
-        # Arithmetic expansion only happens under a shell: pins the documented
-        # string form to its existing shell=True behavior.
-        lane = ho.Lane(
-            key="x",
-            name="x",
-            base_url="",
-            model="m",
-            enabled=True,
-            api_key_command='echo "shell-$((6*7))"',
-        )
+    def test_api_key_command_string_form_runs_without_shell(self):
+        # Strings are shlex-split; "$((6*7))" reaches printf verbatim.
+        self.assertEqual(ho.resolve_api_key(self.lane('printf %s "shell-$((6*7))"')), "shell-$((6*7))")
+        self.assertEqual(ho.api_key_command_spec(self.lane("printf a b")), (["printf", "a", "b"], False))
+
+    def test_api_key_command_shell_requires_explicit_opt_in(self):
+        lane = self.lane({"command": 'echo "shell-$((6*7))"', "shell": True})
         self.assertEqual(ho.resolve_api_key(lane), "shell-42")
+        lane = self.lane({"command": 'printf %s "$((6*7))"', "shell": False})
+        self.assertEqual(ho.resolve_api_key(lane), "$((6*7))")
+        with self.assertRaises(ho.ApiKeyCommandError):
+            ho.resolve_api_key(self.lane({"shell": True}))
+
+    def test_api_key_command_failure_names_lane_instead_of_sending_empty_key(self):
+        for command in ["false", ["true"], "/nonexistent/credential-helper", "printf ''"]:
+            with self.subTest(command=command):
+                with self.assertRaises(ho.ApiKeyCommandError) as ctx:
+                    ho.resolve_api_key(self.lane(command, key="my-lane"))
+                self.assertIn("my-lane", str(ctx.exception))
+                self.assertIsInstance(ctx.exception, ho.OrchestratorError)
+
+    def test_no_credential_configured_is_still_keyless(self):
+        self.assertEqual(ho.resolve_api_key(self.lane(None)), "")
+
+    def test_api_key_command_failure_marks_lane_unhealthy(self):
+        lane = ho.Lane(
+            key="x", name="x", base_url="http://127.0.0.1:9/v1", model="m", enabled=True,
+            api_key_command="false",
+        )
+        healthy, detail = ho.lane_health(lane, 1, 1)
+        self.assertFalse(healthy)
+        self.assertTrue(detail.startswith("api_key_command_failed"), detail)
+        self.assertEqual(ho.list_lane_models(lane, 1), ([], "api_key_command_failed"))
+        self.assertEqual(ho.probe_tool_call_support(lane, 1, "m"), (False, "api_key_command_failed"))
+
+
+class SystemdUnitHardeningTests(unittest.TestCase):
+    SANDBOX = (
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "PrivateTmp=yes",
+        "CapabilityBoundingSet=",
+        "ReadWritePaths=__HERMES_DIR__/logs",
+    )
+
+    def test_every_service_unit_is_sandboxed(self):
+        units = sorted((HERMES_DIR / "systemd").glob("*.service"))
+        self.assertTrue(units)
+        for unit in units:
+            lines = unit.read_text(encoding="utf-8").splitlines()
+            for directive in self.SANDBOX:
+                with self.subTest(unit=unit.name, directive=directive):
+                    self.assertIn(directive, lines)
+
+
+class BindPolicyTests(unittest.TestCase):
+    """The proxy is loopback-only unless explicitly overridden with auth on."""
+
+    def test_loopback_hosts_always_allowed(self):
+        for host in ("127.0.0.1", "127.0.0.2", "localhost", "::1"):
+            with self.subTest(host=host):
+                ho.check_bind_policy(host, None, allow_remote=False)
+                ho.check_bind_policy(host, "tok", allow_remote=False)
+
+    def test_non_loopback_without_auth_is_refused_even_with_allow_remote(self):
+        for host in ("0.0.0.0", "192.168.1.5", "::", "example.com"):
+            with self.subTest(host=host):
+                with self.assertRaises(ho.OrchestratorError) as ctx:
+                    ho.check_bind_policy(host, None, allow_remote=True)
+                self.assertIn("unauthenticated", str(ctx.exception))
+
+    def test_non_loopback_with_auth_requires_allow_remote(self):
+        with self.assertRaises(ho.OrchestratorError) as ctx:
+            ho.check_bind_policy("0.0.0.0", "tok", allow_remote=False)
+        self.assertIn("--allow-remote", str(ctx.exception))
+        with contextlib.redirect_stderr(io.StringIO()):
+            ho.check_bind_policy("0.0.0.0", "tok", allow_remote=True)
+
+    def test_command_serve_refuses_before_binding(self):
+        args = argparse.Namespace(
+            host="0.0.0.0", port=0, token="", allow_cloud=False, no_auth=True, allow_remote=True
+        )
+        with self.assertRaises(ho.OrchestratorError):
+            ho.command_serve(args, {"proxy": {"auth_token_env": "HERMES_TEST_UNSET_TOKEN_ENV"}})
+
+    def test_serve_parser_exposes_allow_remote(self):
+        args = ho.build_parser().parse_args(["serve", "--allow-remote"])
+        self.assertTrue(args.allow_remote)
 
 
 class _RecordingHTTPError(urllib.error.HTTPError):

@@ -18,9 +18,6 @@
  *   - layered --help: top-level under 40 lines, per-command help beneath
  */
 
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import type { AgentMemoryScope } from "./config_runtime.js";
@@ -44,6 +41,7 @@ import {
   withTaskStoreLock,
   type TaskStatus,
 } from "./task_runtime.js";
+import { isDirectExecution } from "./entrypoint.js";
 
 /**
  * Re-exported, not re-implemented. `xx platforms`, `xx diagnose`, and
@@ -213,110 +211,114 @@ export function parseCliArgs(argv: string[]): ParsedCommand {
       return { kind: "diagnose", json: values.json === true };
     }
 
-    case "tasks": {
-      const { values, positionals } = parseWith(rest, TASKS_LIST_OPTIONS);
-      if (values.help === true) return { kind: "help", topic: "tasks" };
-      const sub = positionals[0];
-      if (sub === undefined) {
-        throw new CliUsageError("tasks requires a subcommand (available: list)");
-      }
-      if (sub !== "list") {
-        throw new CliUsageError(`unknown tasks subcommand: "${sub}" (available: list)`);
-      }
-      if (positionals.length > 1) {
-        throw new CliUsageError(
-          `tasks list takes no positional arguments (got: ${positionals.slice(1).join(" ")})`
-        );
-      }
+    case "tasks":
+      return parseTasksArgs(rest);
 
-      let status: TaskStatus | undefined;
-      if (typeof values.status === "string") {
-        if (!(TASK_STATUS_VALUES as readonly string[]).includes(values.status)) {
-          throw new CliUsageError(
-            `invalid --status "${values.status}" (valid: ${TASK_STATUS_VALUES.join(", ")})`
-          );
-        }
-        status = values.status as TaskStatus;
-      }
-
-      let limit: number | undefined;
-      if (typeof values.limit === "string") {
-        const parsed = Number.parseInt(values.limit, 10);
-        if (
-          !Number.isInteger(parsed) ||
-          parsed < 1 ||
-          parsed > 500 ||
-          String(parsed) !== values.limit
-        ) {
-          throw new CliUsageError(`invalid --limit "${values.limit}" (must be an integer 1-500)`);
-        }
-        limit = parsed;
-      }
-
-      return {
-        kind: "tasks-list",
-        json: values.json === true,
-        status,
-        tag: typeof values.tag === "string" ? values.tag : undefined,
-        owner: typeof values.owner === "string" ? values.owner : undefined,
-        includeCompleted: values["include-completed"] === true,
-        readyOnly: values["ready-only"] === true,
-        limit,
-      };
-    }
-
-    case "memory": {
-      const { values, positionals } = parseWith(rest, MEMORY_OPTIONS);
-      if (values.help === true) return { kind: "help", topic: "memory" };
-      const sub = positionals[0];
-      if (sub === undefined) {
-        throw new CliUsageError("memory requires a subcommand (available: status, apply)");
-      }
-      if (sub !== "status" && sub !== "apply") {
-        throw new CliUsageError(`unknown memory subcommand: "${sub}" (available: status, apply)`);
-      }
-      if (positionals.length > 1) {
-        throw new CliUsageError(
-          `memory ${sub} takes no positional arguments (got: ${positionals.slice(1).join(" ")})`
-        );
-      }
-
-      const agentId = typeof values.agent === "string" ? values.agent.trim() : "";
-      if (agentId.length === 0) {
-        throw new CliUsageError(`memory ${sub} requires --agent <id>`);
-      }
-
-      let scope: AgentMemoryScope | undefined;
-      if (typeof values.scope === "string") {
-        if (!(MEMORY_SCOPES as readonly string[]).includes(values.scope)) {
-          throw new CliUsageError(
-            `invalid --scope "${values.scope}" (valid: ${MEMORY_SCOPES.join(", ")})`
-          );
-        }
-        scope = values.scope as AgentMemoryScope;
-      }
-
-      const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
-      const json = values.json === true;
-
-      if (sub === "status") {
-        if (typeof values["expect-hash"] === "string") {
-          throw new CliUsageError("--expect-hash applies to write commands (try: memory apply)");
-        }
-        return { kind: "memory-status", agentId, scope, cwd, json };
-      }
-
-      const expectHash =
-        typeof values["expect-hash"] === "string" ? values["expect-hash"].trim() : undefined;
-      if (expectHash !== undefined && expectHash.length === 0) {
-        throw new CliUsageError("--expect-hash requires a non-empty hash");
-      }
-      return { kind: "memory-apply", agentId, scope, cwd, expectHash, json };
-    }
+    case "memory":
+      return parseMemoryArgs(rest);
 
     default:
       throw new CliUsageError(`unknown command: "${command}" (commands: ${COMMANDS.join(", ")})`);
   }
+}
+
+/**
+ * The one subcommand a command takes, validated against `available`, with no
+ * further positionals allowed.
+ */
+function requireSubcommand<S extends string>(
+  command: string,
+  positionals: string[],
+  available: readonly S[]
+): S {
+  const sub = positionals[0];
+  const list = available.join(", ");
+  if (sub === undefined) {
+    throw new CliUsageError(`${command} requires a subcommand (available: ${list})`);
+  }
+  if (!(available as readonly string[]).includes(sub)) {
+    throw new CliUsageError(`unknown ${command} subcommand: "${sub}" (available: ${list})`);
+  }
+  if (positionals.length > 1) {
+    throw new CliUsageError(
+      `${command} ${sub} takes no positional arguments (got: ${positionals.slice(1).join(" ")})`
+    );
+  }
+  return sub as S;
+}
+
+/** An optional `--flag` whose value must be one of `valid`. */
+function parseEnumOption<T extends string>(
+  flag: string,
+  value: string | boolean | undefined,
+  valid: readonly T[]
+): T | undefined {
+  if (typeof value !== "string") return undefined;
+  if (!(valid as readonly string[]).includes(value)) {
+    throw new CliUsageError(`invalid --${flag} "${value}" (valid: ${valid.join(", ")})`);
+  }
+  return value as T;
+}
+
+function parseTasksArgs(rest: string[]): ParsedCommand {
+  const { values, positionals } = parseWith(rest, TASKS_LIST_OPTIONS);
+  if (values.help === true) return { kind: "help", topic: "tasks" };
+  requireSubcommand("tasks", positionals, ["list"] as const);
+  const status = parseEnumOption("status", values.status, TASK_STATUS_VALUES);
+
+  let limit: number | undefined;
+  if (typeof values.limit === "string") {
+    const parsed = Number.parseInt(values.limit, 10);
+    if (
+      !Number.isInteger(parsed) ||
+      parsed < 1 ||
+      parsed > 500 ||
+      String(parsed) !== values.limit
+    ) {
+      throw new CliUsageError(`invalid --limit "${values.limit}" (must be an integer 1-500)`);
+    }
+    limit = parsed;
+  }
+
+  return {
+    kind: "tasks-list",
+    json: values.json === true,
+    status,
+    tag: typeof values.tag === "string" ? values.tag : undefined,
+    owner: typeof values.owner === "string" ? values.owner : undefined,
+    includeCompleted: values["include-completed"] === true,
+    readyOnly: values["ready-only"] === true,
+    limit,
+  };
+}
+
+function parseMemoryArgs(rest: string[]): ParsedCommand {
+  const { values, positionals } = parseWith(rest, MEMORY_OPTIONS);
+  if (values.help === true) return { kind: "help", topic: "memory" };
+  const sub = requireSubcommand("memory", positionals, ["status", "apply"] as const);
+
+  const agentId = typeof values.agent === "string" ? values.agent.trim() : "";
+  if (agentId.length === 0) {
+    throw new CliUsageError(`memory ${sub} requires --agent <id>`);
+  }
+
+  const scope = parseEnumOption("scope", values.scope, MEMORY_SCOPES);
+  const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
+  const json = values.json === true;
+
+  if (sub === "status") {
+    if (typeof values["expect-hash"] === "string") {
+      throw new CliUsageError("--expect-hash applies to write commands (try: memory apply)");
+    }
+    return { kind: "memory-status", agentId, scope, cwd, json };
+  }
+
+  const expectHash =
+    typeof values["expect-hash"] === "string" ? values["expect-hash"].trim() : undefined;
+  if (expectHash !== undefined && expectHash.length === 0) {
+    throw new CliUsageError("--expect-hash requires a non-empty hash");
+  }
+  return { kind: "memory-apply", agentId, scope, cwd, expectHash, json };
 }
 
 // --- Help (layered: top-level short, per-command beneath) ---
@@ -666,21 +668,9 @@ export async function runCli(
   }
 }
 
-// --- Direct execution guard (same realpath pattern as index.ts) ---
+// --- Direct execution guard (entrypoint.ts) ---
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return realpathSync(candidate);
-    } catch {
-      return resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   runCli(process.argv.slice(2))
     .then((code) => {
       // exitCode (not process.exit) so pending stdout pipe writes flush.

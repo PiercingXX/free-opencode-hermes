@@ -10,6 +10,7 @@ import { lookupModelCost } from "./platform_runtime.js";
 import {
   endpointFamilyForHost,
   fetchHostModels,
+  findHostById,
   probeHostEndpointCompatibility,
 } from "./routing_runtime.js";
 
@@ -669,6 +670,62 @@ export function toolAnnotations(name: string): ToolHints {
   return lookupToolAnnotations(name) ?? FAIL_SAFE_TOOL_HINTS;
 }
 
+/** check_health `models`: live catalogs for every enabled HTTP host, else the registry's. */
+async function collectModelCatalogs(registry: Registry): Promise<Array<Record<string, unknown>>> {
+  const allHosts = registry.tiers.flatMap((tier) =>
+    tier.hosts
+      .filter(
+        (host) =>
+          host.enabled !== false &&
+          (host.endpoint.startsWith("http://") || host.endpoint.startsWith("https://"))
+      )
+      .map((host) => ({ tier, host }))
+  );
+  return Promise.all(
+    allHosts.map(async ({ tier, host }) => {
+      const models = await fetchHostModels(host);
+      return {
+        tier: tier.id,
+        host: host.id,
+        endpoint: host.endpoint,
+        provider: host.provider,
+        endpointFamily: endpointFamilyForHost(host),
+        models: models.length > 0 ? models : (host.models ?? []),
+        source: models.length > 0 ? "live" : "registry-cache",
+      };
+    })
+  );
+}
+
+/**
+ * check_health `probe`: an OpenAI-compat probe of a registry host or a manual
+ * endpoint, or an error naming what is missing. Undefined when there is
+ * nothing to report (no target and the probe was not explicitly requested).
+ */
+async function probeReport(
+  registry: Registry,
+  probeRequested: boolean,
+  target: { hostId?: string; endpoint?: string; provider?: string; model?: string }
+): Promise<unknown> {
+  const { hostId, endpoint, provider, model } = target;
+  let host: Host | null = null;
+  if (hostId) {
+    host = findHostById(registry, hostId)?.host ?? null;
+    if (!host) return { error: `hostId not found: ${hostId}` };
+  } else if (endpoint) {
+    host = {
+      id: "manual-endpoint",
+      label: "Manual endpoint",
+      provider: provider ?? "openai-compatible",
+      endpoint,
+      models: model ? [{ name: model }] : [],
+    };
+  } else if (probeRequested) {
+    return { error: "provide hostId or endpoint" };
+  }
+  return host ? probeHostEndpointCompatibility(host, model ?? null) : undefined;
+}
+
 export function registerObservabilityTools(server: McpServer, deps: ObservabilityToolDeps): void {
   server.registerTool(
     "list_platforms",
@@ -711,29 +768,7 @@ export function registerObservabilityTools(server: McpServer, deps: Observabilit
       };
 
       if (extras.has("models")) {
-        const allHosts = registry.tiers.flatMap((tier) =>
-          tier.hosts
-            .filter(
-              (host) =>
-                host.enabled !== false &&
-                (host.endpoint.startsWith("http://") || host.endpoint.startsWith("https://"))
-            )
-            .map((host) => ({ tier, host }))
-        );
-        payload.models = await Promise.all(
-          allHosts.map(async ({ tier, host }) => {
-            const models = await fetchHostModels(host);
-            return {
-              tier: tier.id,
-              host: host.id,
-              endpoint: host.endpoint,
-              provider: host.provider,
-              endpointFamily: endpointFamilyForHost(host),
-              models: models.length > 0 ? models : (host.models ?? []),
-              source: models.length > 0 ? "live" : "registry-cache",
-            };
-          })
-        );
+        payload.models = await collectModelCatalogs(registry);
       }
 
       if (extras.has("hardware")) {
@@ -741,32 +776,13 @@ export function registerObservabilityTools(server: McpServer, deps: Observabilit
       }
 
       if (extras.has("probe") || hostId || endpoint) {
-        let host: Host | null = null;
-        if (hostId) {
-          for (const tier of registry.tiers) {
-            const matched = tier.hosts.find((candidate) => candidate.id === hostId);
-            if (matched) {
-              host = matched;
-              break;
-            }
-          }
-          if (!host) {
-            payload.probe = { error: `hostId not found: ${hostId}` };
-          }
-        } else if (endpoint) {
-          host = {
-            id: "manual-endpoint",
-            label: "Manual endpoint",
-            provider: provider ?? "openai-compatible",
-            endpoint,
-            models: model ? [{ name: model }] : [],
-          };
-        } else if (extras.has("probe")) {
-          payload.probe = { error: "provide hostId or endpoint" };
-        }
-        if (host) {
-          payload.probe = await probeHostEndpointCompatibility(host, model ?? null);
-        }
+        const probe = await probeReport(registry, extras.has("probe"), {
+          hostId,
+          endpoint,
+          provider,
+          model,
+        });
+        if (probe !== undefined) payload.probe = probe;
       }
 
       return jsonContent(extras.size === 0 && !hostId && !endpoint ? payload.health : payload);

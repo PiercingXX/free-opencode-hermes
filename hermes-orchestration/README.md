@@ -53,6 +53,20 @@ Then update `lanes.ollama.model` in `config/orchestration.json` to a model that
 `example-gpu-box-ollama` host in the `tailscale-ollama` tier of
 `../runtime/platforms.json` (generated from `inventory.example.json`).
 
+### Lane credentials
+
+A lane resolves its key from `api_key_env` first, then `api_key_command`:
+
+- `"api_key_command": "pass show sglang/key"` — split with `shlex`, run
+  **without** a shell.
+- `"api_key_command": ["pass", "show", "sglang/key"]` — argv list, no shell.
+- `"api_key_command": {"command": "op read ... | tr -d '\\n'", "shell": true}` —
+  the only form that uses a shell; opt in explicitly.
+
+If the command times out, exits non-zero or prints nothing, the lane is marked
+unhealthy (`api_key_command_failed`) and is skipped, naming the lane, instead of
+being called upstream with an empty key.
+
 ## What is implemented
 
 - Control plane runner: `scripts/hermes_orchestrator.py`
@@ -143,8 +157,9 @@ python3 scripts/hermes_orchestrator.py serve
 # → http://127.0.0.1:8180  with endpoints /healthz, /v1/models, /v1/chat/completions
 ```
 
-- Binds loopback-only by default (`proxy.bind_host`); a warning is printed for
-  anything else.
+- Binds loopback-only by default (`proxy.bind_host`). A non-loopback host is
+  refused outright with `--no-auth` (that would be an unauthenticated LAN
+  relay) and, with auth, only starts when `--allow-remote` is passed.
 - Requires a bearer token (env var named by `proxy.auth_token_env`, `--token`,
   or explicit `--no-auth`).
 - `model: "auto"` (or omitted) uses the standard routing order; naming a real
@@ -288,25 +303,46 @@ Commands pass three layers before they run, all of which must succeed:
    even if it were not.
 2. **Whole-token prefix match** against `execution.allowed_command_prefixes`
    (`git statusx` does not match `git status`).
-3. **Per-argument screening of every remaining argument** — this is the part
+3. **Repo-code runners are opt-in.** `python3 -m pytest`, `pytest`,
+   `npm test`, `npm run`, `npx`, `yarn`, `pnpm` and `make` execute code the
+   *repository* controls (`conftest.py`, `package.json` scripts, Makefiles), so
+   argument screening cannot make them safe. They are not in the shipped
+   allowlist and are refused with `repo_code_execution_disabled:<runner>` even
+   when you add them, unless you also set
+   `execution.allow_repo_code_execution: true`. Only do that for a checkout you
+   trust.
+4. **Per-argument screening of every remaining argument** — this is the part
    that used to be missing. A prefix match no longer waves through whatever
    follows it. Arguments in the denylist (`-exec`, `-execdir`, `-delete`,
    `-fprintf`, `--pre`, `--pre-glob`, `--ext-diff`, `-c`, `--exec-path`,
-   `--node-options`, `--require`, `--prefix`, `-p`, `-o`, `-z`, …) are refused,
-   and every path argument must resolve inside the working directory, so
+   `--node-options`, `--require`, `--prefix`, `-p`, `-o`, `-z`, …) are refused.
+   Single-dash tokens are scanned letter by letter, so glued values and
+   clusters (`-pevilmod`, `-o/tmp/x`, `-xpevil`) cannot hide a denied flag;
+   the collateral is that e.g. `ls -ltr` and `git log -Sfoo` are refused too.
+   Every path argument — standalone or glued to an option (`--opt=/etc/x`,
+   `-O/etc/x`) — must resolve inside the working directory, so
    `cat ~/.hermes/config.yaml`, `cat /etc/passwd` and `ls -la /tmp` are refused.
 
 The shipped allowlist is `pwd`, `ls`, `cat`, `git status`, `git diff`,
-`git log`, `python3 -m pytest`, `npm test`. `find` and `rg` were removed: their
+`git log`. `find` and `rg` were removed: their
 process-spawning flags are numerous and version-dependent, so a denylist is not
 a trustworthy boundary for them. The denylist still covers their known forms if
 you re-add them, but you are on your own for flags nobody has enumerated yet.
 
+To let a plan run your test suite, opt in explicitly:
+
+```json
+"execution": {
+  "allow_shell_execution": true,
+  "allow_repo_code_execution": true,
+  "allowed_command_prefixes": ["pwd", "ls", "cat", "git status", "git diff", "git log", "python3 -m pytest"]
+}
+```
+
 **Residual limits — this is not a sandbox:**
 
-- `npm test` and `python3 -m pytest` run code the *repository* controls
-  (`package.json` scripts, `conftest.py`). Allowlisting them trusts the
-  checkout, not the model. Drop them if the checkout is untrusted.
+- With `allow_repo_code_execution` on, test runners run code the
+  *repository* controls. That trusts the checkout, not the model.
 - `cat`/`ls` can read any file inside the working directory, including a stray
   `.env`. Containment is a workspace boundary, not a secrets boundary.
 - The denylist enumerates known-bad flags; a new one is uncovered until added.

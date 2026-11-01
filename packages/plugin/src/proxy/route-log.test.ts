@@ -157,8 +157,7 @@ test("routeChat emits hops for retryable fallback with the full tried chain", as
       }
       return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
     },
-    undefined,
-    (hop) => hops.push(hop)
+    { onHop: (hop) => hops.push(hop) }
   );
 
   assert.equal(result.used.providerId, "open_router");

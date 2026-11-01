@@ -190,11 +190,50 @@ test("parseDangerousPatterns skips broken lines and keeps valid ones", () => {
   assert.ok(parseErrors[0].startsWith("line 4:"), "parse error must name the broken line");
 });
 
-test("a missing pattern file fails open with an empty denylist", () => {
+test("a missing pattern file loads as an empty, not-loaded denylist", () => {
   const result = loadDangerousPatternsFromFile("/nonexistent/dangerous-patterns.txt");
   assert.equal(result.loaded, false);
-  assert.deepEqual(result.patterns, [], "fail-open means no patterns, not block-everything");
+  assert.deepEqual(result.patterns, []);
   assert.equal(result.parseErrors.length, 1);
+});
+
+/** Point the denylist at `file` (and optionally set the opt-out) for one test body. */
+async function withDenylistEnv(
+  file: string,
+  allowMissing: boolean,
+  body: () => Promise<void> | void
+): Promise<void> {
+  const previousFile = process.env.XX_STACK_DANGEROUS_PATTERNS_FILE;
+  const previousAllow = process.env.XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS;
+  process.env.XX_STACK_DANGEROUS_PATTERNS_FILE = file;
+  if (allowMissing) process.env.XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS = "1";
+  else delete process.env.XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS;
+  resetDangerousPatternsCache();
+  try {
+    await body();
+  } finally {
+    if (previousFile === undefined) delete process.env.XX_STACK_DANGEROUS_PATTERNS_FILE;
+    else process.env.XX_STACK_DANGEROUS_PATTERNS_FILE = previousFile;
+    if (previousAllow === undefined) delete process.env.XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS;
+    else process.env.XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS = previousAllow;
+    resetDangerousPatternsCache();
+  }
+}
+
+test("an unloadable denylist fails CLOSED for hook commands", async () => {
+  await withDenylistEnv("/nonexistent/dangerous-patterns.txt", false, () => {
+    const result = validateExecRequest("npm", ["test"], "hook", ["npm"]);
+    assert.equal(result.allowed, false);
+    assert.equal(result.reason, "dangerous_patterns_unavailable");
+    // The fixed internal probes are exact-match constants and keep working.
+    assert.equal(validateExecRequest("free", ["-b"], "internal").allowed, true);
+  });
+});
+
+test("XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS=1 opts back into running without a denylist", async () => {
+  await withDenylistEnv("/nonexistent/dangerous-patterns.txt", true, () => {
+    assert.equal(validateExecRequest("npm", ["test"], "hook", ["npm"]).allowed, true);
+  });
 });
 
 test("an empty denylist blocks nothing", () => {
@@ -516,9 +555,8 @@ test(
 // ---------------------------------------------------------------------------
 // MCP-3: the candidate chain must resolve to a real filesystem path, not a
 // percent-encoded URL pathname. An install directory containing a space, '#',
-// or any non-ASCII byte used to make readFileSync throw and the loader fail
-// OPEN to an empty denylist — killing the catastrophic-command layer on exactly
-// the hosts where the pattern file is present.
+// or any non-ASCII byte used to make readFileSync throw and the denylist fail
+// to load on exactly the hosts where the pattern file is present.
 // ---------------------------------------------------------------------------
 
 test("the denylist loads from an install path containing a space, '#', and non-ASCII", async () => {
@@ -549,9 +587,9 @@ test("the denylist loads from an install path containing a space, '#', and non-A
     // quietly come back: url.pathname is not a path you can read.
     const encoded = new URL("../dangerous-patterns.txt", moduleUrl).pathname;
     assert.ok(encoded.includes("%20"));
-    const failOpen = loadDangerousPatternsFromFile(encoded);
-    assert.equal(failOpen.loaded, false);
-    assert.deepEqual(failOpen.patterns, [], "the old path fails OPEN — an empty denylist");
+    const unreadable = loadDangerousPatternsFromFile(encoded);
+    assert.equal(unreadable.loaded, false, "the old path cannot be read at all");
+    assert.deepEqual(unreadable.patterns, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

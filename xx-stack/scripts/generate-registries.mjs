@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeFileAtomic } from "./lib/fs-atomic.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const inventoryPath = path.join(repoRoot, "inventory.json");
@@ -91,21 +92,6 @@ function fail(message) {
 
 // Live registries are read by running systems; a half-written file would be
 // worse than a stale one, so content lands via rename in the same directory.
-function writeFileAtomic(filePath, data) {
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    fs.writeFileSync(tempPath, data);
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw error;
-  }
-}
-
 // inventory.json holds your private machine truth (MagicDNS names, hardware)
 // and is git-ignored. Until you create it, the shipped template answers, so a
 // fresh clone can sync and check without carrying anyone's real inventory.

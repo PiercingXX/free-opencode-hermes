@@ -16,6 +16,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 HERMES_DIR = HERE.parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from hermes_lib.fsutil import atomic_write_text  # noqa: E402
 TOKEN_FILE = Path(
     os.environ.get(
         "HERMES_PROXY_ENV_FILE",
@@ -95,8 +99,7 @@ def write_managed_config(directory: Path, url: str) -> None:
             "api_key": "",
         },
     }
-    path = directory / "config.yaml"
-    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(directory / "config.yaml", json.dumps(config, indent=2) + "\n")
 
 
 def main() -> int:

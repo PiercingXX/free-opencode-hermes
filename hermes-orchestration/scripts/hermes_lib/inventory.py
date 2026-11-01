@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from .fsutil import atomic_write_text
 from .lanes import (
+    Lane,
+    check_lane_health,
     cloud_lane_keys,
     health_timeout,
     lane_from_config,
@@ -21,7 +22,6 @@ from .lanes import (
     request_timeout,
     select_probe_model,
     self_hosted_lane_keys,
-    check_lane_health,
 )
 
 
@@ -93,24 +93,13 @@ def routing_event(
     return event
 
 
-
 def save_json(path: Path, obj: Dict[str, Any]) -> None:
-    """Write JSON atomically so a concurrent reader never sees torn content.
+    """Write JSON atomically (see fsutil.atomic_write_text).
 
     The capability cache is read on the proxy/subagent path while refreshes
-    rewrite it. Writing a temp file in the same directory and renaming keeps
-    every reader on either the previous file or the complete new one.
+    rewrite it, so readers must never observe a partial file.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(obj, indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write(payload)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, json.dumps(obj, indent=2, sort_keys=True) + "\n")
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -127,6 +116,40 @@ def cache_is_fresh(path: Path, max_age_seconds: int) -> bool:
         return True
     age_seconds = time.time() - path.stat().st_mtime
     return age_seconds <= max_age_seconds
+
+
+def tool_probe_result(
+    cfg: Dict[str, Any],
+    lane: Lane,
+    model: str,
+    previous_meta: Any,
+) -> Tuple[bool, str]:
+    """Tool-call support for ``model``, reusing a prior probe of the same model."""
+    if (
+        isinstance(previous_meta, dict)
+        and previous_meta.get("selected_probe_model") == model
+        and previous_meta.get("tool_call_supported") is not None
+    ):
+        return bool(previous_meta.get("tool_call_supported")), "reused_previous_probe"
+    return probe_tool_call_support(lane, request_timeout(cfg), model)
+
+
+def subagent_score(
+    lane: Lane,
+    healthy: bool,
+    models: List[str],
+    tool_supported: Optional[bool],
+    probe_tool_calls: bool,
+) -> int:
+    """Rank lanes for recommended_subagent: health, model breadth, priority, tools."""
+    score = 50 if healthy else 0
+    score += min(len(models), 10)
+    score += lane.priority
+    if tool_supported is True:
+        score += 40
+    elif probe_tool_calls and tool_supported is False:
+        score -= 30
+    return score
 
 
 def build_inventory_report(
@@ -161,32 +184,13 @@ def build_inventory_report(
             models, models_reason = list_lane_models(lane, health_timeout(cfg))
 
         selected_model = select_probe_model(lane, models)
-        tool_supported = None
+        tool_supported: Optional[bool] = None
         tool_reason = "not_requested"
         if probe_tool_calls and healthy and selected_model:
-            previous_meta = previous_lanes.get(key)
-            if (
-                reuse_probe
-                and isinstance(previous_meta, dict)
-                and previous_meta.get("selected_probe_model") == selected_model
-                and previous_meta.get("tool_call_supported") is not None
-            ):
-                tool_supported = bool(previous_meta.get("tool_call_supported"))
-                tool_reason = "reused_previous_probe"
-            else:
-                ok, reason = probe_tool_call_support(lane, request_timeout(cfg), selected_model)
-                tool_supported = ok
-                tool_reason = reason
-
-        score = 0
-        if healthy:
-            score += 50
-        score += min(len(models), 10)
-        score += lane.priority
-        if tool_supported is True:
-            score += 40
-        elif probe_tool_calls and tool_supported is False:
-            score -= 30
+            tool_supported, tool_reason = tool_probe_result(
+                cfg, lane, selected_model, previous_lanes.get(key) if reuse_probe else None
+            )
+        score = subagent_score(lane, healthy, models, tool_supported, probe_tool_calls)
 
         lane_record = {
             "lane": lane.name,
@@ -225,8 +229,12 @@ def build_inventory_report(
     return inventory
 
 
+def capability_cache_path(cfg: Dict[str, Any]) -> Path:
+    return Path(cfg["execution"].get("capability_cache_file", "logs/capability-cache.json"))
+
+
 def maybe_refresh_capability_cache(cfg: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
-    cache_path = Path(cfg["execution"].get("capability_cache_file", "logs/capability-cache.json"))
+    cache_path = capability_cache_path(cfg)
     auto_refresh = bool(cfg["execution"].get("auto_refresh_capability_cache", True))
     max_age_seconds = int(cfg["execution"].get("capability_cache_max_age_seconds", 600))
 

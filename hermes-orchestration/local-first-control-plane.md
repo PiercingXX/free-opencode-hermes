@@ -71,6 +71,10 @@ The common failure mode is expecting tool execution from plain text generation.
 - To actually run returned shell actions, both must be true:
   - `config/orchestration.json` has `execution.allow_shell_execution` set to `true`
   - command is launched with `--execute-approved`
+- Test runners (`python3 -m pytest`, `npm test`, `make`, ...) execute
+  repository-controlled code and are refused unless
+  `execution.allow_repo_code_execution` is also `true` (and the runner is in
+  `execution.allowed_command_prefixes`).
 
 Example:
 
@@ -117,13 +121,14 @@ python3 scripts/hermes_orchestrator.py subagents --task "check one||check two"
   whole argv tokens against the allowlist, screened argument-by-argument against
   a denylist of process-spawning/escape flags with every path argument confined
   to the working directory, and executed without a shell. The shipped allowlist
-  deliberately excludes `find` and `rg`. See the README section "Executable
+  deliberately excludes `find`, `rg` and repo-code test runners. See the README section "Executable
   plans and command execution" for the residual limits — this is defense in
   depth behind the double gate, not a sandbox.
 - The `serve` command exposes a loopback-only OpenAI-compatible proxy
   (`/healthz`, `/v1/models`, `/v1/chat/completions`) that enforces this routing
-  policy; it requires a bearer token and excludes cloud lanes unless explicitly
-  allowed. Lane health on the proxied path is memoized for
+  policy; it requires a bearer token, refuses non-loopback binds without auth
+  (and with auth unless `--allow-remote` is passed), and excludes cloud lanes
+  unless explicitly allowed. Lane health on the proxied path is memoized for
   `proxy.health_check_ttl_seconds` (default 30s) rather than probed per request.
 - The `bench` command produces qualification-matrix-schema reports in
   `logs/bench/`.

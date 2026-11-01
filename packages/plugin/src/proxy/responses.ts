@@ -28,6 +28,24 @@ export function argumentsText(value: unknown): string {
 
 export type SanitizedToolCall = { name: string; arguments: string };
 
+/** Required field → safe default for explore tools a weak model calls empty. */
+const REQUIRED_ARG_DEFAULTS: Record<string, [field: string, fallback: string]> = {
+  glob: ["pattern", "*"],
+  list: ["path", "."],
+  bash: ["command", "ls -la"],
+  shell: ["command", "ls -la"],
+};
+
+function parseArgumentsObject(text: string): JsonObject {
+  if (!text || text === "{}") return {};
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Weak models emit glob/read/bash with no required fields. OpenCode aborts those
  * calls and the model retries forever. Fill explore defaults. Empty `read` becomes
@@ -37,45 +55,27 @@ export function sanitizeToolCall(name: string, raw: unknown): SanitizedToolCall 
   const tool = name.trim();
   if (!tool) return null;
   const lowered = tool.toLowerCase();
-  let parsed: JsonObject = {};
   const text = argumentsText(raw);
-  if (text && text !== "{}") {
-    try {
-      const value: unknown = JSON.parse(text);
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        parsed = value as JsonObject;
-      }
-    } catch {
-      parsed = {};
-    }
-  }
+  const parsed = parseArgumentsObject(text);
+  const withArgs = (): SanitizedToolCall => ({ name: tool, arguments: JSON.stringify(parsed) });
 
-  if (lowered === "glob") {
-    if (!nonemptyString(parsed.pattern)) parsed.pattern = "*";
-    return { name: tool, arguments: JSON.stringify(parsed) };
-  }
-  if (lowered === "list") {
-    if (!nonemptyString(parsed.path)) parsed.path = ".";
-    return { name: tool, arguments: JSON.stringify(parsed) };
+  const required = REQUIRED_ARG_DEFAULTS[lowered];
+  if (required) {
+    const [field, fallback] = required;
+    if (!nonemptyString(parsed[field])) parsed[field] = fallback;
+    return withArgs();
   }
   if (lowered === "read") {
     const path = nonemptyString(parsed.filePath) || nonemptyString(parsed.path);
     if (!path) return { name: "glob", arguments: JSON.stringify({ pattern: "*" }) };
     parsed.filePath = path;
-    return { name: tool, arguments: JSON.stringify(parsed) };
+    return withArgs();
   }
-  if (lowered === "bash" || lowered === "shell") {
-    if (!nonemptyString(parsed.command)) parsed.command = "ls -la";
-    return { name: tool, arguments: JSON.stringify(parsed) };
-  }
-  if (lowered === "grep") {
-    if (!nonemptyString(parsed.pattern)) return null;
-    return { name: tool, arguments: JSON.stringify(parsed) };
-  }
+  if (lowered === "grep") return nonemptyString(parsed.pattern) ? withArgs() : null;
   return { name: tool, arguments: text || "{}" };
 }
 
-/** @deprecated use sanitizeToolCall — kept for tests and the plugin hook. */
+/** @deprecated use sanitizeToolCall — kept for existing tests. */
 export function sanitizeToolCallArguments(name: string, raw: string): string | null {
   return sanitizeToolCall(name, raw)?.arguments ?? null;
 }
@@ -391,6 +391,15 @@ export function extractToolCallsFromText(text: string): {
   return { calls, text: remainder };
 }
 
+function reasoningInputText(rec: JsonObject): string {
+  if (typeof rec.content === "string") return rec.content;
+  if (!Array.isArray(rec.summary)) return "";
+  return rec.summary
+    .map((part) => asRecord(part).text)
+    .filter((text): text is string => typeof text === "string")
+    .join("");
+}
+
 /**
  * Consecutive `function_call` items become one
  * assistant message with `tool_calls`. OpenAI Chat rejects a tool result that
@@ -410,14 +419,19 @@ export function inputToMessages(input: unknown): Array<Record<string, unknown>> 
     return null;
   };
 
+  /** Reasoning items attach to the next assistant turn, as Chat's `reasoning_content`. */
+  const withPendingReasoning = (message: Record<string, unknown>): Record<string, unknown> => {
+    if (pendingReasoning) {
+      message.reasoning_content = pendingReasoning;
+      pendingReasoning = "";
+    }
+    return message;
+  };
+
   const addToolCall = (name: string, callId: string, args: unknown): void => {
     let message = lastToolCallMessage();
     if (!message) {
-      message = { role: "assistant", content: "", tool_calls: [] };
-      if (pendingReasoning) {
-        message.reasoning_content = pendingReasoning;
-        pendingReasoning = "";
-      }
+      message = withPendingReasoning({ role: "assistant", content: "", tool_calls: [] });
       messages.push(message);
     }
     const calls = message.tool_calls as Array<Record<string, unknown>>;
@@ -438,14 +452,7 @@ export function inputToMessages(input: unknown): Array<Record<string, unknown>> 
     const role = typeof rec.role === "string" ? rec.role : "user";
 
     if (type === "reasoning") {
-      const summary = rec.summary;
-      if (typeof rec.content === "string") pendingReasoning += rec.content;
-      else if (Array.isArray(summary)) {
-        for (const part of summary) {
-          const text = asRecord(part).text;
-          if (typeof text === "string") pendingReasoning += text;
-        }
-      }
+      pendingReasoning += reasoningInputText(rec);
       continue;
     }
 
@@ -483,12 +490,7 @@ export function inputToMessages(input: unknown): Array<Record<string, unknown>> 
       }
       const content = flattenContent(rec.content ?? rec.text);
       if (content === "" || content == null) continue;
-      const message: Record<string, unknown> = { role, content };
-      if (pendingReasoning) {
-        message.reasoning_content = pendingReasoning;
-        pendingReasoning = "";
-      }
-      messages.push(message);
+      messages.push(withPendingReasoning({ role, content }));
       continue;
     }
 
@@ -684,14 +686,7 @@ export function chatJsonToResponses(
   };
 }
 
-type ToolAccum = {
-  id: string;
-  call_id: string;
-  name: string;
-  arguments: string;
-  added: boolean;
-  outputIndex: number;
-};
+type ToolAccum = FunctionCallItem & { outputIndex: number };
 
 type StreamDelta = {
   content?: unknown;
@@ -708,6 +703,10 @@ type StreamDelta = {
   function_call?: { name?: string; arguments?: unknown };
 };
 
+type ChatChunk = { choices?: Array<{ delta?: StreamDelta; message?: JsonObject }> };
+
+type ToolPatch = { call_id?: string; name?: string; arguments?: unknown };
+
 function appendArguments(current: string, next: unknown): string {
   if (next == null) return current;
   if (typeof next === "object") return JSON.stringify(next);
@@ -720,97 +719,177 @@ function assistantTextFromDelta(content: unknown): string {
   return "";
 }
 
-export async function* chatStreamToResponses(
-  stream: ReadableStream<Uint8Array>,
-  publicModel: string,
-  responseId: string
-): AsyncGenerator<string> {
-  const sequence = { n: 0 };
-  const responseBase = {
-    id: responseId,
-    object: "response",
-    status: "in_progress",
-    model: publicModel,
-    output: [] as JsonObject[],
-  };
-  yield sse("response.created", { type: "response.created", response: responseBase }, sequence);
-  yield sse(
-    "response.in_progress",
-    { type: "response.in_progress", response: responseBase },
-    sequence
-  );
+/** One Chat Completions SSE line → parsed chunk; null for comments, `[DONE]`, and junk. */
+function parseChatSseLine(line: string): ChatChunk | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("data:")) return null;
+  const payload = trimmed.slice(5).trim();
+  if (payload === "[DONE]") return null;
+  try {
+    return JSON.parse(payload) as ChatChunk;
+  } catch {
+    return null;
+  }
+}
 
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let text = "";
-  let reasoning = "";
-  let messageAdded = false;
-  let textPartAdded = false;
-  let reasoningAdded = false;
-  let nextOutputIndex = 0;
-  let messageOutputIndex = 0;
-  let reasoningOutputIndex = 0;
-  const tools = new Map<number, ToolAccum>();
+/**
+ * Chat Completions deltas → Responses API SSE events. Reasoning and text stream
+ * live; tool calls are buffered and emitted at the end, after sanitizing,
+ * because weak models stream partial or empty arguments.
+ */
+class ResponsesStreamTranslator {
+  private readonly sequence = { n: 0 };
+  private nextOutputIndex = 0;
+  private text = "";
+  private reasoning = "";
+  private reasoningIndex: number | null = null;
+  private messageIndex: number | null = null;
+  private textPartAdded = false;
+  private readonly tools = new Map<number, ToolAccum>();
 
-  const ensureReasoning = function* (): Generator<string> {
-    if (reasoningAdded) return;
-    reasoningAdded = true;
-    reasoningOutputIndex = nextOutputIndex++;
-    yield sse(
-      "response.output_item.added",
-      {
-        type: "response.output_item.added",
-        output_index: reasoningOutputIndex,
-        item: reasoningItem(responseId, ""),
-      },
-      sequence
+  constructor(
+    private readonly responseId: string,
+    private readonly publicModel: string
+  ) {}
+
+  private get messageId(): string {
+    return `${this.responseId}_msg`;
+  }
+
+  private get reasoningId(): string {
+    return `${this.responseId}_reasoning`;
+  }
+
+  private event(type: string, fields: JsonObject): string {
+    return sse(type, { type, ...fields }, this.sequence);
+  }
+
+  start(): string[] {
+    const response = {
+      id: this.responseId,
+      object: "response",
+      status: "in_progress",
+      model: this.publicModel,
+      output: [],
+    };
+    return [
+      this.event("response.created", { response }),
+      this.event("response.in_progress", { response }),
+    ];
+  }
+
+  ingestChunk(chunk: ChatChunk): string[] {
+    const choice = chunk.choices?.[0];
+    if (choice?.message) this.ingestMessageToolCalls(asRecord(choice.message));
+    const delta = choice?.delta;
+    if (!delta) return [];
+    const out: string[] = [];
+    const reasoningDelta = delta.reasoning_content ?? delta.reasoning;
+    if (reasoningDelta) out.push(...this.reasoningDelta(reasoningDelta));
+    const contentDelta = assistantTextFromDelta(delta.content);
+    if (contentDelta) out.push(...this.textDelta(contentDelta));
+    if (delta.function_call) {
+      this.ingestToolDelta(0, {
+        name: delta.function_call.name,
+        arguments: delta.function_call.arguments,
+      });
+    }
+    for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const fn = call.function ?? call;
+      this.ingestToolDelta(typeof call.index === "number" ? call.index : 0, {
+        call_id: call.id,
+        name: fn.name ?? call.name,
+        arguments: fn.arguments ?? call.arguments,
+      });
+    }
+    return out;
+  }
+
+  /** Some servers ignore `stream` and answer with one JSON body (no trailing newline). */
+  ingestTrailingJson(leftover: string): void {
+    if (!leftover.trim().startsWith("{")) return;
+    try {
+      const choice = (JSON.parse(leftover) as ChatChunk).choices?.[0];
+      if (choice?.message) this.ingestMessageToolCalls(asRecord(choice.message));
+    } catch {
+      // leftover was not a full chat completion
+    }
+  }
+
+  finish(): string[] {
+    const out = this.finishReasoning();
+    this.adoptToolCallsFromText();
+    const tools = this.sanitizedTools();
+    for (const tool of tools) out.push(...this.toolEvents(tool));
+    out.push(...this.finishMessage());
+    out.push(this.event("response.completed", { response: this.completedResponse(tools) }));
+    return out;
+  }
+
+  private reasoningDelta(delta: string): string[] {
+    const out: string[] = [];
+    this.reasoning += delta;
+    if (this.reasoningIndex === null) {
+      this.reasoningIndex = this.nextOutputIndex++;
+      out.push(
+        this.event("response.output_item.added", {
+          output_index: this.reasoningIndex,
+          item: reasoningItem(this.responseId, ""),
+        })
+      );
+    }
+    out.push(
+      this.event("response.reasoning_text.delta", {
+        item_id: this.reasoningId,
+        output_index: this.reasoningIndex,
+        delta,
+      })
     );
-  };
+    return out;
+  }
 
-  const ensureMessage = function* (): Generator<string> {
-    if (messageAdded) return;
-    messageAdded = true;
-    messageOutputIndex = nextOutputIndex++;
-    yield sse(
-      "response.output_item.added",
-      {
-        type: "response.output_item.added",
-        output_index: messageOutputIndex,
-        item: {
-          type: "message",
-          id: `${responseId}_msg`,
-          role: "assistant",
-          status: "in_progress",
-          content: [],
-        },
-      },
-      sequence
-    );
-  };
-
-  const ensureTextPart = function* (): Generator<string> {
-    yield* ensureMessage();
-    if (textPartAdded) return;
-    textPartAdded = true;
-    yield sse(
-      "response.content_part.added",
-      {
-        type: "response.content_part.added",
-        output_index: messageOutputIndex,
+  private textDelta(delta: string): string[] {
+    const out: string[] = [];
+    this.text += delta;
+    if (this.messageIndex === null) {
+      this.messageIndex = this.nextOutputIndex++;
+      out.push(
+        this.event("response.output_item.added", {
+          output_index: this.messageIndex,
+          item: {
+            type: "message",
+            id: this.messageId,
+            role: "assistant",
+            status: "in_progress",
+            content: [],
+          },
+        })
+      );
+    }
+    if (!this.textPartAdded) {
+      this.textPartAdded = true;
+      out.push(
+        this.event("response.content_part.added", {
+          output_index: this.messageIndex,
+          content_index: 0,
+          item_id: this.messageId,
+          part: { type: "output_text", text: "" },
+        })
+      );
+    }
+    out.push(
+      this.event("response.output_text.delta", {
+        item_id: this.messageId,
+        output_index: this.messageIndex,
         content_index: 0,
-        item_id: `${responseId}_msg`,
-        part: { type: "output_text", text: "" },
-      },
-      sequence
+        delta,
+      })
     );
-  };
+    return out;
+  }
 
-  const ingestToolDelta = (
-    index: number,
-    patch: { call_id?: string; name?: string; arguments?: unknown }
-  ): void => {
-    let tool = tools.get(index);
+  private ingestToolDelta(index: number, patch: ToolPatch): void {
+    let tool = this.tools.get(index);
     if (!tool) {
       const callId = patch.call_id || `call_${index}`;
       tool = {
@@ -818,285 +897,171 @@ export async function* chatStreamToResponses(
         call_id: callId,
         name: patch.name || "",
         arguments: "",
-        added: false,
-        outputIndex: nextOutputIndex++,
+        outputIndex: this.nextOutputIndex++,
       };
-      tools.set(index, tool);
+      this.tools.set(index, tool);
     }
     if (patch.call_id) {
       tool.call_id = patch.call_id;
       tool.id = `fc_${patch.call_id}`;
     }
     if (patch.name) tool.name = patch.name;
-    if (patch.arguments !== undefined)
+    if (patch.arguments !== undefined) {
       tool.arguments = appendArguments(tool.arguments, patch.arguments);
-  };
+    }
+  }
 
-  const ingestMessageToolCalls = (message: JsonObject): void => {
+  private ingestMessageToolCalls(message: JsonObject): void {
     for (const [index, item] of collectRawToolCalls(message).entries()) {
-      ingestToolDelta(index, {
-        call_id: item.id,
-        name: item.name,
-        arguments: item.arguments,
+      this.ingestToolDelta(index, { call_id: item.id, name: item.name, arguments: item.arguments });
+    }
+  }
+
+  private finishReasoning(): string[] {
+    if (this.reasoningIndex === null) return [];
+    return [
+      this.event("response.reasoning_text.done", {
+        item_id: this.reasoningId,
+        output_index: this.reasoningIndex,
+        text: this.reasoning,
+      }),
+      this.event("response.output_item.done", {
+        output_index: this.reasoningIndex,
+        item: reasoningItem(this.responseId, this.reasoning),
+      }),
+    ];
+  }
+
+  /** Strip JSON/XML tool dumps from the text; they become real calls only if none streamed. */
+  private adoptToolCallsFromText(): void {
+    const extracted = extractToolCallsFromText(this.text);
+    if (extracted.calls.length === 0) return;
+    this.text = extracted.text;
+    if (this.tools.size > 0) return;
+    for (const [index, call] of extracted.calls.entries()) {
+      this.ingestToolDelta(index, {
+        call_id: `call_text_${index}`,
+        name: call.name,
+        arguments: call.arguments,
       });
     }
-  };
+  }
 
+  private sanitizedTools(): ToolAccum[] {
+    return [...this.tools.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .flatMap(([, tool]) => {
+        const sanitized = sanitizeToolCall(tool.name, tool.arguments);
+        if (!sanitized) return [];
+        tool.name = sanitized.name;
+        tool.arguments = sanitized.arguments;
+        return [tool];
+      });
+  }
+
+  // OpenAI Responses spec: add the item with empty arguments, then delta the JSON
+  // once. Putting arguments on both added and delta concatenates them and
+  // OpenCode aborts the unparseable call.
+  private toolEvents(tool: ToolAccum): string[] {
+    const out = [
+      this.event("response.output_item.added", {
+        output_index: tool.outputIndex,
+        item: functionCallItem(tool, "in_progress"),
+      }),
+    ];
+    if (tool.arguments) {
+      out.push(
+        this.event("response.function_call_arguments.delta", {
+          item_id: tool.id,
+          output_index: tool.outputIndex,
+          delta: tool.arguments,
+        })
+      );
+    }
+    out.push(
+      this.event("response.function_call_arguments.done", {
+        item_id: tool.id,
+        output_index: tool.outputIndex,
+        arguments: tool.arguments,
+      }),
+      this.event("response.output_item.done", {
+        output_index: tool.outputIndex,
+        item: functionCallItem(tool, "completed"),
+      })
+    );
+    return out;
+  }
+
+  private finishMessage(): string[] {
+    if (this.messageIndex === null) return [];
+    const out: string[] = [];
+    const text = this.text;
+    if (this.textPartAdded) {
+      out.push(
+        this.event("response.output_text.done", {
+          item_id: this.messageId,
+          output_index: this.messageIndex,
+          content_index: 0,
+          text,
+        }),
+        this.event("response.content_part.done", {
+          item_id: this.messageId,
+          output_index: this.messageIndex,
+          content_index: 0,
+          part: { type: "output_text", text },
+        })
+      );
+    }
+    out.push(
+      this.event("response.output_item.done", {
+        output_index: this.messageIndex,
+        item: messageItem(this.responseId, text),
+      })
+    );
+    return out;
+  }
+
+  private completedResponse(tools: ToolAccum[]): JsonObject {
+    const message = {
+      content: this.text,
+      reasoning_content: this.reasoning || undefined,
+      tool_calls: tools.map((tool) => ({
+        id: tool.call_id,
+        type: "function",
+        function: { name: tool.name, arguments: tool.arguments },
+      })),
+    };
+    return chatJsonToResponses({ id: this.responseId, choices: [{ message }] }, this.publicModel);
+  }
+}
+
+export async function* chatStreamToResponses(
+  stream: ReadableStream<Uint8Array>,
+  publicModel: string,
+  responseId: string
+): AsyncGenerator<string> {
+  const translator = new ResponsesStreamTranslator(responseId, publicModel);
+  yield* translator.start();
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      buffer = buffer.replace(/\r\n/g, "\n");
-      const parts = buffer.split("\n");
-      buffer = parts.pop() ?? "";
-      for (const line of parts) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (payload === "[DONE]") continue;
-        let parsed: {
-          choices?: Array<{
-            delta?: StreamDelta;
-            message?: JsonObject;
-          }>;
-        };
-        try {
-          parsed = JSON.parse(payload) as typeof parsed;
-        } catch {
-          continue;
-        }
-        const choice = parsed.choices?.[0];
-        const delta = choice?.delta;
-        if (choice?.message) ingestMessageToolCalls(asRecord(choice.message));
-        if (!delta) continue;
-        const reasoningDelta = delta.reasoning_content ?? delta.reasoning;
-        if (reasoningDelta) {
-          reasoning += reasoningDelta;
-          yield* ensureReasoning();
-          yield sse(
-            "response.reasoning_text.delta",
-            {
-              type: "response.reasoning_text.delta",
-              item_id: `${responseId}_reasoning`,
-              output_index: reasoningOutputIndex,
-              delta: reasoningDelta,
-            },
-            sequence
-          );
-        }
-        const contentDelta = assistantTextFromDelta(delta.content);
-        if (contentDelta) {
-          text += contentDelta;
-          yield* ensureTextPart();
-          yield sse(
-            "response.output_text.delta",
-            {
-              type: "response.output_text.delta",
-              item_id: `${responseId}_msg`,
-              output_index: messageOutputIndex,
-              content_index: 0,
-              delta: contentDelta,
-            },
-            sequence
-          );
-        }
-        if (delta.function_call) {
-          ingestToolDelta(0, {
-            name: delta.function_call.name,
-            arguments: delta.function_call.arguments,
-          });
-        }
-        if (Array.isArray(delta.tool_calls)) {
-          for (const call of delta.tool_calls) {
-            const index = typeof call.index === "number" ? call.index : 0;
-            const fn = call.function ?? call;
-            ingestToolDelta(index, {
-              call_id: call.id,
-              name: fn.name ?? call.name,
-              arguments: fn.arguments ?? call.arguments,
-            });
-          }
-        }
+      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const chunk = parseChatSseLine(line);
+        if (chunk) yield* translator.ingestChunk(chunk);
       }
     }
   } finally {
     reader.releaseLock();
   }
 
-  if (buffer.trim().startsWith("{")) {
-    try {
-      const parsed = JSON.parse(buffer) as {
-        choices?: Array<{ message?: JsonObject; delta?: StreamDelta }>;
-      };
-      const choice = parsed.choices?.[0];
-      if (choice?.message) ingestMessageToolCalls(asRecord(choice.message));
-    } catch {
-      // leftover was not a full chat completion
-    }
-  }
-
-  if (reasoningAdded) {
-    yield sse(
-      "response.reasoning_text.done",
-      {
-        type: "response.reasoning_text.done",
-        item_id: `${responseId}_reasoning`,
-        output_index: reasoningOutputIndex,
-        text: reasoning,
-      },
-      sequence
-    );
-    yield sse(
-      "response.output_item.done",
-      {
-        type: "response.output_item.done",
-        output_index: reasoningOutputIndex,
-        item: reasoningItem(responseId, reasoning),
-      },
-      sequence
-    );
-  }
-
-  const extracted = extractToolCallsFromText(text);
-  if (tools.size === 0 && extracted.calls.length > 0) {
-    text = extracted.text;
-    for (const [index, call] of extracted.calls.entries()) {
-      ingestToolDelta(index, {
-        call_id: `call_text_${index}`,
-        name: call.name,
-        arguments: call.arguments,
-      });
-    }
-  } else if (extracted.calls.length > 0) {
-    text = extracted.text;
-  }
-
-  const orderedTools = [...tools.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map((entry) => entry[1])
-    .flatMap((tool) => {
-      const sanitized = sanitizeToolCall(tool.name, tool.arguments);
-      if (!sanitized) return [];
-      tool.name = sanitized.name;
-      tool.arguments = sanitized.arguments;
-      return [tool];
-    });
-
-  // OpenAI Responses spec: add the item with empty arguments, then delta the JSON
-  // once. Putting arguments on both added and delta concatenates them and
-  // OpenCode aborts the unparseable call.
-  for (const tool of orderedTools) {
-    const inProgress = functionCallItem(
-      { id: tool.id, call_id: tool.call_id, name: tool.name, arguments: tool.arguments },
-      "in_progress"
-    );
-    yield sse(
-      "response.output_item.added",
-      {
-        type: "response.output_item.added",
-        output_index: tool.outputIndex,
-        item: inProgress,
-      },
-      sequence
-    );
-    if (tool.arguments) {
-      yield sse(
-        "response.function_call_arguments.delta",
-        {
-          type: "response.function_call_arguments.delta",
-          item_id: tool.id,
-          output_index: tool.outputIndex,
-          delta: tool.arguments,
-        },
-        sequence
-      );
-    }
-    yield sse(
-      "response.function_call_arguments.done",
-      {
-        type: "response.function_call_arguments.done",
-        item_id: tool.id,
-        output_index: tool.outputIndex,
-        arguments: tool.arguments,
-      },
-      sequence
-    );
-    yield sse(
-      "response.output_item.done",
-      {
-        type: "response.output_item.done",
-        output_index: tool.outputIndex,
-        item: functionCallItem(
-          { id: tool.id, call_id: tool.call_id, name: tool.name, arguments: tool.arguments },
-          "completed"
-        ),
-      },
-      sequence
-    );
-  }
-
-  if (textPartAdded) {
-    yield sse(
-      "response.output_text.done",
-      {
-        type: "response.output_text.done",
-        item_id: `${responseId}_msg`,
-        output_index: messageOutputIndex,
-        content_index: 0,
-        text,
-      },
-      sequence
-    );
-    yield sse(
-      "response.content_part.done",
-      {
-        type: "response.content_part.done",
-        item_id: `${responseId}_msg`,
-        output_index: messageOutputIndex,
-        content_index: 0,
-        part: { type: "output_text", text },
-      },
-      sequence
-    );
-  }
-  if (messageAdded) {
-    yield sse(
-      "response.output_item.done",
-      {
-        type: "response.output_item.done",
-        output_index: messageOutputIndex,
-        item: messageItem(responseId, text),
-      },
-      sequence
-    );
-  }
-
-  const completed = chatJsonToResponses(
-    {
-      id: responseId,
-      choices: [
-        {
-          message: {
-            content: text,
-            reasoning_content: reasoning || undefined,
-            tool_calls: orderedTools.map((tool) => ({
-              id: tool.call_id,
-              type: "function",
-              function: { name: tool.name, arguments: tool.arguments },
-            })),
-          },
-        },
-      ],
-    },
-    publicModel
-  );
-  yield sse(
-    "response.completed",
-    {
-      type: "response.completed",
-      response: completed,
-    },
-    sequence
-  );
+  translator.ingestTrailingJson(buffer);
+  yield* translator.finish();
 }

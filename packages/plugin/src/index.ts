@@ -159,8 +159,7 @@ export const FreeOpenCodePlugin: Plugin = async () => {
                 ? "No local parallel lanes ready."
                 : lanes
                     .map(
-                      (lane) =>
-                        `${lane.agentName}\t${lane.wireModel}\tstrength=${lane.strength}`
+                      (lane) => `${lane.agentName}\t${lane.wireModel}\tstrength=${lane.strength}`
                     )
                     .join("\n");
             return {

@@ -2,8 +2,6 @@
 
 import fs from "node:fs";
 import os from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { atomicWriteTextFile } from "./io_runtime.js";
 import {
   PATH_CONSTANTS,
@@ -11,6 +9,7 @@ import {
   repoCompatFileCandidates,
   liveRegistryPath,
 } from "./runtime_constants.js";
+import { isDirectExecution } from "./entrypoint.js";
 
 type ModelMeta = {
   name?: string;
@@ -349,22 +348,10 @@ async function main(): Promise<void> {
   }
 }
 
-// --- Direct execution guard (same realpath pattern as cli.ts / index.ts) ---
+// --- Direct execution guard (entrypoint.ts) ---
 // Without it, importing this module from a test would run a live preflight.
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return fs.realpathSync(candidate);
-    } catch {
-      return path.resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`parallel-preflight failed: ${message}`);

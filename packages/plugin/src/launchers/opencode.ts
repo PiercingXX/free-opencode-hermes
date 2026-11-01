@@ -1,13 +1,14 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { writeFileAtomic } from "../fs-atomic.js";
 import { fccStyleAgentOverlay, stripNativePrimaryAgentFiles } from "../plugin/config.js";
-import { ensureProxyRunning } from "../plugin/lifecycle.js";
 import { OPENCODE_MIN_VERSION } from "../paths.js";
 import {
   binaryVersion,
   formatVersion,
+  orExit,
+  privateTempDir,
+  requireRunningProxy,
   resolveClientBinary,
   runClientProcess,
   versionAtLeast,
@@ -69,42 +70,18 @@ export async function launchOpenCode(argv: string[]): Promise<never> {
     );
   }
 
-  let proxy;
-  try {
-    proxy = await ensureProxyRunning();
-  } catch (error) {
-    console.error(
-      `Free OpenCode proxy is not reachable: ${error instanceof Error ? error.message : String(error)}`
-    );
-    console.error("Start it with: free-opencode start");
-    process.exit(1);
-  }
-
-  let config;
-  try {
+  const proxy = await requireRunningProxy();
+  const config = await orExit("Could not prepare the OpenCode model catalog", async () => {
     const models = await fetchClientModels(proxy.url, proxy.token);
-    config = buildOpenCodeConfig(models, proxy.url);
-    config.overlay.agent = fccStyleAgentOverlay();
-    config.overlay.permission = { bash: "allow", edit: "allow" };
-  } catch (error) {
-    console.error(
-      `Could not prepare the OpenCode model catalog: ${error instanceof Error ? error.message : String(error)}`
-    );
-    process.exit(1);
-  }
+    const built = buildOpenCodeConfig(models, proxy.url);
+    built.overlay.agent = fccStyleAgentOverlay();
+    built.overlay.permission = { bash: "allow", edit: "allow" };
+    return built;
+  });
 
-  const tempDirectory = mkdtempSync(join(tmpdir(), "foc-opencode-"));
-  const cleanup = (): void => {
-    try {
-      rmSync(tempDirectory, { recursive: true, force: true });
-    } catch {
-      // best effort
-    }
-  };
-  process.on("exit", cleanup);
-  mkdirSync(tempDirectory, { recursive: true });
-  const configPath = join(tempDirectory, "opencode.json");
-  writeFileSync(configPath, `${JSON.stringify(config.file, null, 2)}\n`, "utf8");
+  const configPath = join(privateTempDir("foc-opencode-"), "opencode.json");
+  // Holds only an {env:…} key reference today, but keep it private regardless.
+  writeFileAtomic(configPath, `${JSON.stringify(config.file, null, 2)}\n`, 0o600);
 
   return runClientProcess(
     [binaryPath, ...argv],

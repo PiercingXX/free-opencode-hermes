@@ -10,7 +10,10 @@
  * upgrade does not split an existing stream.
  *
  * Telemetry is append-only JSONL (one JSON object per line).
- * The server log rotates to mcp-server.jsonl.1 when it exceeds 5 MB.
+ * The server log rotates to mcp-server.jsonl.1 when it exceeds 5 MB; each
+ * session log rotates to <id>.jsonl.1 past 2 MB. Session logs untouched for
+ * SESSION_LOG_RETENTION_DAYS, or beyond the newest MAX_SESSION_LOG_FILES, are
+ * pruned at startup and at most every SESSION_LOG_PRUNE_INTERVAL_MS.
  *
  * A write failure never propagates to the caller — telemetry is an observability
  * sink, and a full disk must not take down routing. It is no longer *silent*
@@ -21,7 +24,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, open, rename, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
@@ -52,11 +55,19 @@ function serverLogPath(): string {
   return join(resolveLogDir(), "mcp-server.jsonl");
 }
 const MAX_SERVER_LOG_BYTES = 5 * 1024 * 1024; // 5 MB
+/** Per-session log cap; one rotated generation (`.1`) is kept beside it. */
+export const MAX_SESSION_LOG_BYTES = 2 * 1024 * 1024;
+/** Session log files (current + rotated) whose mtime is older than this are deleted. */
+export const SESSION_LOG_RETENTION_DAYS = 14;
+/** At most this many session log files are kept; the oldest beyond it are deleted. */
+export const MAX_SESSION_LOG_FILES = 500;
+/** A long-lived server re-prunes at most this often. */
+const SESSION_LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** A session log filename is capped so a long id cannot trip ENAMETOOLONG. */
 const MAX_SESSION_FILENAME_LENGTH = 128;
 
 /**
- * Test seam for the five filesystem calls telemetry makes.
+ * Test seam for the filesystem calls telemetry makes.
  *
  * The failure paths below are the whole point of this module's contract, and
  * they are unreachable from a test that is not allowed to break the user's real
@@ -67,7 +78,7 @@ const MAX_SESSION_FILENAME_LENGTH = 128;
  * the file's last byte, and a check that bypasses the seam is a check no test
  * with the existing doubles can reach.
  */
-export const __logIo = { mkdir, appendFile, open, rename, stat };
+export const __logIo = { mkdir, appendFile, open, rename, stat, readdir, unlink };
 
 let dirEnsured = false;
 
@@ -141,15 +152,66 @@ async function ensureLogDir(): Promise<void> {
   dirEnsured = true;
 }
 
-async function rotateLargeLog(logPath: string): Promise<void> {
+async function rotateLargeLog(logPath: string, maxBytes: number): Promise<void> {
   try {
     const s = await __logIo.stat(logPath);
-    if (s.size > MAX_SERVER_LOG_BYTES) {
+    if (s.size > maxBytes) {
       await __logIo.rename(logPath, `${logPath}.1`);
     }
   } catch {
     // file does not exist yet — nothing to rotate
   }
+}
+
+let lastPruneAt = 0;
+
+/**
+ * Delete session logs past retention: anything not modified within
+ * SESSION_LOG_RETENTION_DAYS, then the oldest files beyond
+ * MAX_SESSION_LOG_FILES. Best-effort — pruning is housekeeping and never fails
+ * or slows a caller's event beyond one directory scan. Returns the number of
+ * files removed.
+ */
+export async function pruneSessionLogs(now: number = Date.now()): Promise<number> {
+  lastPruneAt = now;
+  const dir = sessionsDir();
+  let names: string[];
+  try {
+    names = (await __logIo.readdir(dir)).map(String);
+  } catch {
+    return 0;
+  }
+  const files: Array<{ path: string; mtimeMs: number }> = [];
+  for (const name of names) {
+    if (!/\.jsonl(\.1)?$/.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      const mtimeMs = Number((await __logIo.stat(path)).mtimeMs);
+      if (Number.isFinite(mtimeMs)) files.push({ path, mtimeMs });
+    } catch {
+      // vanished between readdir and stat
+    }
+  }
+  const cutoff = now - SESSION_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
+  const doomed = files.filter(
+    (file, index) => file.mtimeMs < cutoff || index >= MAX_SESSION_LOG_FILES
+  );
+  let removed = 0;
+  for (const file of doomed) {
+    try {
+      await __logIo.unlink(file.path);
+      removed += 1;
+    } catch {
+      // already gone, or not ours to delete — skip
+    }
+  }
+  return removed;
+}
+
+async function maybePruneSessionLogs(): Promise<void> {
+  if (Date.now() - lastPruneAt < SESSION_LOG_PRUNE_INTERVAL_MS) return;
+  await pruneSessionLogs();
 }
 
 /**
@@ -247,7 +309,7 @@ export async function logEvent(
       // The check sits AFTER rotation on purpose: `rotateLargeLog` renames the
       // oversized file away, so the file this append lands in is size 0 and a
       // hoisted check would have measured the wrong file.
-      await rotateLargeLog(serverLog);
+      await rotateLargeLog(serverLog, MAX_SERVER_LOG_BYTES);
       const heal = (await needsLeadingNewline(serverLog)) ? "\n" : "";
       // The healing newline rides in the SAME append call. A separate append
       // re-opens the exact tear window it is closing.
@@ -255,8 +317,12 @@ export async function logEvent(
     } else {
       const sessionLog = resolveSessionLogPath(stream.session);
       if (sessionLog === null) return { ok: false, outcome: "skipped" };
+      // Same ordering rule as the server log: rotate, then measure the file
+      // the append will actually land in.
+      await rotateLargeLog(sessionLog, MAX_SESSION_LOG_BYTES);
       const heal = (await needsLeadingNewline(sessionLog)) ? "\n" : "";
       await __logIo.appendFile(sessionLog, heal + line, "utf-8");
+      await maybePruneSessionLogs();
     }
   } catch (error) {
     // Telemetry must never fail a caller's operation. It must also never be
@@ -272,13 +338,14 @@ export async function logEvent(
 }
 
 /**
- * Called once at server startup to ensure the log directory exists and rotate
- * the server log if it is already oversized.
+ * Called once at server startup to ensure the log directory exists, rotate
+ * the server log if it is already oversized, and prune expired session logs.
  */
 export async function initServerLog(): Promise<LogEventResult> {
   try {
     await ensureLogDir();
-    await rotateLargeLog(serverLogPath());
+    await rotateLargeLog(serverLogPath(), MAX_SERVER_LOG_BYTES);
+    await pruneSessionLogs();
   } catch (error) {
     // Non-fatal, but recorded and announced — a log directory that cannot be
     // created at startup used to be completely invisible.

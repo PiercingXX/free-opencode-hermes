@@ -1,14 +1,27 @@
-import { chmodSync, existsSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { guardedExecFile } from "./execution_policy.js";
-import { jsonContent } from "./agent_tool_helpers.js";
+import {
+  ALLOW_ANY_CWD_ENV,
+  envFlagEnabled,
+  isPathWithinRoot,
+  jsonContent,
+} from "./agent_tool_helpers.js";
 import { compactOutput } from "./output_compaction.js";
-import { redactSecrets } from "./supervisor_completion_tools.js";
+import { redactSecrets } from "./secret_redaction.js";
 import { toolAnnotations } from "./observability_tools.js";
 
 // --- Capture-then-truncate -------------------------------------------------
@@ -35,6 +48,166 @@ const RUN_TIMEOUT_MS = 120_000;
 
 interface VerifyEditDeps {
   allowedCommands: string[];
+  /**
+   * Root every `cwd` and path-like argument must stay inside. Defaults to the
+   * server launch directory (`process.cwd()`, read per call) — the same
+   * boundary the memory tools use. `XX_STACK_ALLOW_ANY_CWD=1` lifts it.
+   */
+  workspaceRoot?: string;
+}
+
+// --- Verification-shaped invocations only ----------------------------------
+//
+// The execution-policy allowlist answers "which binary"; it cannot answer
+// "doing what". `node /tmp/payload.js`, `npx some-typosquat`, and
+// `cat ~/.ssh/id_rsa` all pass a binary allowlist, so verify_edit additionally
+// requires the invocation to look like a verification step, and confines the
+// cwd and every path-like argument to the workspace. The commands themselves
+// still run project code (that is what a test suite is), but only code that
+// lives in the workspace the agent is already editing.
+
+/** `npx <tool>`: linters, type checkers, formatters, test runners. */
+const NPX_VERIFY_TOOLS = new Set(["tsc", "eslint", "prettier", "vitest", "jest", "mocha", "biome"]);
+
+/** `npm <subcommand>`: run the project's own test/script entry points. */
+const NPM_VERIFY_SUBCOMMANDS = new Set(["test", "t", "run", "run-script"]);
+
+/** npm flags that swap the interpreter or inject code into every script. */
+const NPM_FORBIDDEN_FLAG = /^--(script-shell|node-options)(=|$)/;
+
+/** node flags that evaluate inline code rather than a workspace file. */
+const NODE_FORBIDDEN_FLAG = /^(-e|-p|--eval|--print)(=|$)/;
+
+/** Scheme-like values (`data:`, `http://`) are code or remote fetches, never workspace paths. */
+const URL_LIKE_SEGMENT = /^[a-z][a-z0-9+.-]*:/i;
+
+const VERIFY_SHAPE_REMEDIATION =
+  "verify_edit only runs verification-shaped commands: `npm test`, `npm run <script>`, `npx tsc|eslint|prettier|vitest|jest|mocha|biome ...`, `node --test ...`, `ruff ...`, `pytest ...` — with every path inside the workspace.";
+
+interface VerifyPolicyDenial {
+  ok: false;
+  reasonCode: string;
+  detail: string;
+}
+
+type VerifyPolicyResult = { ok: true; command: string; args: string[] } | VerifyPolicyDenial;
+
+function shapeDenied(reasonCode: string, detail: string): VerifyPolicyResult {
+  return { ok: false, reasonCode, detail };
+}
+
+/**
+ * Check that `command args` is a verification-shaped invocation, returning the
+ * argv to actually run (npx gains `--no-install` so a missing tool can never
+ * be fetched from the registry under a squatted name).
+ */
+export function checkVerifyInvocation(command: string, args: string[]): VerifyPolicyResult {
+  if (command.includes("/") || command.includes("\\")) {
+    return shapeDenied("verify_command_path", `command must be a bare name, got ${command}`);
+  }
+  switch (command) {
+    case "npm": {
+      const sub = args[0];
+      if (sub === undefined || !NPM_VERIFY_SUBCOMMANDS.has(sub)) {
+        return shapeDenied("verify_npm_subcommand", `npm ${sub ?? ""} is not a verification step`);
+      }
+      if (
+        (sub === "run" || sub === "run-script") &&
+        !args.slice(1).some((a) => !a.startsWith("-"))
+      ) {
+        return shapeDenied("verify_npm_subcommand", `npm ${sub} needs a script name`);
+      }
+      const forbidden = args.find((arg) => NPM_FORBIDDEN_FLAG.test(arg));
+      if (forbidden) return shapeDenied("verify_flag_forbidden", `npm flag ${forbidden}`);
+      return { ok: true, command, args };
+    }
+    case "npx": {
+      const tool = args[0];
+      if (tool === undefined || !NPX_VERIFY_TOOLS.has(tool)) {
+        return shapeDenied(
+          "verify_npx_tool",
+          `npx ${tool ?? ""} is not an allowed verification tool`
+        );
+      }
+      return { ok: true, command, args: ["--no-install", ...args] };
+    }
+    case "node": {
+      if (args[0] !== "--test") {
+        return shapeDenied("verify_node_shape", "node is only allowed as `node --test ...`");
+      }
+      const forbidden = args.find((arg) => NODE_FORBIDDEN_FLAG.test(arg));
+      if (forbidden) return shapeDenied("verify_flag_forbidden", `node flag ${forbidden}`);
+      return { ok: true, command, args };
+    }
+    default:
+      // ruff, pytest, or anything else the operator allowlisted: the
+      // execution policy decides on the binary, path confinement on the args.
+      return { ok: true, command, args };
+  }
+}
+
+/** realpath of the longest existing ancestor, with the missing tail re-appended. */
+function realpathLenient(path: string): string {
+  const absolute = resolve(path);
+  const missing: string[] = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...missing.reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return absolute;
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** Sub-values of an argument that name a path: `--config=a/b`, `a.js,b.js`, `x:./y`. */
+function pathLikeSegments(arg: string): string[] {
+  return arg
+    .split(/[=,]/)
+    .filter(
+      (segment) => segment.includes("/") || segment.startsWith(".") || segment.startsWith("~")
+    );
+}
+
+/**
+ * Confine `cwd` and every path-like argument to `root` (symlinks resolved, so
+ * a link pointing out of the workspace does not count as inside it).
+ */
+export function confineVerifyPaths(
+  rawCwd: string,
+  args: string[],
+  root: string
+): { ok: true; cwd: string } | VerifyPolicyDenial {
+  const realRoot = realpathLenient(root);
+  const cwd = resolve(realRoot, rawCwd.trim());
+  if (envFlagEnabled(ALLOW_ANY_CWD_ENV)) return { ok: true, cwd };
+  const realCwd = realpathLenient(cwd);
+  if (!isPathWithinRoot(realCwd, realRoot)) {
+    return {
+      ok: false,
+      reasonCode: "cwd_outside_workspace",
+      detail: `cwd ${cwd} is outside the workspace ${realRoot}`,
+    };
+  }
+  for (const arg of args) {
+    for (const segment of pathLikeSegments(arg)) {
+      if (segment.startsWith("~") || URL_LIKE_SEGMENT.test(segment)) {
+        return { ok: false, reasonCode: "path_outside_workspace", detail: `argument ${arg}` };
+      }
+      const target = isAbsolute(segment) ? segment : resolve(realCwd, segment);
+      if (!isPathWithinRoot(realpathLenient(target), realRoot)) {
+        return {
+          ok: false,
+          reasonCode: "path_outside_workspace",
+          detail: `argument ${arg} resolves outside the workspace ${realRoot}`,
+        };
+      }
+    }
+  }
+  return { ok: true, cwd: realCwd };
 }
 
 // --- Could-not-run is not a failure ----------------------------------------
@@ -336,9 +509,13 @@ export function registerVerifyEditTools(server: McpServer, deps: VerifyEditDeps)
     "verify_edit",
     {
       description:
-        "After an edit, run the project's linter and/or tests and return structured pass/fail with failure payload for a continuation prompt. Each result carries an `outcome` of pass | fail | could_not_run | denied with a machine-readable `reasonCode`: 'could_not_run' means this lane could not execute the command (missing binary, missing node_modules, bad cwd, timeout) and is NOT evidence about the code, and carries a one-sentence `remediation`. Commands are split on whitespace and run as argv with no shell, so quoted arguments cannot be expressed (a denial with reasonCode 'hook_arg_pattern_blocked' says so in `remediation`). Output is captured in full, returned as a bounded head+tail view with secrets redacted, and the complete unredacted capture is kept at fullOutputPath when truncated. Shells out through the execution-policy gate.",
+        "After an edit, run the project's linter and/or tests and return structured pass/fail with failure payload for a continuation prompt. Each result carries an `outcome` of pass | fail | could_not_run | denied with a machine-readable `reasonCode`: 'could_not_run' means this lane could not execute the command (missing binary, missing node_modules, bad cwd, timeout) and is NOT evidence about the code, and carries a one-sentence `remediation`. Commands are split on whitespace and run as argv with no shell, so quoted arguments cannot be expressed (a denial with reasonCode 'hook_arg_pattern_blocked' says so in `remediation`). Output is captured in full, returned as a bounded head+tail view with secrets redacted, and the complete unredacted capture is kept at fullOutputPath when truncated. Only verification-shaped commands run (npm test, npm run <script>, npx tsc|eslint|prettier|vitest|jest|mocha|biome, node --test, ruff, pytest), with cwd and every path argument confined to the workspace; anything else is denied with a verify_* or *_outside_workspace reasonCode. Shells out through the execution-policy gate.",
       inputSchema: {
-        cwd: z.string().describe("Working directory for the commands"),
+        cwd: z
+          .string()
+          .describe(
+            "Working directory for the commands; must lie inside the workspace (server launch directory)"
+          ),
         lintCmd: z
           .string()
           .optional()
@@ -437,19 +614,35 @@ export function registerVerifyEditTools(server: McpServer, deps: VerifyEditDeps)
           : { ...classification, output: text, truncated: true };
       };
 
-      if (lintCmd) {
-        const parts = lintCmd.split(/\s+/);
-        const command = parts[0]!;
-        const args = parts.slice(1);
-        result.lint = toResult("lint", await runCommand(command, args, cwd, deps.allowedCommands));
-      }
+      const root = deps.workspaceRoot ?? process.cwd();
+      /** Split, shape-check, confine, run. Whitespace-only commands are treated as absent. */
+      const runStep = async (
+        label: string,
+        commandLine: string | undefined
+      ): Promise<CmdResult | null> => {
+        const parts = (commandLine ?? "").trim().split(/\s+/).filter(Boolean);
+        if (parts.length === 0) return null;
+        const [command, ...args] = parts as [string, ...string[]];
+        const deny = (denial: VerifyPolicyDenial): CmdResult =>
+          toResult(label, {
+            ok: false,
+            full: `verify_policy_denied:${denial.reasonCode}: ${denial.detail}`,
+            outcome: "denied",
+            reasonCode: denial.reasonCode,
+            remediation: VERIFY_SHAPE_REMEDIATION,
+          });
+        const shape = checkVerifyInvocation(command, args);
+        if (!shape.ok) return deny(shape);
+        const confined = confineVerifyPaths(cwd, args, root);
+        if (!confined.ok) return deny(confined);
+        return toResult(
+          label,
+          await runCommand(shape.command, shape.args, confined.cwd, deps.allowedCommands)
+        );
+      };
 
-      if (testCmd) {
-        const parts = testCmd.split(/\s+/);
-        const command = parts[0]!;
-        const args = parts.slice(1);
-        result.test = toResult("test", await runCommand(command, args, cwd, deps.allowedCommands));
-      }
+      result.lint = await runStep("lint", lintCmd);
+      result.test = await runStep("test", testCmd);
 
       if (compactResults.length > 0) {
         result.compacted = compactResults;

@@ -1,9 +1,7 @@
-import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 
-import { atomicWriteTextFile } from "./io_runtime.js";
-import { isMissingFileError, StoreAccessError } from "./supervisor_store_runtime.js";
+import { readJsonStoreDocument, writeJsonStoreDocument } from "./supervisor_store_runtime.js";
 import {
   canaryCommandFor,
   type BaselineRef,
@@ -162,50 +160,21 @@ export function getFindingStatePath(): string {
   return resolve(homedir(), ".config/opencode/xx-stack-finding-state.json");
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export async function readFindingStore(): Promise<FindingStore> {
-  const path = getFindingStatePath();
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf-8");
-  } catch (error) {
-    if (isMissingFileError(error)) return emptyFindingStore();
-    throw new StoreAccessError("finding", path, error);
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new StoreAccessError("finding", path, error);
-  }
-
-  if (!isPlainRecord(parsed)) {
-    throw new StoreAccessError("finding", path, new Error("store root is not a JSON object"));
-  }
-  const findings = parsed.findings;
-  const generations = parsed.generations;
-  if (findings !== undefined && !isPlainRecord(findings)) {
-    throw new StoreAccessError("finding", path, new Error("findings is not a JSON object"));
-  }
-  if (generations !== undefined && !isPlainRecord(generations)) {
-    throw new StoreAccessError("finding", path, new Error("generations is not a JSON object"));
-  }
-
+  const parsed = await readJsonStoreDocument("finding", getFindingStatePath(), [
+    "findings",
+    "generations",
+  ]);
+  if (!parsed) return emptyFindingStore();
   return {
     version: FINDING_STORE_VERSION,
-    findings: (findings as FindingStore["findings"]) ?? {},
-    generations: (generations as FindingStore["generations"]) ?? {},
+    findings: (parsed.findings as FindingStore["findings"]) ?? {},
+    generations: (parsed.generations as FindingStore["generations"]) ?? {},
   };
 }
 
 export async function writeFindingStore(store: FindingStore): Promise<void> {
-  const path = getFindingStatePath();
-  await mkdir(dirname(path), { recursive: true });
-  await atomicWriteTextFile(path, JSON.stringify(store, null, 2) + "\n");
+  await writeJsonStoreDocument(getFindingStatePath(), store);
 }
 
 export function generateFindingId(): string {

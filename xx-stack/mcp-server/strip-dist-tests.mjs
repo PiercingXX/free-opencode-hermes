@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /**
- * Drop tsc test artifacts from dist/. Unix `rm -f` is not a Windows command,
- * and install-opencode.ps1 runs this build.
+ * Post-tsc build step: drop tsc test artifacts from dist/ and ship the
+ * catastrophic-command denylist into dist/ beside execution_policy.js (which
+ * fails closed when it cannot find one). Unix `rm -f` / `cp` are not Windows
+ * commands, and install-opencode.ps1 runs this build.
  */
-import { readdirSync, rmSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +18,14 @@ try {
   }
 } catch (err) {
   if (err && err.code !== "ENOENT") throw err;
+}
+
+// Canonical first, then the standalone opencode-orchestration layout.
+const patternSource = ["../runtime/dangerous-patterns.txt", "../opencode/dangerous-patterns.txt"]
+  .map((candidate) => join(root, candidate))
+  .find((candidate) => existsSync(candidate));
+if (patternSource && existsSync(dist)) {
+  copyFileSync(patternSource, join(dist, "dangerous-patterns.txt"));
 }
 
 if (process.argv.includes("--dist-test")) {

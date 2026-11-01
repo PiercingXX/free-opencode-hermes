@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { guardedExecFile } from "./execution_policy.js";
 import {
+  checkVerifyInvocation,
+  confineVerifyPaths,
   getVerifyEditScratchDir,
   listFullOutputArtifacts,
   registerVerifyEditTools,
@@ -42,8 +44,8 @@ test("guardedExecFile rejects blocked commands through validateExecRequest", asy
 });
 
 test("guardedExecFile allows commands on the allowlist", async () => {
-  // "echo" is a safe command that should be on the allowlist.
-  // We test with it explicitly allowed.
+  // The gate itself, with "echo" explicitly allowed (verify_edit no longer
+  // allowlists it — it is not a verification tool).
   const { stdout } = await guardedExecFile(
     "echo",
     ["hello-verify"],
@@ -144,7 +146,8 @@ type VerifyEditPayload = { lint: CmdResult; test: CmdResult; compacted?: string[
 /** Register verify_edit on a capture-only server stub and return a driver
  * that invokes the registered handler and parses the structured payload. */
 function captureVerifyEditTool(
-  allowedCommands: string[]
+  allowedCommands: string[],
+  workspaceRoot: string = tmpdir()
 ): (args: VerifyEditArgs) => Promise<VerifyEditPayload> {
   let handler:
     | ((args: VerifyEditArgs) => Promise<{ content: Array<{ type: string; text: string }> }>)
@@ -155,7 +158,7 @@ function captureVerifyEditTool(
     },
   } as unknown as McpServer;
 
-  registerVerifyEditTools(fakeServer, { allowedCommands });
+  registerVerifyEditTools(fakeServer, { allowedCommands, workspaceRoot });
   assert.ok(handler, "registerVerifyEditTools should register a tool handler");
 
   return async (args: VerifyEditArgs) => {
@@ -166,18 +169,53 @@ function captureVerifyEditTool(
   };
 }
 
+/**
+ * verify_edit only runs verification-shaped commands, so fixtures are driven
+ * as `npm run -s <script>`: a real project entry point, and `-s` keeps npm's
+ * own banner out of the captured output. node_modules exists so a failing
+ * script is not reclassified as deps_not_installed.
+ */
+async function writeNpmProject(dir: string, scripts: Record<string, string>): Promise<void> {
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "probe", version: "0.0.0", private: true, scripts }) + "\n"
+  );
+  await mkdir(join(dir, "node_modules"), { recursive: true });
+}
+
+/** Write `<name>.js` files and expose each as an npm script of the same name (merging). */
+async function writeScripts(dir: string, files: Record<string, string>): Promise<void> {
+  let scripts: Record<string, string>;
+  try {
+    scripts = (
+      JSON.parse(await readFile(join(dir, "package.json"), "utf8")) as {
+        scripts: Record<string, string>;
+      }
+    ).scripts;
+  } catch {
+    scripts = {};
+  }
+  for (const [name, body] of Object.entries(files)) {
+    await writeFile(join(dir, `${name}.js`), body);
+    scripts[name] = `node ${name}.js`;
+  }
+  await writeNpmProject(dir, scripts);
+}
+
+const run = (script: string): string => `npm run -s ${script}`;
+
 test("verify_edit returns a structured failure payload on a failing test command", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-edit-tool-"));
   try {
-    await writeFile(
-      join(dir, "fail.js"),
-      'console.log("stdout before failure");\n' +
+    await writeScripts(dir, {
+      fail:
+        'console.log("stdout before failure");\n' +
         'console.error("AssertionError: intentional failure marker");\n' +
-        "process.exit(1);\n"
-    );
+        "process.exit(1);\n",
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node fail.js" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("fail") });
 
     assert.equal(payload.lint, null, "no lintCmd given, lint should be null");
     assert.ok(payload.test, "test result should be present");
@@ -201,16 +239,16 @@ test("verify_edit returns a head+tail view and keeps the full capture on disk", 
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-edit-tool-"));
   resetFullOutputArtifacts();
   try {
-    await writeFile(
-      join(dir, "fail-big.js"),
-      'console.error("HEAD-MARKER");\n' +
+    await writeScripts(dir, {
+      "fail-big":
+        'console.error("HEAD-MARKER");\n' +
         'for (let i = 0; i < 300; i++) console.error("noise line " + i + " " + "x".repeat(40));\n' +
         'console.error("FINAL-TAIL-MARKER");\n' +
-        "process.exit(1);\n"
-    );
+        "process.exit(1);\n",
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node fail-big.js" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("fail-big") });
 
     assert.equal(payload.test!.ok, false);
     assert.equal(payload.test!.truncated, true, "oversized output must be flagged as truncated");
@@ -254,14 +292,14 @@ test("verify_edit returns a head+tail view and keeps the full capture on disk", 
 test("verify_edit reports lint pass and test fail independently in one payload", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-edit-tool-"));
   try {
-    await writeFile(join(dir, "pass.js"), 'console.log("lint clean");\n');
-    await writeFile(join(dir, "fail.js"), 'console.error("1 test failed");\nprocess.exit(1);\n');
+    await writeScripts(dir, { pass: 'console.log("lint clean");\n' });
+    await writeScripts(dir, { fail: 'console.error("1 test failed");\nprocess.exit(1);\n' });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
+    const verifyEdit = captureVerifyEditTool(["npm"]);
     const payload = await verifyEdit({
       cwd: dir,
-      lintCmd: "node pass.js",
-      testCmd: "node fail.js",
+      lintCmd: run("pass"),
+      testCmd: run("fail"),
     });
 
     assert.equal(payload.lint!.ok, true, "passing lint must report ok: true");
@@ -296,15 +334,14 @@ test("caller-supplied compaction still reports what it dropped", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-edit-tool-"));
   resetFullOutputArtifacts();
   try {
-    await writeFile(
-      join(dir, "repeat.js"),
-      'for (let i = 0; i < 12; i++) console.log("identical line");\n'
-    );
+    await writeScripts(dir, {
+      repeat: 'for (let i = 0; i < 12; i++) console.log("identical line");\n',
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
+    const verifyEdit = captureVerifyEditTool(["npm"]);
     const payload = await verifyEdit({
       cwd: dir,
-      testCmd: "node repeat.js",
+      testCmd: run("repeat"),
       compactOptions: { collapseRepeats: true },
     });
 
@@ -339,9 +376,9 @@ test("caller-supplied compaction still reports what it dropped", async () => {
 test("verify_edit classifies a passing command as pass with ok true", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-outcome-"));
   try {
-    await writeFile(join(dir, "ok.js"), 'console.log("all good");\n');
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node ok.js" });
+    await writeScripts(dir, { ok: 'console.log("all good");\n' });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("ok") });
 
     assert.equal(payload.test!.outcome, "pass");
     assert.equal(payload.test!.ok, true, "ok must stay derivable from outcome");
@@ -355,9 +392,9 @@ test("verify_edit classifies a passing command as pass with ok true", async () =
 test("verify_edit classifies a non-zero exit with captured output as fail", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-outcome-"));
   try {
-    await writeFile(join(dir, "red.js"), 'console.error("2 tests failed");\nprocess.exit(1);\n');
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node red.js" });
+    await writeScripts(dir, { red: 'console.error("2 tests failed");\nprocess.exit(1);\n' });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("red") });
 
     assert.equal(payload.test!.outcome, "fail", "a suite that ran and went red is a code failure");
     assert.equal(payload.test!.ok, false);
@@ -415,8 +452,8 @@ test("a missing cwd is bad_cwd, not a missing command", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-outcome-"));
   const gone = join(dir, "no-such-dir");
   try {
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: gone, testCmd: "node --version" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: gone, testCmd: "npm test" });
 
     assert.equal(payload.test!.outcome, "could_not_run");
     assert.equal(
@@ -461,15 +498,14 @@ test("caller-supplied collapse never returns more bytes than the capture", async
     // Exactly "PASS\n\n\n\nPASS\n\n\n\nPASS" — 20 bytes, no trailing newline
     // for `.trim()` to remove. Pre-fix the view came back at 80 bytes with two
     // phantom "collapsed 3 consecutive identical lines" savings reported.
-    await writeFile(
-      join(dir, "blanks.js"),
-      'process.stdout.write("PASS\\n\\n\\n\\nPASS\\n\\n\\n\\nPASS");\n'
-    );
+    await writeScripts(dir, {
+      blanks: 'process.stdout.write("PASS\\n\\n\\n\\nPASS\\n\\n\\n\\nPASS");\n',
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
+    const verifyEdit = captureVerifyEditTool(["npm"]);
     const payload = await verifyEdit({
       cwd: dir,
-      testCmd: "node blanks.js",
+      testCmd: run("blanks"),
       compactOptions: { collapseRepeats: true },
     });
 
@@ -522,13 +558,12 @@ const JEST_FAILURE_WITH_DSN = [
 test("verify_edit redacts secrets from the view without damaging the failure diff", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-redact-"));
   try {
-    await writeFile(
-      join(dir, "jest-like.js"),
-      `console.error(${JSON.stringify(JEST_FAILURE_WITH_DSN)});\nprocess.exit(1);\n`
-    );
+    await writeScripts(dir, {
+      "jest-like": `console.error(${JSON.stringify(JEST_FAILURE_WITH_DSN)});\nprocess.exit(1);\n`,
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node jest-like.js" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("jest-like") });
     const view = payload.test!.output;
 
     assert.equal(payload.test!.outcome, "fail");
@@ -560,15 +595,15 @@ test("the on-disk full capture stays raw while the travelling view is redacted",
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-redact-"));
   resetFullOutputArtifacts();
   try {
-    await writeFile(
-      join(dir, "big-secret.js"),
-      `console.error(${JSON.stringify(JEST_FAILURE_WITH_DSN)});\n` +
+    await writeScripts(dir, {
+      "big-secret":
+        `console.error(${JSON.stringify(JEST_FAILURE_WITH_DSN)});\n` +
         'for (let i = 0; i < 300; i++) console.error("noise " + i + " " + "z".repeat(40));\n' +
-        "process.exit(1);\n"
-    );
+        "process.exit(1);\n",
+    });
 
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, testCmd: "node big-secret.js" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, testCmd: run("big-secret") });
 
     assert.equal(payload.test!.truncated, true);
     assert.ok(!payload.test!.output.includes("user:pw@host"), "the view never carries the value");
@@ -621,8 +656,8 @@ test("an argv-pattern denial names quoting as the limitation", async () => {
   // leading quote fails SAFE_HOOK_ARG_PATTERN. The denial was correct and loud
   // but anonymous: the caller got `hook_arg_pattern_blocked` and no hint.
   // goalContract.validationCmd flows through here, so that cost a whole cycle.
-  const verifyEdit = captureVerifyEditTool(["node"]);
-  const payload = await verifyEdit({ cwd: tmpdir(), testCmd: 'node -t "my test"' });
+  const verifyEdit = captureVerifyEditTool(["npx"]);
+  const payload = await verifyEdit({ cwd: tmpdir(), testCmd: 'npx jest -t "my test"' });
 
   assert.equal(payload.test!.outcome, "denied");
   assert.equal(payload.test!.reasonCode, "hook_arg_pattern_blocked");
@@ -652,14 +687,130 @@ test("a non-argv denial still carries no remediation", async () => {
 test("ok is exactly outcome === pass on every path", async () => {
   const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-outcome-"));
   try {
-    await writeFile(join(dir, "ok.js"), 'console.log("fine");\n');
-    await writeFile(join(dir, "red.js"), "process.exit(3);\n");
-    const verifyEdit = captureVerifyEditTool(["node"]);
-    const payload = await verifyEdit({ cwd: dir, lintCmd: "node ok.js", testCmd: "node red.js" });
+    await writeScripts(dir, { ok: 'console.log("fine");\n' });
+    await writeScripts(dir, { red: "process.exit(3);\n" });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, lintCmd: run("ok"), testCmd: run("red") });
 
     for (const result of [payload.lint!, payload.test!]) {
       assert.equal(result.ok, result.outcome === "pass", "ok must never disagree with outcome");
     }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Verification-shaped invocations and workspace confinement -------------
+
+test("only verification-shaped invocations pass the shape check", () => {
+  const allowed: Array<[string, string[]]> = [
+    ["npm", ["test"]],
+    ["npm", ["run", "lint"]],
+    ["npm", ["run", "-s", "lint"]],
+    ["npx", ["tsc", "--noEmit"]],
+    ["npx", ["eslint", "src"]],
+    ["node", ["--test", "test/a.test.js"]],
+    ["pytest", ["-q"]],
+    ["ruff", ["check", "."]],
+  ];
+  for (const [command, args] of allowed) {
+    assert.equal(checkVerifyInvocation(command, args).ok, true, `${command} ${args.join(" ")}`);
+  }
+  const denied: Array<[string, string[], string]> = [
+    ["node", ["/tmp/payload.js"], "verify_node_shape"],
+    ["node", ["payload.js"], "verify_node_shape"],
+    ["node", ["--test", "--eval=1"], "verify_flag_forbidden"],
+    ["npx", ["some-typosquat"], "verify_npx_tool"],
+    ["npx", ["-p", "evil", "tsc"], "verify_npx_tool"],
+    ["npm", ["exec", "evil"], "verify_npm_subcommand"],
+    ["npm", ["install", "evil"], "verify_npm_subcommand"],
+    ["npm", ["run"], "verify_npm_subcommand"],
+    ["npm", ["test", "--script-shell=/bin/sh"], "verify_flag_forbidden"],
+    ["/usr/bin/node", ["--test"], "verify_command_path"],
+  ];
+  for (const [command, args, reasonCode] of denied) {
+    const result = checkVerifyInvocation(command, args);
+    assert.equal(result.ok, false, `${command} ${args.join(" ")} must be denied`);
+    assert.equal(!result.ok && result.reasonCode, reasonCode);
+  }
+});
+
+test("npx never fetches a missing tool from the registry", () => {
+  const result = checkVerifyInvocation("npx", ["tsc", "--noEmit"]);
+  assert.ok(result.ok);
+  assert.deepEqual(result.ok && result.args, ["--no-install", "tsc", "--noEmit"]);
+});
+
+test("cwd and path-like arguments are confined to the workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "xx-stack-verify-confine-"));
+  const outside = await mkdtemp(join(tmpdir(), "xx-stack-verify-outside-"));
+  try {
+    await mkdir(join(root, "pkg"), { recursive: true });
+    await symlink(outside, join(root, "escape"));
+    assert.equal(
+      confineVerifyPaths(join(root, "pkg"), ["src/a.ts", "--config=./x.json"], root).ok,
+      true
+    );
+    assert.equal(
+      confineVerifyPaths("pkg", [], root).ok,
+      true,
+      "a relative cwd resolves under the root"
+    );
+
+    const cases: Array<[string, string[], string]> = [
+      [outside, [], "cwd_outside_workspace"],
+      [join(root, "escape"), [], "cwd_outside_workspace"],
+      [root, ["/etc/passwd"], "path_outside_workspace"],
+      [root, ["../../etc/passwd"], "path_outside_workspace"],
+      [root, ["--config=/tmp/evil.json"], "path_outside_workspace"],
+      [root, ["--require=a.js,/tmp/evil.js"], "path_outside_workspace"],
+      [root, ["escape/payload.js"], "path_outside_workspace"],
+      [root, ["--registry=https://evil.example/"], "path_outside_workspace"],
+    ];
+    for (const [cwd, args, reasonCode] of cases) {
+      const result = confineVerifyPaths(cwd, args, root);
+      assert.equal(result.ok, false, `${cwd} ${args.join(" ")} must be refused`);
+      assert.equal(!result.ok && result.reasonCode, reasonCode);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("verify_edit denies a cwd outside the workspace before spawning anything", async () => {
+  const root = await mkdtemp(join(tmpdir(), "xx-stack-verify-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "xx-stack-verify-outside-"));
+  try {
+    const verifyEdit = captureVerifyEditTool(["npm"], root);
+    const payload = await verifyEdit({ cwd: outside, testCmd: "npm test" });
+    assert.equal(payload.test!.outcome, "denied");
+    assert.equal(payload.test!.reasonCode, "cwd_outside_workspace");
+    assert.ok(payload.test!.remediation);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("verify_edit refuses cat and bare node script execution", async () => {
+  const verifyEdit = captureVerifyEditTool(["npm", "npx", "node", "ruff", "pytest"]);
+  const catPayload = await verifyEdit({ cwd: tmpdir(), testCmd: "cat /etc/passwd" });
+  assert.equal(catPayload.test!.outcome, "denied");
+  const nodePayload = await verifyEdit({ cwd: tmpdir(), testCmd: "node /tmp/payload.js" });
+  assert.equal(nodePayload.test!.outcome, "denied");
+  assert.equal(nodePayload.test!.reasonCode, "verify_node_shape");
+});
+
+test("leading/trailing whitespace in a command is trimmed, blank commands are absent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-verify-trim-"));
+  try {
+    await writeScripts(dir, { ok: 'console.log("trimmed fine");\n' });
+    const verifyEdit = captureVerifyEditTool(["npm"]);
+    const payload = await verifyEdit({ cwd: dir, lintCmd: "   ", testCmd: `  ${run("ok")}  ` });
+    assert.equal(payload.lint, null, "a whitespace-only command is not run");
+    assert.equal(payload.test!.outcome, "pass");
+    assert.ok(payload.test!.output.includes("trimmed fine"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

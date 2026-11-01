@@ -1,23 +1,15 @@
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  rmSync,
-  writeSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, existsSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
-import { ensureProxyRunning } from "../plugin/lifecycle.js";
 import { HERMES_MIN_VERSION } from "../paths.js";
 import {
   binaryVersion,
   formatVersion,
+  orExit,
+  privateTempDir,
+  requireRunningProxy,
   resolveClientBinary,
   runClientProcess,
   versionAtLeast,
@@ -326,49 +318,18 @@ export async function launchHermes(argv: string[]): Promise<never> {
   rejectManagedPolicy(process.env);
   requireCompatibleHermes(binaryPath);
 
-  let proxy;
-  try {
-    proxy = await ensureProxyRunning();
-  } catch (error) {
-    console.error(
-      `Free OpenCode proxy is not reachable: ${error instanceof Error ? error.message : String(error)}`
-    );
-    console.error("Start it with: free-opencode start");
-    process.exit(1);
-  }
-
-  let managed;
-  try {
+  const proxy = await requireRunningProxy();
+  const managed = await orExit("Could not prepare the Hermes model catalog", async () => {
     const models = await fetchClientModels(proxy.url, proxy.token);
-    managed = buildHermesManagedConfig(models, {
+    return buildHermesManagedConfig(models, {
       proxyRootUrl: proxy.url,
       nonce: randomBytes(8).toString("hex"),
       selectedModel,
     });
-  } catch (error) {
-    console.error(
-      `Could not prepare the Hermes model catalog: ${error instanceof Error ? error.message : String(error)}`
-    );
-    process.exit(1);
-  }
+  });
 
-  const tempDirectory = mkdtempSync(join(tmpdir(), "foc-hermes-"));
-  const cleanup = (): void => {
-    try {
-      rmSync(tempDirectory, { recursive: true, force: true });
-    } catch {
-      // best effort
-    }
-  };
-  process.on("exit", cleanup);
-  mkdirSync(tempDirectory, { recursive: true });
-  if (process.platform !== "win32") {
-    try {
-      chmodSync(tempDirectory, 0o700);
-    } catch {
-      // ignore
-    }
-  }
+  const tempDirectory = privateTempDir("foc-hermes-");
+  // mkdtemp creates the directory 0700; the file is created O_EXCL 0600.
   writePrivateJson(join(tempDirectory, "config.yaml"), managed.config);
 
   const childEnv = buildHermesLauncherEnv(process.env, {

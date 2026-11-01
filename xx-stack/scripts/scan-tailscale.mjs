@@ -81,9 +81,11 @@ const DEFAULT_HERMES_PRIORITY = { sglang: 100, vllm: 90, "llama-cpp": 80, locala
 
 function kindFromOpenAiBody(body, fallback) {
   const owners = (body.data ?? [])
-    .map((row) => String(row?.owned_by ?? "")
-      .trim()
-      .toLowerCase())
+    .map((row) =>
+      String(row?.owned_by ?? "")
+        .trim()
+        .toLowerCase()
+    )
     .filter(Boolean);
   for (const owner of owners) {
     if (owner === "llamacpp" || owner === "llama.cpp" || owner === "llama-cpp") return "llama-cpp";

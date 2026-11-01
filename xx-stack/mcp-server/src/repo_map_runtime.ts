@@ -942,6 +942,91 @@ function commonPrefixLength(a: string, b: string): number {
   return i;
 }
 
+/**
+ * Read each discovered file exactly once, behind the size and binary guards,
+ * and gather its ranking signals. The content is carried through scoring and
+ * selection so nothing is read twice.
+ */
+function collectFileSignals(
+  root: string,
+  files: string[],
+  focusPaths: string[],
+  omissions: OmissionAccumulator
+): { contents: Map<string, string>; signals: FileSignals[] } {
+  // One `git log` for the whole repo. Only when that is unusable *and* git
+  // could still answer per file do we pay the old spawn-per-file price.
+  const bulkTimestamps = collectGitTimestamps(root);
+  const perFileTimestamps = bulkTimestamps === null && isGitRepo(root);
+
+  const contents = new Map<string, string>();
+  const signals: FileSignals[] = [];
+  for (const relPath of files) {
+    const fullPath = join(root, relPath);
+    const outcome = readTextFile(fullPath);
+    if (!outcome.ok) {
+      noteOmission(omissions, outcome.reason, relPath);
+      continue;
+    }
+    contents.set(relPath, outcome.content);
+    signals.push({
+      path: relPath,
+      gitTimestamp: bulkTimestamps
+        ? (bulkTimestamps.get(relPath) ?? 0)
+        : perFileTimestamps
+          ? getGitTimestamp(fullPath, root)
+          : 0,
+      proximityScore: computeProximityScore(relPath, focusPaths),
+      refCount: countReferences(outcome.content),
+    });
+  }
+  return { contents, signals };
+}
+
+/**
+ * Blend recency, reference count and focus proximity into `proximityScore`
+ * (in place) and sort best-first.
+ */
+function rankBySignals(signals: FileSignals[]): void {
+  const maxTs = Math.max(...signals.map((s) => s.gitTimestamp), 1);
+  const maxRef = Math.max(...signals.map((s) => s.refCount), 1);
+
+  for (const s of signals) {
+    const recency = s.gitTimestamp / maxTs;
+    const refNorm = s.refCount / maxRef;
+    const focus = s.proximityScore;
+    s.proximityScore = recency * 0.3 + refNorm * 0.3 + focus * 0.4;
+  }
+
+  signals.sort((a, b) => b.proximityScore - a.proximityScore);
+}
+
+/**
+ * The leading whole lines of `content` that fit `tokenBudget` (~4 chars per
+ * token), so tokensEstimated never exceeds the budget. Null when not even the
+ * first line fits.
+ */
+function headWithinTokens(
+  content: string,
+  tokenBudget: number
+): { content: string; lineCount: number; truncated: boolean } | null {
+  const lines = content.split("\n");
+  const charBudget = tokenBudget * 4;
+  let usedChars = 0;
+  let lineCount = 0;
+  for (const line of lines) {
+    const lineChars = line.length + (lineCount > 0 ? 1 : 0); // +1 for "\n"
+    if (usedChars + lineChars > charBudget) break;
+    usedChars += lineChars;
+    lineCount += 1;
+  }
+  if (lineCount === 0) return null;
+  return {
+    content: lines.slice(0, lineCount).join("\n"),
+    lineCount,
+    truncated: lineCount < lines.length,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -963,67 +1048,20 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
   omissions.considered = discovery.considered;
   for (const path of discovery.ignored) noteOmission(omissions, "ignored", path);
 
+  const emptyResult = (): RepoMapResult => ({
+    files: [],
+    tokensEstimated: 0,
+    method: "heuristic",
+    omissions: finalizeOmissions(omissions),
+    budget,
+  });
+
   const allFiles = discovery.files;
-  if (allFiles.length === 0) {
-    return {
-      files: [],
-      tokensEstimated: 0,
-      method: "heuristic",
-      omissions: finalizeOmissions(omissions),
-      budget,
-    };
-  }
+  if (allFiles.length === 0) return emptyResult();
 
-  // One `git log` for the whole repo. Only when that is unusable *and* git
-  // could still answer per file do we pay the old spawn-per-file price.
-  const bulkTimestamps = collectGitTimestamps(resolvedRoot);
-  const perFileTimestamps = bulkTimestamps === null && isGitRepo(resolvedRoot);
-
-  // Each file is read exactly once, behind the size and binary guards, and the
-  // content is carried through scoring and selection.
-  const contents = new Map<string, string>();
-  const signals: FileSignals[] = [];
-  for (const relPath of allFiles) {
-    const fullPath = join(resolvedRoot, relPath);
-    const outcome = readTextFile(fullPath);
-    if (!outcome.ok) {
-      noteOmission(omissions, outcome.reason, relPath);
-      continue;
-    }
-    contents.set(relPath, outcome.content);
-    signals.push({
-      path: relPath,
-      gitTimestamp: bulkTimestamps
-        ? (bulkTimestamps.get(relPath) ?? 0)
-        : perFileTimestamps
-          ? getGitTimestamp(fullPath, resolvedRoot)
-          : 0,
-      proximityScore: computeProximityScore(relPath, focusPaths),
-      refCount: countReferences(outcome.content),
-    });
-  }
-
-  if (signals.length === 0) {
-    return {
-      files: [],
-      tokensEstimated: 0,
-      method: "heuristic",
-      omissions: finalizeOmissions(omissions),
-      budget,
-    };
-  }
-
-  const maxTs = Math.max(...signals.map((s) => s.gitTimestamp), 1);
-  const maxRef = Math.max(...signals.map((s) => s.refCount), 1);
-
-  for (const s of signals) {
-    const recency = s.gitTimestamp / maxTs;
-    const refNorm = s.refCount / maxRef;
-    const focus = s.proximityScore;
-    s.proximityScore = recency * 0.3 + refNorm * 0.3 + focus * 0.4;
-  }
-
-  signals.sort((a, b) => b.proximityScore - a.proximityScore);
+  const { contents, signals } = collectFileSignals(resolvedRoot, allFiles, focusPaths, omissions);
+  if (signals.length === 0) return emptyResult();
+  rankBySignals(signals);
 
   // Cap the candidate set before selection: rank by the cheap heuristic first,
   // then run the O(n^2) submodular pass over the top K only. Everything below
@@ -1059,17 +1097,11 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
   for (const s of ranked) {
     if (!chosen.has(s.path)) continue;
     const fileContent = contents.get(s.path) ?? "";
-
-    let symbols: string[] | undefined;
-    if (includeSymbols) {
-      symbols = extractSymbols(fileContent);
-    }
-
     selected.push({
       path: s.path,
       score: s.proximityScore,
       ranges: [{ startLine: 1, endLine: fileContent.split("\n").length }],
-      symbols,
+      symbols: includeSymbols ? extractSymbols(fileContent) : undefined,
     });
   }
 
@@ -1079,46 +1111,23 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
   const remaining = tokenBudget - runningTokens;
   if (remaining > 0) {
     const next = ranked.find((s) => !chosen.has(s.path));
-    if (next) {
-      const fileContent = contents.get(next.path) ?? "";
-      const lines = fileContent.split("\n");
-      // Take whole lines while they fit the remaining token budget
-      // (~4 chars per token), so tokensEstimated never exceeds tokenBudget.
-      const charBudget = remaining * 4;
-      let usedChars = 0;
-      let lineBudget = 0;
-      for (const line of lines) {
-        const lineChars = line.length + (lineBudget > 0 ? 1 : 0); // +1 for "\n"
-        if (usedChars + lineChars > charBudget) break;
-        usedChars += lineChars;
-        lineBudget += 1;
-      }
+    const head = next ? headWithinTokens(contents.get(next.path) ?? "", remaining) : null;
+    if (next && head) {
+      selected.push({
+        path: next.path,
+        score: next.proximityScore,
+        ranges: [{ startLine: 1, endLine: head.lineCount }],
+        symbols: includeSymbols ? extractSymbols(head.content) : undefined,
+      });
 
-      if (lineBudget > 0) {
-        const truncatedContent = lines.slice(0, lineBudget).join("\n");
-        const truncatedTokens = estimateTokens(truncatedContent);
-
-        let symbols: string[] | undefined;
-        if (includeSymbols) {
-          symbols = extractSymbols(truncatedContent);
-        }
-
-        selected.push({
-          path: next.path,
-          score: next.proximityScore,
-          ranges: [{ startLine: 1, endLine: lineBudget }],
-          symbols,
-        });
-
-        runningTokens += truncatedTokens;
-        // Included, but not whole: `ranges` alone cannot tell the caller how
-        // much of the file it is missing, so say so.
-        if (lineBudget < lines.length) {
-          truncatedPath = next.path;
-          noteOmission(omissions, "truncated", next.path);
-        } else {
-          chosen.add(next.path);
-        }
+      runningTokens += estimateTokens(head.content);
+      // Included, but not whole: `ranges` alone cannot tell the caller how
+      // much of the file it is missing, so say so.
+      if (head.truncated) {
+        truncatedPath = next.path;
+        noteOmission(omissions, "truncated", next.path);
+      } else {
+        chosen.add(next.path);
       }
     }
   }

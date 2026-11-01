@@ -16,11 +16,12 @@
  * not create). See MANUAL §13.
  */
 
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
+import { writeFileAtomic } from "../fs-atomic.js";
 import { repoRoot } from "../paths.js";
 import { nodeExecutable, userBinDir } from "../platform.js";
 import { appendLog } from "../proxy/route-log.js";
@@ -78,6 +79,28 @@ export function __setExecFileSync(fn: typeof __serviceRuntime.execFileSync | nul
     fn ??
     ((cmd, args, opts): ReturnType<typeof __serviceRuntime.execFileSync> =>
       execFileSync(cmd, args as string[], opts as never) as unknown);
+}
+
+/**
+ * Run a service-manager command and throw (with its stderr) when it fails to
+ * spawn *or* exits non-zero — a non-zero systemctl/launchctl is not success.
+ */
+function runChecked(cmd: string, args: string[], label = `${cmd} ${args.join(" ")}`): void {
+  const result = __serviceRuntime.spawnSync(cmd, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  if (result.error) throw new Error(`${label} failed: ${result.error.message}`);
+  if (result.status !== 0) {
+    const detail =
+      `${result.stderr ?? ""}`.trim() || `${result.stdout ?? ""}`.trim() || `exit ${result.status}`;
+    throw new Error(`${label} failed: ${detail}`);
+  }
+}
+
+function guiDomain(): string {
+  return `gui/${process.getuid?.() ?? 501}`;
 }
 
 function cliPath(): string {
@@ -201,11 +224,9 @@ export function serviceUninstall(): void {
     removeIfExists(windowsTaskScriptPath());
   } else if (isMac()) {
     try {
-      __serviceRuntime.execFileSync(
-        "launchctl",
-        ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL],
-        { stdio: "ignore" }
-      );
+      __serviceRuntime.execFileSync("launchctl", ["bootout", guiDomain(), MAC_LABEL], {
+        stdio: "ignore",
+      });
     } catch {
       // not loaded
     }
@@ -232,52 +253,24 @@ function removeIfExists(path: string): void {
 }
 
 function installSystemdUnit(): void {
-  const dir = systemdUserDir();
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(systemdUnitPath(), systemdUnitBody(), "utf8");
-  for (const args of [
-    ["--user", "daemon-reload"],
-    ["--user", "enable", "--now", SERVICE_NAME],
-  ]) {
-    const result = __serviceRuntime.spawnSync("systemctl", args, {
-      stdio: "inherit",
-      windowsHide: true,
-    });
-    if (result.error) {
-      throw new Error(`systemctl ${args[1]} failed: ${result.error.message}`);
-    }
-  }
+  writeFileAtomic(systemdUnitPath(), systemdUnitBody(), 0o644);
+  runChecked("systemctl", ["--user", "daemon-reload"]);
+  runChecked("systemctl", ["--user", "enable", "--now", SERVICE_NAME]);
   // Best-effort: keep the user unit alive after logout. Never requires root; a
   // headless box without linger drops a user service at logout, which a Proxy
   // user service should survive. Failure is informational only.
-  try {
-    __serviceRuntime.spawnSync(
-      "loginctl",
-      ["enable-linger", process.env.USER ?? homeDir().split("/").pop() ?? ""],
-      { stdio: "ignore", windowsHide: true }
-    );
-  } catch {
-    // linger unavailable — the unit still works while logged in
-  }
+  __serviceRuntime.spawnSync(
+    "loginctl",
+    ["enable-linger", process.env.USER ?? homeDir().split("/").pop() ?? ""],
+    { stdio: "ignore", windowsHide: true }
+  );
 }
 
 function installLaunchAgent(): void {
-  const dir = join(homeDir(), "Library", "LaunchAgents");
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(launchAgentPath(), launchAgentBody(), "utf8");
-  __serviceRuntime.spawnSync(
-    "launchctl",
-    ["bootout", `gui/${process.getuid?.() ?? 501}`, MAC_LABEL],
-    { stdio: "ignore" }
-  );
-  const result = __serviceRuntime.spawnSync(
-    "launchctl",
-    ["bootstrap", `gui/${process.getuid?.() ?? 501}`, launchAgentPath()],
-    { stdio: "ignore" }
-  );
-  if (result.error) {
-    throw new Error(`launchctl bootstrap failed: ${result.error.message}`);
-  }
+  writeFileAtomic(launchAgentPath(), launchAgentBody(), 0o644);
+  // Unload any previous copy; failure just means it was not loaded.
+  __serviceRuntime.spawnSync("launchctl", ["bootout", guiDomain(), MAC_LABEL], { stdio: "ignore" });
+  runChecked("launchctl", ["bootstrap", guiDomain(), launchAgentPath()], "launchctl bootstrap");
 }
 
 /** Quote a path for a .cmd file (cmd.exe doubles embedded quotes). */
@@ -298,13 +291,12 @@ export function writeWindowsTaskScript(home = homeDir()): string {
   mkdirSync(serviceDir(home), { recursive: true, mode: 0o700 });
   const scriptPath = windowsTaskScriptPath(home);
   const wrapper = join(userBinDir(home), "free-opencode.cmd");
-  const body = existsSync(wrapper)
-    ? `@echo off\r\n${quoteForCmd(wrapper)} start --foreground\r\n`
-    : (() => {
-        const [exe, script, ...rest] = execArgs();
-        return `@echo off\r\n${quoteForCmd(exe)} ${quoteForCmd(script)} ${rest.join(" ")}\r\n`;
-      })();
-  writeFileSync(scriptPath, body, "utf8");
+  const [exe, script, ...rest] = execArgs();
+  const command = existsSync(wrapper)
+    ? `${quoteForCmd(wrapper)} start --foreground`
+    : `${quoteForCmd(exe)} ${quoteForCmd(script)} ${rest.join(" ")}`;
+  const body = `@echo off\r\n${command}\r\n`;
+  writeFileAtomic(scriptPath, body, 0o644);
   return scriptPath;
 }
 
@@ -314,18 +306,11 @@ function installScheduledTask(): void {
   const scriptPath = writeWindowsTaskScript();
   // One path token only — spaces get a single pair of quotes, no nesting.
   const tr = /\s/.test(scriptPath) ? `"${scriptPath}"` : scriptPath;
-  const result = __serviceRuntime.spawnSync(
+  runChecked(
     "schtasks",
     ["/Create", "/TN", SERVICE_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", tr],
-    { encoding: "utf8", windowsHide: true }
+    "schtasks /Create"
   );
-  if (result.error) {
-    throw new Error(`schtasks /Create failed: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    const detail = `${result.stderr ?? ""}${result.stdout ?? ""}`.trim() || `exit ${result.status}`;
-    throw new Error(`schtasks /Create failed: ${detail}`);
-  }
 }
 
 export function serviceStatus(): ServiceStatus {
@@ -340,11 +325,11 @@ export function serviceStatus(): ServiceStatus {
   }
   if (isMac()) {
     const installed = existsSync(launchAgentPath());
-    let running = false;
+    let running: boolean;
     try {
       const result = __serviceRuntime.execFileSync(
         "launchctl",
-        ["print", `gui/${process.getuid?.() ?? 501}/${MAC_LABEL}`],
+        ["print", `${guiDomain()}/${MAC_LABEL}`],
         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
       );
       running = String(result).includes("state = running");
@@ -355,7 +340,7 @@ export function serviceStatus(): ServiceStatus {
   }
   if (isLinux()) {
     const installed = existsSync(systemdUnitPath());
-    let running = false;
+    let running: boolean;
     try {
       const result = __serviceRuntime.execFileSync(
         "systemctl",
@@ -374,27 +359,14 @@ export function serviceStatus(): ServiceStatus {
 /** Restart a service that is already installed (a no-op path for each OS). */
 export function serviceRestart(): void {
   if (isWindows()) {
-    const result = __serviceRuntime.spawnSync("schtasks", ["/Run", "/TN", SERVICE_NAME], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    if (result.error) throw new Error(`schtasks /Run failed: ${result.error.message}`);
-    return;
-  }
-  if (isMac()) {
-    const result = __serviceRuntime.spawnSync(
+    runChecked("schtasks", ["/Run", "/TN", SERVICE_NAME], "schtasks /Run");
+  } else if (isMac()) {
+    runChecked(
       "launchctl",
-      ["kickstart", "-k", `gui/${process.getuid?.() ?? 501}/${MAC_LABEL}`],
-      { stdio: "ignore", windowsHide: true }
+      ["kickstart", "-k", `${guiDomain()}/${MAC_LABEL}`],
+      "launchctl kickstart"
     );
-    if (result.error) throw new Error(`launchctl kickstart failed: ${result.error.message}`);
-    return;
-  }
-  if (isLinux()) {
-    const result = __serviceRuntime.spawnSync("systemctl", ["--user", "restart", SERVICE_NAME], {
-      stdio: "inherit",
-      windowsHide: true,
-    });
-    if (result.error) throw new Error(`systemctl restart failed: ${result.error.message}`);
+  } else if (isLinux()) {
+    runChecked("systemctl", ["--user", "restart", SERVICE_NAME], "systemctl restart");
   }
 }

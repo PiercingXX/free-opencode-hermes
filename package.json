@@ -11,9 +11,9 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces",
-    "lint": "eslint . --ext .ts,.mjs,.js",
-    "lint:fix": "eslint . --ext .ts,.mjs,.js --fix",
-    "typecheck": "npm --prefix xx-stack/mcp-server run build -- --noEmit && npm run typecheck -w free-opencode",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc -p xx-stack/mcp-server/tsconfig.json --noEmit && npm run typecheck -w free-opencode",
     "format": "prettier --write \"{xx-stack/mcp-server/src,xx-stack/scripts,packages/plugin/src,scripts}/**/*.{ts,js,mjs}\"",
     "format:check": "prettier --check \"{xx-stack/mcp-server/src,xx-stack/scripts,packages/plugin/src,scripts}/**/*.{ts,js,mjs}\"",
     "plugin:build": "npm run build -w free-opencode",
@@ -57,11 +57,16 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@typescript-eslint/eslint-plugin": "^8.26.0",
-    "@typescript-eslint/parser": "^8.26.0",
-    "eslint": "^8.57.1",
-    "prettier": "^3.5.3",
-    "typescript": "^6.0.2"
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.1",
+    "@typescript-eslint/eslint-plugin": "^8.70.0",
+    "@typescript-eslint/parser": "^8.70.0",
+    "eslint": "^10.10.0",
+    "globals": "^16.5.0",
+    "prettier": "^3.9.8",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "zod": "^4.6.7"
   }
 }

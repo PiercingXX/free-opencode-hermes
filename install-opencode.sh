@@ -21,7 +21,8 @@ Usage: ./install-opencode.sh [--skip-opencode] [--force]
 Installs OpenCode, the Free OpenCode plugin/proxy, and the xx-stack
 agents, skills, MCP server, and inventory.
 
-  --skip-opencode   Do not download the OpenCode CLI (use an existing install)
+  --skip-opencode   Do not download the OpenCode CLI (use an existing install;
+                    same as FOC_SKIP_VENDOR_INSTALL=1)
   --force           Pass --force through to xx-stack OpenCode setup
 EOF
       exit 0
@@ -40,7 +41,7 @@ if [ "$SKIP_OPENCODE_BIN" -eq 0 ]; then
     info "OpenCode already on PATH: $(command -v opencode)"
   else
     info "installing OpenCode CLI"
-    curl -fsSL https://opencode.ai/install | bash
+    run_vendor_installer https://opencode.ai/install "OpenCode CLI" FOC_SKIP_VENDOR_INSTALL
     hash -r || true
     have opencode || warn "OpenCode installer finished but 'opencode' is not on PATH yet — open a new shell"
   fi
@@ -52,7 +53,6 @@ info "wiring OpenCode plugin, skills, MCP, CLI, and proxy"
 # and hard-exits when it is missing. The plugin + host-setup.mjs is the install
 # path: it copies skills/agents, registers the plugin and MCP against this repo,
 # and starts the proxy.
-SETUP_ARGS=()
 if [ "$FORCE_SETUP" -eq 1 ]; then
   warn "--force is accepted for compatibility; host-setup overwrites generated wrappers and skill copies"
 fi

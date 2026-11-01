@@ -4,6 +4,7 @@ import { networkInterfaces } from "node:os";
 import { promisify } from "node:util";
 
 import { connectProvider, isProviderConfigured, type Settings } from "../config/settings.js";
+import { mapPool } from "../map-pool.js";
 import { keepToolCapableModel } from "../proxy/models.js";
 import type { FoundHost } from "./inventory.js";
 
@@ -57,6 +58,13 @@ export function kindFromOpenAiBody(body: Record<string, unknown>, fallback: stri
   return fallback;
 }
 
+const openAiProbe = (kind: string, port: number): ProbeSpec => ({
+  kind,
+  port,
+  path: "/v1/models",
+  models: openAiModelIds,
+});
+
 const PROBES: ProbeSpec[] = [
   {
     kind: "ollama",
@@ -67,50 +75,24 @@ const PROBES: ProbeSpec[] = [
         .map((row) => row.name || row.model)
         .filter((id): id is string => Boolean(id)),
   },
-  {
-    kind: "sglang",
-    port: 30000,
-    path: "/v1/models",
-    models: openAiModelIds,
-  },
+  openAiProbe("sglang", 30000),
   // Common second OpenAI-compat port (llama.cpp next to SGLang on the same box).
-  {
-    kind: "llamacpp",
-    port: 30001,
-    path: "/v1/models",
-    models: openAiModelIds,
-  },
-  {
-    kind: "vllm",
-    port: 8000,
-    path: "/v1/models",
-    models: openAiModelIds,
-  },
-  {
-    kind: "llamacpp",
-    port: 8080,
-    path: "/v1/models",
-    models: openAiModelIds,
-  },
-  {
-    kind: "lmstudio",
-    port: 1234,
-    path: "/v1/models",
-    models: openAiModelIds,
-  },
+  openAiProbe("llamacpp", 30001),
+  openAiProbe("vllm", 8000),
+  openAiProbe("llamacpp", 8080),
+  openAiProbe("lmstudio", 1234),
 ];
 
-const LOOPBACK_IDS: Record<string, string> = {
-  ollama: "ollama",
-  sglang: "sglang",
-  llamacpp: "llamacpp",
-  lmstudio: "lmstudio",
+/** Built-in catalog provider ids a hit claims first (by scope, then kind). */
+const BUILTIN_IDS: Partial<Record<AutofindScope, Record<string, string>>> = {
+  loopback: { ollama: "ollama", sglang: "sglang", llamacpp: "llamacpp", lmstudio: "lmstudio" },
+  tailscale: { ollama: "tailscale_ollama", sglang: "tailscale_sglang" },
 };
 
-const TAILSCALE_IDS: Record<string, string> = {
-  ollama: "tailscale_ollama",
-  sglang: "tailscale_sglang",
-};
+/** True when `id` is a built-in catalog entry for this kind (no found-host card needed). */
+function isBuiltinId(kind: string, id: string): boolean {
+  return Object.values(BUILTIN_IDS).some((ids) => ids?.[kind] === id);
+}
 
 export type AutofindDeps = {
   fetchImpl?: typeof fetch;
@@ -165,36 +147,12 @@ export function safeProviderId(kind: string, host: string): string {
 }
 
 export function assignProviderId(hit: AutofindHit, used: Set<string>): string {
-  if (hit.scope === "loopback") {
-    const id = LOOPBACK_IDS[hit.kind];
-    if (id && !used.has(id)) return id;
-  }
-  if (hit.scope === "tailscale") {
-    const id = TAILSCALE_IDS[hit.kind];
-    if (id && !used.has(id)) return id;
-  }
-  let id = safeProviderId(hit.kind, hit.host);
-  let n = 2;
-  while (used.has(id)) {
-    id = `${safeProviderId(hit.kind, hit.host)}-${n}`;
-    n += 1;
-  }
+  const builtin = BUILTIN_IDS[hit.scope]?.[hit.kind];
+  if (builtin && !used.has(builtin)) return builtin;
+  const base = safeProviderId(hit.kind, hit.host);
+  let id = base;
+  for (let n = 2; used.has(id); n += 1) id = `${base}-${n}`;
   return id;
-}
-
-async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  if (items.length === 0) return [];
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      out[index] = await fn(items[index]);
-    }
-  });
-  await Promise.all(workers);
-  return out;
 }
 
 type ProbeHit = { kind: string; models: string[] };
@@ -214,8 +172,7 @@ async function probeOne(
     if (!response.ok) return null;
     const body = (await response.json()) as Record<string, unknown>;
     const models = toolModels(spec.models(body));
-    const kind =
-      spec.path === "/v1/models" ? kindFromOpenAiBody(body, spec.kind) : spec.kind;
+    const kind = spec.path === "/v1/models" ? kindFromOpenAiBody(body, spec.kind) : spec.kind;
     return { kind, models };
   } catch {
     return null;
@@ -286,7 +243,7 @@ export async function runAutofind(deps: AutofindDeps = {}): Promise<AutofindRepo
     { host: "127.0.0.1", scope: "loopback" },
   ];
 
-  let tailscaleHosts: string[] = [];
+  let tailscaleHosts: string[];
   if (deps.listTailscaleHosts) {
     tailscaleHosts = await deps.listTailscaleHosts();
   } else {
@@ -365,19 +322,16 @@ export function applyAutofindResults(
     used.add(id);
     next = connectProvider(next, id, { baseUrl: hit.baseUrl }, hit.models);
     connected.push(id);
-    if (!LOOPBACK_IDS[hit.kind] || id !== LOOPBACK_IDS[hit.kind]) {
-      if (!TAILSCALE_IDS[hit.kind] || id !== TAILSCALE_IDS[hit.kind]) {
-        extraById.set(id, {
-          id,
-          kind: hit.kind,
-          scope: hit.scope,
-          host: hit.host,
-          label: `${hit.host} · ${hit.kind}`,
-          baseUrl: hit.baseUrl,
-          models: hit.models,
-        });
-      }
-    }
+    if (isBuiltinId(hit.kind, id)) continue;
+    extraById.set(id, {
+      id,
+      kind: hit.kind,
+      scope: hit.scope,
+      host: hit.host,
+      label: `${hit.host} · ${hit.kind}`,
+      baseUrl: hit.baseUrl,
+      models: hit.models,
+    });
   }
 
   next = { ...next, foundHosts: [...extraById.values()] };

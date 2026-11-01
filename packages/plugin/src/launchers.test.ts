@@ -51,7 +51,7 @@ test("OpenCode process config uses Responses SDK and overlay-forces the model", 
   assert.equal(config.overlay.model, `${PROVIDER_ID}/${CATALOG_MODEL_ID}`);
   assert.equal(config.overlay.small_model, config.overlay.model);
   const advertised = Object.keys(provider.models as Record<string, unknown>);
-  assert.deepEqual(advertised, [CATALOG_MODEL_ID]);
+  assert.deepEqual(advertised, [CATALOG_MODEL_ID, "auto/fast", "auto/sticky"]);
   const defaultEntry = (provider.models as Record<string, { limit?: { context: number } }>)[
     CATALOG_MODEL_ID
   ];

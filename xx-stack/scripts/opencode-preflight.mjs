@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fail, readStdin } from "./lib/cli.mjs";
 
 const DEFAULT_PING_INPUT = "Respond with exactly PONG.";
 const SUCCESS_MARKER = "OPENCODE_PREFLIGHT_OK";
@@ -14,11 +15,6 @@ function usage() {
   process.stdout.write(
     `Usage:\n  node scripts/opencode-preflight.mjs --ping-agent <name> --worker-agent <name> [options]\n\nOptions:\n  --ping-agent <name>                Required liveness probe agent.\n  --worker-agent <name>              Required worker agent used for the tool-loop probe.\n  --binary <path>                    OpenCode executable. Defaults to opencode.\n  --model <provider/model>           Optional model override.\n  --dir <path>                       Optional OpenCode working directory. Defaults to current cwd.\n  --probe-dir <path>                 Directory used for the temporary tool-loop probe file. Defaults to current cwd.\n  --phase-timeout-ms <n>             Optional per-phase timeout. Defaults to 15000.\n  --variant <value>                  Optional model variant.\n  --print-logs                       Forward OpenCode logs to stderr.\n  --pure                             Run without external plugins.\n  --thinking                         Show thinking blocks.\n  --dangerously-skip-permissions     Auto-approve non-denied permissions.\n  --help                             Show this help.\n`
   );
-}
-
-function fail(message, exitCode = 1) {
-  process.stderr.write(`${message}\n`);
-  process.exit(exitCode);
 }
 
 function parseArgs(argv) {
@@ -56,15 +52,6 @@ function parsePositiveInt(value, fallback, label) {
     fail(`Invalid --${label}: ${value}`);
   }
   return parsed;
-}
-
-async function readStdin() {
-  process.stdin.setEncoding("utf-8");
-  let input = "";
-  for await (const chunk of process.stdin) {
-    input += chunk;
-  }
-  return input;
 }
 
 function buildHelperArgs(helperPath, options) {

@@ -85,7 +85,7 @@ dependency on the TypeScript stack.
   largely vendored and reformatting it obscures real diffs. See `.prettierignore`.
 - Follow existing patterns; keep functions focused on a single responsibility.
 
-`.eslintrc.json` carries one deliberate exemption that JSON cannot self-document:
+`eslint.config.mjs` carries one deliberate exemption worth knowing about:
 `no-console` is disabled for four standalone CLI entrypoints
 (`monitor-memory.ts`, `parallel-preflight.ts`, `parallel-smoke.ts`,
 `trace-provider-proxy.ts`). Each has a shebang, is wired to an npm script, and
@@ -95,11 +95,11 @@ you add a CLI entrypoint, add it to that list explicitly.
 
 `npm run lint` covers `.ts`, `.mjs`, and `.js`. The scripts under
 `xx-stack/scripts/` are a deliberate mix of ESM (`.mjs`) and CommonJS (`.js`) —
-see the `//type` note in the root `package.json` — so `.eslintrc.json` gives
-them their own overrides: the default parser (they are not in `tsconfig.json`'s
-program), `sourceType` split by extension, and `no-require-imports` off for the
-CommonJS half. The vendored design pack (`xx-stack/packs/**`) is in
-`ignorePatterns` alongside the OpenCode pack copy; it is upstream content, not
+see the `//type` note in the root `package.json` — so `eslint.config.mjs` gives
+them their own block: the default parser (they are not in `tsconfig.json`'s
+program), `sourceType` split by extension, and the typescript-eslint rules
+scoped to `.ts` only. The vendored design pack (`xx-stack/packs/**`) is in
+`ignores` alongside the OpenCode pack copy; it is upstream content, not
 ours to restyle.
 
 Lint must be **clean of errors**. Warnings are allowed but should not grow.

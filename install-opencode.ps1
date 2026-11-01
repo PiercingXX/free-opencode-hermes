@@ -19,7 +19,7 @@ Usage: .\install-opencode.ps1 [-SkipOpenCode] [-Force]
 Installs OpenCode, the Free OpenCode plugin/proxy, and the xx-stack
 agents, skills, MCP server, and inventory.
 
-  -SkipOpenCode   Do not download the OpenCode CLI
+  -SkipOpenCode   Do not download the OpenCode CLI (same as FOC_SKIP_VENDOR_INSTALL=1)
   -Force          Overwrite existing host files
 "@
     exit 0
@@ -86,6 +86,11 @@ try {
     Pop-Location
 }
 
+if ($env:FOC_SKIP_VENDOR_INSTALL -eq "1") {
+    Write-Info "FOC_SKIP_VENDOR_INSTALL=1 - skipping the OpenCode CLI download"
+    $SkipOpenCode = $true
+}
+
 if (-not $SkipOpenCode) {
     $existing = Get-Application "opencode"
     if ($existing) {
@@ -106,6 +111,12 @@ if (-not $SkipOpenCode) {
         try {
             New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
             Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+            $zipItem = Get-Item -LiteralPath $zipPath -ErrorAction SilentlyContinue
+            if (-not $zipItem -or $zipItem.Length -lt 4) { Die "the OpenCode download was empty ($url)" }
+            $magic = New-Object byte[] 2
+            $stream = [IO.File]::OpenRead($zipPath)
+            try { [void] $stream.Read($magic, 0, 2) } finally { $stream.Dispose() }
+            if ($magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) { Die "the OpenCode download is not a zip archive ($url)" }
             Expand-Archive -LiteralPath $zipPath -DestinationPath $extract
             $exe = Get-ChildItem -LiteralPath $extract -Recurse -File -Filter "opencode.exe" | Select-Object -First 1
             if (-not $exe) { Die "OpenCode archive did not contain opencode.exe" }

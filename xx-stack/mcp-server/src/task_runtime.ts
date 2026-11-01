@@ -1,12 +1,11 @@
-import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { z } from "zod";
 
-import { atomicWriteTextFile } from "./io_runtime.js";
-// StoreAccessError / isMissingFileError live beside the supervisor store reader
-// so both stores raise one error shape for an unreadable state file (MCP-1).
-import { isMissingFileError, StoreAccessError } from "./supervisor_store_runtime.js";
+import { createStoreLock } from "./io_runtime.js";
+// The strict store reader lives beside the supervisor store so every store
+// raises one error shape for an unreadable state file (MCP-1).
+import { readJsonStoreDocument, writeJsonStoreDocument } from "./supervisor_store_runtime.js";
 import type { SupervisorSessionState } from "./supervisor_runtime.js";
 
 export const TASK_STATUS_VALUES = [
@@ -444,22 +443,14 @@ export interface TaskStore {
 
 const TASK_STORE_VERSION = 1;
 
-let taskStoreLock: Promise<void> = Promise.resolve();
-
-export async function withTaskStoreLock<T>(work: () => Promise<T>): Promise<T> {
-  const previous = taskStoreLock;
-  let release: () => void = () => {};
-  taskStoreLock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  await previous;
-  try {
-    return await work();
-  } finally {
-    release();
-  }
-}
+/**
+ * Serializes task-store read -> mutate -> write across this process AND every
+ * other process sharing the store file (other MCP servers, the CLI). Callers
+ * must re-read the store inside the lock. Non-reentrant.
+ */
+export const withTaskStoreLock: <T>(work: () => Promise<T>) => Promise<T> = createStoreLock(() =>
+  getTaskStatePath()
+);
 
 export function emptyTaskStore(): TaskStore {
   return {
@@ -605,53 +596,22 @@ export function buildResumeDirective(
   return lines.join("\n");
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Read the task store. Only a genuinely missing file means "empty store"
- * (MCP-1): every handler is read → mutate → write-whole-document, so healing a
- * parse error or an EACCES into an empty store makes the next write delete
- * every task. Anything but ENOENT raises StoreAccessError and the caller fails
- * loudly. StoreAccessError is shared with the supervisor store so both readers
- * report one error shape.
+ * (MCP-1); see readJsonStoreDocument. StoreAccessError is shared with the
+ * supervisor store so both readers report one error shape.
  */
 export async function readTaskStore(): Promise<TaskStore> {
-  const path = getTaskStatePath();
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf-8");
-  } catch (error) {
-    if (isMissingFileError(error)) return emptyTaskStore();
-    throw new StoreAccessError("task", path, error);
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new StoreAccessError("task", path, error);
-  }
-
-  if (!isPlainRecord(parsed)) {
-    throw new StoreAccessError("task", path, new Error("store root is not a JSON object"));
-  }
-  const tasks = parsed.tasks;
-  if (tasks !== undefined && !isPlainRecord(tasks)) {
-    throw new StoreAccessError("task", path, new Error("tasks is not a JSON object"));
-  }
-
+  const parsed = await readJsonStoreDocument("task", getTaskStatePath(), ["tasks"]);
+  if (!parsed) return emptyTaskStore();
   return {
     version: TASK_STORE_VERSION,
-    tasks: (tasks as TaskStore["tasks"]) ?? {},
+    tasks: (parsed.tasks as TaskStore["tasks"]) ?? {},
   };
 }
 
 export async function writeTaskStore(store: TaskStore): Promise<void> {
-  const path = getTaskStatePath();
-  await mkdir(dirname(path), { recursive: true });
-  await atomicWriteTextFile(path, JSON.stringify(store, null, 2) + "\n");
+  await writeJsonStoreDocument(getTaskStatePath(), store);
 }
 
 export function generateTaskId(): string {

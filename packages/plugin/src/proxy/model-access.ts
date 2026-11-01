@@ -7,6 +7,7 @@
  */
 
 import type { Settings } from "../config/settings.js";
+import { mapPool } from "../map-pool.js";
 import { providerById } from "../providers/catalog.js";
 import {
   listedModelsForProvider,
@@ -27,15 +28,14 @@ export type ModelAccessEntry = {
 export type ModelAccessMap = Record<string, ModelAccessEntry>;
 
 /** B.ai candidates worth probing — never auto-routed until a probe marks open. */
-export const BAI_PROBE_CANDIDATES = [
-  "glm-5.3-flash",
-  "qwen3.8-flash",
-  "hy3",
-  "mimo-v2.5",
-] as const;
+export const BAI_PROBE_CANDIDATES = ["glm-5.3-flash", "qwen3.8-flash", "hy3", "mimo-v2.5"] as const;
 
 /** DeepSeek flash is often listed with free promos but charges zero-balance keys. */
-const BAI_PROBE_SKIP = new Set(["deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]);
+const BAI_PROBE_SKIP = new Set([
+  "deepseek-v4.1-flash",
+  "deepseek-v4-flash",
+  "deepseek-v4-flash-vision-exp",
+]);
 
 export const ACCESS_PROBE_MAX_TOKENS = 4;
 export const ACCESS_PROBE_TIMEOUT_MS = 12_000;
@@ -45,10 +45,7 @@ export const ACCESS_PROBE_CONCURRENCY = 1;
 export const ACCESS_PROBE_STALE_MS = 6 * 60 * 60 * 1000;
 
 /** Classify an upstream chat/completions outcome for access learning. */
-export function classifyAccessStatus(
-  status: number,
-  message = ""
-): ModelAccessStatus | null {
+export function classifyAccessStatus(status: number, message = ""): ModelAccessStatus | null {
   const text = message.toLowerCase();
   if (
     /deposit|access restricted|premium|unlock|purchase|billing|payment|credit insufficient|insufficient (credit|balance)|balance\s*=\s*0|required=\d+/.test(
@@ -82,26 +79,14 @@ export function rememberAccess(
 ): Settings {
   if (status === "unknown") return settings;
   const prev = settings.modelAccess?.[slug];
-  if (prev?.status === status && (!reason || prev.reason === reason)) {
-    return {
-      ...settings,
-      modelAccess: {
-        ...(settings.modelAccess ?? {}),
-        [slug]: { ...prev, at: Date.now(), ...(reason ? { reason: reason.slice(0, 240) } : {}) },
-      },
-    };
-  }
-  return {
-    ...settings,
-    modelAccess: {
-      ...(settings.modelAccess ?? {}),
-      [slug]: {
-        status,
-        at: Date.now(),
-        ...(reason ? { reason: reason.slice(0, 240) } : {}),
-      },
-    },
+  // Re-observing the same status without a new reason keeps the old reason.
+  const nextReason = reason ? reason.slice(0, 240) : prev?.status === status ? prev.reason : "";
+  const entry: ModelAccessEntry = {
+    status,
+    at: Date.now(),
+    ...(nextReason ? { reason: nextReason } : {}),
   };
+  return { ...settings, modelAccess: { ...(settings.modelAccess ?? {}), [slug]: entry } };
 }
 
 export function parseModelAccessMap(raw: unknown): ModelAccessMap {
@@ -145,7 +130,9 @@ export function accessProbeCandidates(settings: Settings, providerId: string): s
       if (!raw) return null;
       try {
         const ref = parseModelRef(raw);
-        return ref.baseProviderId === providerId || ref.providerId === providerId ? ref.model : null;
+        return ref.baseProviderId === providerId || ref.providerId === providerId
+          ? ref.model
+          : null;
       } catch {
         return null;
       }
@@ -172,7 +159,8 @@ export function accessProbeCandidates(settings: Settings, providerId: string): s
   return out.slice(0, 8);
 }
 
-async function readErrorMessage(response: Response): Promise<string> {
+/** Upstream error text: the OpenAI-style `error.message`, else the first 400 chars of the body. */
+export async function readErrorMessage(response: Response): Promise<string> {
   try {
     const text = await response.text();
     if (!text) return `HTTP ${response.status}`;
@@ -187,20 +175,33 @@ async function readErrorMessage(response: Response): Promise<string> {
   }
 }
 
-async function mapPool<T>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T) => Promise<void>
-): Promise<void> {
-  const queue = items.slice();
-  const runners = Array.from({ length: Math.min(concurrency, Math.max(queue.length, 1)) }, async () => {
-    while (queue.length) {
-      const item = queue.shift();
-      if (item === undefined) return;
-      await worker(item);
-    }
+/**
+ * One tiny chat completion (`max_tokens` 4, "."), classified as open/paywall.
+ * Throws on network errors and timeouts; callers treat that as unknown.
+ */
+export async function sendAccessProbe(
+  baseUrl: string,
+  headers: Record<string, string>,
+  model: string,
+  signal: AbortSignal,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ httpStatus: number; message: string; access: ModelAccessStatus | null }> {
+  const response = await fetchImpl(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: "." }],
+      max_tokens: ACCESS_PROBE_MAX_TOKENS,
+    }),
+    signal,
   });
-  await Promise.all(runners);
+  const message = await readErrorMessage(response);
+  return {
+    httpStatus: response.status,
+    message,
+    access: classifyAccessStatus(response.status, message),
+  };
 }
 
 export type AccessProbeResult = {
@@ -241,32 +242,17 @@ export async function probeProviderAccess(
         options?.signal && typeof AbortSignal.any === "function"
           ? AbortSignal.any([options.signal, timeout])
           : timeout;
-      const response = await fetchImpl(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: "." }],
-          max_tokens: ACCESS_PROBE_MAX_TOKENS,
-        }),
+      const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+      const { httpStatus, message, access } = await sendAccessProbe(
+        baseUrl,
+        headers,
+        model,
         signal,
-      });
-      const message = await readErrorMessage(response);
-      const access = classifyAccessStatus(response.status, message);
-      probed.push({
-        slug,
-        status: access ?? "unknown",
-        httpStatus: response.status,
-        message,
-      });
+        fetchImpl
+      );
+      probed.push({ slug, status: access ?? "unknown", httpStatus, message });
       if (access) {
-        const reason =
-          access === "open"
-            ? `probe http ${response.status}`
-            : message.slice(0, 240);
+        const reason = access === "open" ? `probe http ${httpStatus}` : message.slice(0, 240);
         // Serialize writes — concurrent workers must not clobber each other.
         live = rememberAccess(live, slug, access, reason);
       }
@@ -281,16 +267,4 @@ export async function probeProviderAccess(
   });
 
   return { settings: live, probed };
-}
-
-/** Providers that must be live-probed before free-first auto-routing. */
-export function providersNeedingAccessProbe(settings: Settings): string[] {
-  return ["bai"].filter((id) => {
-    try {
-      // ready check deferred to caller; we only know probe policy here
-      return providerNeedsAccessProbe(settings, id);
-    } catch {
-      return false;
-    }
-  });
 }

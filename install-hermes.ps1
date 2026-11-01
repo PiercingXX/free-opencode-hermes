@@ -18,7 +18,7 @@ Usage: .\install-hermes.ps1 [-SkipHermes]
 Installs Hermes Agent, generates lanes from inventory.json, writes the
 loopback orchestration token, and puts xx-hermes on PATH.
 
-  -SkipHermes   Do not download Hermes Agent
+  -SkipHermes   Do not download Hermes Agent (same as FOC_SKIP_VENDOR_INSTALL=1)
 "@
     exit 0
 }
@@ -84,6 +84,11 @@ try {
     Pop-Location
 }
 
+if ($env:FOC_SKIP_VENDOR_INSTALL -eq "1") {
+    Write-Info "FOC_SKIP_VENDOR_INSTALL=1 - skipping the Hermes Agent installer"
+    $SkipHermes = $true
+}
+
 if (-not $SkipHermes) {
     $existing = Get-Application "hermes"
     if ($existing) {
@@ -92,7 +97,17 @@ if (-not $SkipHermes) {
         Write-Info "installing Hermes Agent"
         $installer = Join-Path ([IO.Path]::GetTempPath()) ("foc-hermes-" + [guid]::NewGuid().ToString("N") + ".ps1")
         try {
-            Invoke-RestMethod -Uri "https://hermes-agent.nousresearch.com/install.ps1" -OutFile $installer
+            $installerUrl = "https://hermes-agent.nousresearch.com/install.ps1"
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+            # Sanity-check before running: a truncated download or an HTML error
+            # page must not be executed. (No checksum pin: the vendor script changes.)
+            $item = Get-Item -LiteralPath $installer -ErrorAction SilentlyContinue
+            if (-not $item -or $item.Length -eq 0) { Die "the Hermes installer download was empty ($installerUrl)" }
+            $head = (Get-Content -LiteralPath $installer -TotalCount 20 -ErrorAction SilentlyContinue) -join "`n"
+            if ($head -match '^\s*<' -or $head -match '(?i)<html') {
+                Die "the Hermes installer ($installerUrl) does not look like a PowerShell script; refusing to run it. Install Hermes yourself or set FOC_SKIP_VENDOR_INSTALL=1."
+            }
+            Write-Info "running the Hermes installer ($($item.Length) bytes)"
             $pwsh = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
             & $pwsh -NoProfile -ExecutionPolicy Bypass -File $installer -NonInteractive -SkipSetup
             if ($LASTEXITCODE -ne 0) { Die "Hermes installer failed" }

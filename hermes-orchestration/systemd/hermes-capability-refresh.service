@@ -13,3 +13,17 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=__HERMES_DIR__
 ExecStart=__HERMES_DIR__/scripts/refresh_capability_cache.sh
+
+# Same sandbox as hermes-proxy.service. refresh_capability_cache.sh only writes
+# the capability cache (execution.capability_cache_file, logs/capability-cache.json,
+# via a temp file + rename in the same directory), so __HERMES_DIR__/logs is the
+# only writable path. Cloud lanes (hermes CLI, which keeps state in ~/.hermes)
+# are not probed by the shipped script; if you add --include-cloud, also add
+# ReadWritePaths=%h/.hermes.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=__HERMES_DIR__/logs

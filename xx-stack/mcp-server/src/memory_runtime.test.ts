@@ -9,6 +9,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import {
   buildMemoryCompactionPrompt,
+  compactMemoryContent,
+  compactMemoryFileIfOversized,
   computeMemoryEntryId,
   detectMemoryWriteConflict,
   getAgentMemoryEntrypoint,
@@ -17,6 +19,8 @@ import {
   hashMemoryContent,
   lineDiffSummary,
   markMemoryEntriesSuperseded,
+  MAX_MEMORY_FILE_BYTES,
+  MEMORY_COMPACTION_MARKER,
   MEMORY_WRITE_CONFLICT_HINT,
   parseMemoryEntries,
   sanitizeNameForPath,
@@ -1017,6 +1021,88 @@ test("a snapshot at a fresh timestamp keeps its unsuffixed history name", async 
       new Date("2026-03-04T05:06:07.890Z")
     );
     assert.equal(base, "2026-03-04T05-06-07-890Z-apply", "no suffix without a collision");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Size cap + compaction
+// ---------------------------------------------------------------------------
+
+function bulkMemory(count: number, superseded: Set<number> = new Set()): string {
+  const lines = ["# Agent Memory", "", "## Durable facts"];
+  for (let i = 0; i < count; i += 1) {
+    const stamp = `2026-01-01T00:00:${String(i % 60).padStart(2, "0")}.000Z`;
+    const prefix = superseded.has(i) ? "- [superseded:newer] " : "- ";
+    lines.push(`${prefix}${stamp} note-${i} ${"x".repeat(80)}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+test("compactMemoryContent leaves an under-target document untouched", () => {
+  const result = compactMemoryContent(FIXTURE_CONTENT, 1_000_000);
+  assert.equal(result.content, FIXTURE_CONTENT);
+  assert.equal(result.droppedEntries, 0);
+});
+
+test("compactMemoryContent drops superseded then oldest notes, keeps headers, records itself", () => {
+  const content = bulkMemory(100, new Set([50]));
+  const target = 4_000;
+  const result = compactMemoryContent(content, target, "2026-02-01T00:00:00.000Z");
+  assert.ok(Buffer.byteLength(result.content) <= target, "result must fit the target");
+  assert.ok(result.droppedEntries > 0);
+  assert.ok(result.content.startsWith("# Agent Memory\n\n## Durable facts\n"), "headers survive");
+  assert.ok(!result.content.includes("note-50 "), "the superseded note goes first");
+  assert.ok(!result.content.includes("note-0 "), "the oldest note goes");
+  assert.ok(result.content.includes("note-99 "), "the newest note survives");
+  const lastLine = result.content.trimEnd().split("\n").at(-1)!;
+  assert.ok(lastLine.includes(MEMORY_COMPACTION_MARKER), "compaction leaves a record");
+  assert.ok(lastLine.startsWith("- 2026-02-01T00:00:00.000Z "), "the record is a parseable entry");
+  assert.ok(result.content.endsWith("\n"), "the trailing newline appends rely on is kept");
+});
+
+test("compactMemoryFileIfOversized rewrites only an over-cap file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-memory-cap-"));
+  try {
+    const path = join(dir, "MEMORY.md");
+    await writeFile(path, FIXTURE_CONTENT);
+    assert.equal(await compactMemoryFileIfOversized(path, 10_000), null);
+    assert.equal(await readFile(path, "utf8"), FIXTURE_CONTENT);
+
+    await writeFile(path, bulkMemory(200));
+    const result = await compactMemoryFileIfOversized(path, 10_000);
+    assert.ok(result && result.droppedEntries > 0);
+    const after = await readFile(path, "utf8");
+    assert.ok(Buffer.byteLength(after) <= 10_000);
+    assert.ok(after.includes(MEMORY_COMPACTION_MARKER));
+    assert.ok(!(await readdir(dir)).some((name) => name.endsWith(".lock")), "lock released");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent_memory_append enforces the cap and reports the compaction", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xx-stack-memory-cap-tool-"));
+  try {
+    const handlers = captureMemoryTools();
+    const path = getAgentMemoryEntrypoint("cap-agent", "project", dir);
+    await mkdir(dirname(path), { recursive: true });
+    // Just over the cap: ~2600 notes of ~100 bytes.
+    await writeFile(path, bulkMemory(Math.ceil(MAX_MEMORY_FILE_BYTES / 100) + 50));
+    const payload = await callTool(handlers, "agent_memory_append", {
+      agentId: "cap-agent",
+      scope: "project",
+      cwd: dir,
+      note: "the newest note survives compaction",
+    });
+    assert.equal(payload.status, "ok");
+    assert.ok(payload.compacted && payload.compacted.droppedEntries > 0);
+    assert.equal(payload.compacted.capBytes, MAX_MEMORY_FILE_BYTES);
+    const after = await readFile(path, "utf8");
+    assert.ok(Buffer.byteLength(after) <= MAX_MEMORY_FILE_BYTES);
+    assert.ok(after.includes("the newest note survives compaction"));
+    assert.ok(after.includes(MEMORY_COMPACTION_MARKER));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

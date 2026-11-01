@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync } from "node:fs";
-import { createInterface } from "node:readline/promises";
+import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import {
@@ -15,20 +14,31 @@ import {
   saveSettings,
   setProviderKey,
   splitAccountQualifier,
+  type Settings,
 } from "./config/settings.js";
 import { launchHermes } from "./launchers/hermes.js";
 import { launchOpenCode } from "./launchers/opencode.js";
-import { pidPath, TOKEN_ENV } from "./paths.js";
+import { TOKEN_ENV } from "./paths.js";
+import { runDoctor } from "./plugin/doctor.js";
 import {
+  clearPidRecordOnExit,
   localCodeBuiltAt,
+  proxyUrl,
+  replaceStaleProxy,
   spawnDetachedProxy,
-  stopDetachedProxy,
+  stopProxyAt,
   waitUntilHealthy,
+  writePidRecord,
 } from "./plugin/lifecycle.js";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./plugin/service.js";
 import { cmdUpdate } from "./plugin/update.js";
 import { applyAutofindResults, runAutofind } from "./providers/autofind.js";
-import { allProviders, providerById, providerExtraFields } from "./providers/catalog.js";
+import {
+  allProviders,
+  providerById,
+  providerExtraFields,
+  type ProviderDescriptor,
+} from "./providers/catalog.js";
 import { suggestedBaseUrl } from "./providers/inventory.js";
 import { buildModelCatalog, probeProvider } from "./proxy/models.js";
 import { probeProviderAccess } from "./proxy/model-access.js";
@@ -54,6 +64,7 @@ Usage:
   free-opencode log [--lines <n>]
   free-opencode service install|uninstall|status
   free-opencode update
+  free-opencode doctor [--fix]
   free-opencode overnight [--parallel]
   free-opencode opencode [args...]
   free-opencode hermes [args...]
@@ -72,7 +83,7 @@ async function cmdOvernight(parallel: boolean): Promise<void> {
   // immediate launchOpenCode would race it for the port and could spawn a
   // second proxy. Wait until the port answers before handing off to the agent.
   const settings = applyEnvOverrides(loadSettings());
-  const url = `http://${settings.listen.host}:${settings.listen.port}`;
+  const url = proxyUrl(settings);
   if (!(await waitUntilHealthy(url))) {
     console.error(`The proxy did not become healthy at ${url}; cannot launch overnight.`);
     process.exit(1);
@@ -90,7 +101,7 @@ async function cmdOvernight(parallel: boolean): Promise<void> {
 async function cmdStart(foreground: boolean): Promise<void> {
   const settings = applyEnvOverrides(loadSettings());
   process.env[TOKEN_ENV] = settings.proxyAuthToken;
-  const url = `http://${settings.listen.host}:${settings.listen.port}`;
+  const url = proxyUrl(settings);
   const health = await fetchProxyHealth(url);
   if (health?.ok && !isStaleProxy(health, localCodeBuiltAt())) {
     console.log(`Already running at ${url}`);
@@ -98,19 +109,27 @@ async function cmdStart(foreground: boolean): Promise<void> {
     return;
   }
   if (health?.ok) {
-    stopDetachedProxy();
+    if (!(await replaceStaleProxy(url))) {
+      console.log(`A stale proxy is running at ${url} but is not one this CLI can stop.`);
+      console.log(
+        "Restart the OpenCode session (or service) that hosts it to pick up the new build."
+      );
+      return;
+    }
     console.log("Replaced stale proxy with the current build.");
   }
   if (!foreground) {
     const pid = spawnDetachedProxy();
-    writeFileSync(pidPath(), `${pid}\n`);
+    writePidRecord({ pid, kind: "detached", port: settings.listen.port });
     console.log(`Proxy ${url} (pid ${pid})`);
     console.log(`Admin ${url}/admin`);
     return;
   }
   const proxy = startProxy(settings);
   await waitForListen(proxy);
-  writeFileSync(pidPath(), `${process.pid}\n`);
+  // This process *is* the dedicated proxy (detached child or service).
+  writePidRecord({ pid: process.pid, kind: "detached", port: settings.listen.port });
+  clearPidRecordOnExit();
   console.log(`Proxy ${proxy.url}`);
   console.log(`Admin ${proxy.url}/admin`);
   const stop = (): void => {
@@ -123,20 +142,19 @@ async function cmdStart(foreground: boolean): Promise<void> {
   });
 }
 
-function cmdStop(): void {
-  try {
-    const pid = Number(readFileSync(pidPath(), "utf8").trim());
-    stopDetachedProxy();
-    void appendLog("proxy.stop", { pid: pid > 0 ? pid : undefined });
-    console.log("Stopped.");
-  } catch {
-    console.log("Proxy was not running (or pid file missing).");
+async function cmdStop(): Promise<void> {
+  const result = await stopProxyAt(proxyUrl(applyEnvOverrides(loadSettings())));
+  if (result.stopped) {
+    void appendLog("proxy.stop", { pid: result.pid });
+    console.log(`Stopped (pid ${result.pid}).`);
+    return;
   }
+  console.log(`Proxy not stopped: ${result.reason}.`);
 }
 
 async function cmdStatus(): Promise<void> {
   const settings = applyEnvOverrides(loadSettings());
-  const url = `http://${settings.listen.host}:${settings.listen.port}`;
+  const url = proxyUrl(settings);
   const health = await fetchProxyHealth(url);
   console.log(`url: ${url}`);
   console.log(`admin: ${url}/admin`);
@@ -176,7 +194,29 @@ function formatRoute(route: RouteHopRecord | null): string {
   });
 }
 
-function formatConnectRow(p: ReturnType<typeof allProviders>[number]): string {
+function fail(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
+
+type ProviderTarget = {
+  provider: ProviderDescriptor;
+  baseProviderId: string;
+  account: string | null;
+  /** `provider` or `provider@account`. */
+  resolvedProviderId: string;
+};
+
+/** Parse `provider[@account]`; exits on an unknown or unsupported provider. */
+function resolveProviderTarget(providerId: string): ProviderTarget {
+  const { provider: baseProviderId, account } = splitAccountQualifier(providerId);
+  const provider = providerById(baseProviderId);
+  if (!provider || provider.unsupported) fail(`Unknown provider '${baseProviderId}'`);
+  const resolvedProviderId = account ? `${baseProviderId}@${account}` : baseProviderId;
+  return { provider, baseProviderId, account, resolvedProviderId };
+}
+
+function formatConnectRow(p: ProviderDescriptor): string {
   const extra = providerExtraFields(p).find((field) => field.key === "baseUrl");
   const hint = p.local
     ? p.defaultBaseUrl || extra?.placeholder || "set a base URL"
@@ -184,134 +224,143 @@ function formatConnectRow(p: ReturnType<typeof allProviders>[number]): string {
   return `${p.id.padEnd(24)} ${p.local ? "self-hosted" : "cloud".padEnd(11)}  ${p.name}  ${hint}`;
 }
 
+function printConnectableProviders(): void {
+  const catalog = allProviders().filter((p) => !p.unsupported && !isAccountQualified(p.id));
+  const local = catalog.filter((p) => p.local);
+  const cloud = catalog.filter((p) => !p.local && p.env);
+  console.log("Self-hosted (Connect probes the URL and lists models):\n");
+  console.log(local.map(formatConnectRow).join("\n"));
+  console.log("\nCloud (paste an API key):\n");
+  console.log(cloud.map(formatConnectRow).join("\n"));
+  console.log("\nThen: free-opencode connect ollama");
+  console.log("      free-opencode connect tailscale_sglang");
+  console.log("      free-opencode connect open_router@work");
+  console.log("      free-opencode connect open_router --account work");
+}
+
+/** Ask for each extra field (base URL, …), defaulting to the saved or suggested value. */
+async function promptExtraFields(
+  rl: Interface,
+  provider: ProviderDescriptor
+): Promise<Record<string, string>> {
+  const saved = applyEnvOverrides(loadSettings()).extra[provider.id] ?? {};
+  const extra: Record<string, string> = {};
+  for (const field of providerExtraFields(provider)) {
+    const preset =
+      saved[field.key] ||
+      suggestedBaseUrl(provider.id) ||
+      field.placeholder ||
+      provider.defaultBaseUrl ||
+      "";
+    const prompt = preset ? `${field.label} [${preset}]: ` : `${field.label}: `;
+    const value = (await rl.question(prompt)).trim() || preset;
+    if (value) extra[field.key] = value;
+    else if (field.required) fail(`${field.label} is required.`);
+  }
+  return extra;
+}
+
+async function probeOrFail(
+  settings: Settings,
+  provider: ProviderDescriptor
+): Promise<{ baseUrl: string; models: string[] }> {
+  const probed = await probeProvider(settings, provider);
+  if (!probed.ok) fail(`Could not reach ${provider.name} at ${probed.baseUrl}: ${probed.error}`);
+  return probed;
+}
+
 async function cmdConnect(providerId?: string): Promise<void> {
-  const catalog = allProviders().filter((p) => !p.unsupported);
   if (!providerId) {
-    const local = catalog.filter((p) => p.local && !isAccountQualified(p.id));
-    const cloud = catalog.filter((p) => !p.local && p.env && !isAccountQualified(p.id));
-    console.log("Self-hosted (Connect probes the URL and lists models):\n");
-    console.log(local.map(formatConnectRow).join("\n"));
-    console.log("\nCloud (paste an API key):\n");
-    console.log(cloud.map(formatConnectRow).join("\n"));
-    console.log("\nThen: free-opencode connect ollama");
-    console.log("      free-opencode connect tailscale_sglang");
-    console.log("      free-opencode connect open_router@work");
-    console.log("      free-opencode connect open_router --account work");
+    printConnectableProviders();
     return;
   }
-  const { provider: baseProviderId, account } = splitAccountQualifier(providerId);
-  const provider = providerById(baseProviderId);
-  if (!provider || provider.unsupported) {
-    console.error(`Unknown provider '${baseProviderId}'`);
-    process.exit(1);
-  }
+  const target = resolveProviderTarget(providerId);
+  const { provider } = target;
   if (provider.credentialUrl) console.log(`Key URL: ${provider.credentialUrl}`);
   if (provider.notes) console.log(provider.notes);
   const rl = createInterface({ input, output });
   try {
-    const extra: Record<string, string> = {};
-    for (const field of providerExtraFields(provider)) {
-      const preset =
-        applyEnvOverrides(loadSettings()).extra[provider.id]?.[field.key] ||
-        suggestedBaseUrl(provider.id) ||
-        field.placeholder ||
-        provider.defaultBaseUrl ||
-        "";
-      const prompt = preset ? `${field.label} [${preset}]: ` : `${field.label}: `;
-      const value = (await rl.question(prompt)).trim() || preset;
-      if (value) extra[field.key] = value;
-      else if (field.required) {
-        console.error(`${field.label} is required.`);
-        process.exit(1);
-      }
-    }
+    const extra = await promptExtraFields(rl, provider);
     let settings = applyEnvOverrides(loadSettings());
-    // If the user gave an account-qualified provider, ensure the account exists
-    if (account) {
+    if (target.account) {
       try {
-        const result = addAccount(settings, baseProviderId, account);
-        settings = result.settings;
+        settings = addAccount(settings, target.baseProviderId, target.account).settings;
       } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
+        fail(error instanceof Error ? error.message : String(error));
       }
     }
-    const resolvedProviderId = account ? `${baseProviderId}@${account}` : baseProviderId;
-    const resolvedProvider = providerById(resolvedProviderId) ?? provider;
-
+    const resolvedProvider = providerById(target.resolvedProviderId) ?? provider;
     if (resolvedProvider.local) {
-      settings = {
-        ...settings,
-        extra: {
-          ...settings.extra,
-          [resolvedProviderId]: {
-            ...settings.extra[resolvedProviderId],
-            ...extra,
-          },
-        },
-      };
-      const probed = await probeProvider(settings, resolvedProvider);
-      if (!probed.ok) {
-        console.error(
-          `Could not reach ${resolvedProvider.name} at ${probed.baseUrl}: ${probed.error}`
-        );
-        process.exit(1);
-      }
-      settings = connectProvider(settings, resolvedProviderId, extra, probed.models);
-      saveSettings(settings);
-      console.log(`Connected ${resolvedProviderId} at ${probed.baseUrl}`);
-      if (probed.models.length === 0)
-        console.log("No models listed. Pull or load one, then connect again.");
-      else {
-        console.log(`Models (${probed.models.length}):`);
-        for (const model of probed.models.slice(0, 20))
-          console.log(`  ${resolvedProviderId}/${model}`);
-        if (probed.models.length > 20) console.log(`  … ${probed.models.length - 20} more`);
-      }
-      console.log(`Default model: ${settings.model ?? "(unset)"}`);
+      await connectSelfHosted(settings, target, resolvedProvider, extra);
       return;
     }
-    if (!provider.env) {
-      console.error(`Provider '${providerId}' is not connectable.`);
-      process.exit(1);
-    }
-    const existingKey = settings.keys[resolvedProviderId]?.trim() || "";
-    const typed = (
-      await rl.question(
-        existingKey ? `${provider.name} API key [saved]: ` : `${provider.name} API key: `
-      )
-    ).trim();
-    const key = typed || existingKey;
-    if (!key) {
-      console.error("No key entered.");
-      process.exit(1);
-    }
-    settings = setProviderKey(settings, resolvedProviderId, key, extra);
-    const probed = await probeProvider(settings, resolvedProvider);
-    if (!probed.ok) {
-      console.error(
-        `Could not reach ${resolvedProvider.name} at ${probed.baseUrl}: ${probed.error}`
-      );
-      process.exit(1);
-    }
-    settings = connectProvider(settings, resolvedProviderId, extra, probed.models);
-    if (baseProviderId === "bai") {
-      console.log("Probing which B.ai models answer without deposit/balance…");
-      const access = await probeProviderAccess(settings, resolvedProviderId, { force: true });
-      settings = access.settings;
-      const open = access.probed.filter((row) => row.status === "open").map((row) => row.slug);
-      const paywall = access.probed
-        .filter((row) => row.status === "paywall")
-        .map((row) => row.slug);
-      if (open.length) console.log(`Open (auto-route): ${open.join(", ")}`);
-      if (paywall.length) console.log(`Paywall (skipped): ${paywall.join(", ")}`);
-    }
-    saveSettings(settings);
-    console.log(`Connected ${resolvedProviderId}. Models: ${probed.models.length}`);
-    console.log(`Default model: ${settings.model ?? "(unchanged)"}`);
+    if (!provider.env) fail(`Provider '${providerId}' is not connectable.`);
+    await connectCloud(rl, settings, target, resolvedProvider, extra);
   } finally {
     rl.close();
   }
+}
+
+async function connectSelfHosted(
+  settings: Settings,
+  target: ProviderTarget,
+  provider: ProviderDescriptor,
+  extra: Record<string, string>
+): Promise<void> {
+  const id = target.resolvedProviderId;
+  // Probe with the typed URL before anything is saved.
+  const withUrl: Settings = {
+    ...settings,
+    extra: { ...settings.extra, [id]: { ...settings.extra[id], ...extra } },
+  };
+  const probed = await probeOrFail(withUrl, provider);
+  const next = connectProvider(withUrl, id, extra, probed.models);
+  saveSettings(next);
+  console.log(`Connected ${id} at ${probed.baseUrl}`);
+  if (probed.models.length === 0) {
+    console.log("No models listed. Pull or load one, then connect again.");
+  } else {
+    console.log(`Models (${probed.models.length}):`);
+    for (const model of probed.models.slice(0, 20)) console.log(`  ${id}/${model}`);
+    if (probed.models.length > 20) console.log(`  … ${probed.models.length - 20} more`);
+  }
+  console.log(`Default model: ${next.model ?? "(unset)"}`);
+}
+
+async function connectCloud(
+  rl: Interface,
+  settings: Settings,
+  target: ProviderTarget,
+  provider: ProviderDescriptor,
+  extra: Record<string, string>
+): Promise<void> {
+  const id = target.resolvedProviderId;
+  const name = target.provider.name;
+  const existingKey = settings.keys[id]?.trim() || "";
+  const typed = (
+    await rl.question(existingKey ? `${name} API key [saved]: ` : `${name} API key: `)
+  ).trim();
+  const key = typed || existingKey;
+  if (!key) fail("No key entered.");
+  let next = setProviderKey(settings, id, key, extra);
+  const probed = await probeOrFail(next, provider);
+  next = connectProvider(next, id, extra, probed.models);
+  if (target.baseProviderId === "bai") next = await probeBaiAccess(next, id);
+  saveSettings(next);
+  console.log(`Connected ${id}. Models: ${probed.models.length}`);
+  console.log(`Default model: ${next.model ?? "(unchanged)"}`);
+}
+
+async function probeBaiAccess(settings: Settings, providerId: string): Promise<Settings> {
+  console.log("Probing which B.ai models answer without deposit/balance…");
+  const access = await probeProviderAccess(settings, providerId, { force: true });
+  const slugsWith = (status: string): string[] =>
+    access.probed.filter((row) => row.status === status).map((row) => row.slug);
+  const open = slugsWith("open");
+  const paywall = slugsWith("paywall");
+  if (open.length) console.log(`Open (auto-route): ${open.join(", ")}`);
+  if (paywall.length) console.log(`Paywall (skipped): ${paywall.join(", ")}`);
+  return access.settings;
 }
 
 async function cmdAutofind(): Promise<void> {
@@ -352,13 +401,7 @@ function cmdRemove(providerId?: string): void {
     console.log("      free-opencode remove open_router@work");
     return;
   }
-  const { provider: baseProviderId, account } = splitAccountQualifier(providerId);
-  const provider = providerById(baseProviderId);
-  if (!provider || provider.unsupported) {
-    console.error(`Unknown provider '${baseProviderId}'`);
-    process.exit(1);
-  }
-  const resolvedProviderId = account ? `${baseProviderId}@${account}` : baseProviderId;
+  const { resolvedProviderId } = resolveProviderTarget(providerId);
   if (!isProviderConfigured(settings, resolvedProviderId)) {
     console.log(`${resolvedProviderId} is not saved.`);
     return;
@@ -431,7 +474,9 @@ async function cmdService(action: string | undefined): Promise<void> {
   switch (action) {
     case "install": {
       // Stop any detached proxy first so the service owns the port cleanly.
-      stopDetachedProxy();
+      const settings = applyEnvOverrides(loadSettings());
+      const url = proxyUrl(settings);
+      await stopProxyAt(url);
       let installed = false;
       try {
         serviceInstall();
@@ -451,8 +496,6 @@ async function cmdService(action: string | undefined): Promise<void> {
       // is still down (e.g. systemd slow, or the unit could not be created), fall
       // back to a detached proxy. Never block on a foreground proxy here — the
       // installers call `service install` and would otherwise hang forever.
-      const settings = applyEnvOverrides(loadSettings());
-      const url = `http://${settings.listen.host}:${settings.listen.port}`;
       if (!installed || !(await waitUntilHealthy(url))) {
         await cmdStart(false);
       }
@@ -460,7 +503,7 @@ async function cmdService(action: string | undefined): Promise<void> {
     }
     case "uninstall":
       serviceUninstall();
-      stopDetachedProxy();
+      await stopProxyAt(proxyUrl(applyEnvOverrides(loadSettings())));
       console.log(
         "Keep-alive service removed. Run `free-opencode start` to run the proxy on demand."
       );
@@ -489,38 +532,35 @@ async function cmdService(action: string | undefined): Promise<void> {
   }
 }
 
+/** `connect <id> [--account <label>]` → `id@label`; an `@` already in the id wins. */
+function connectTargetFromArgs(rest: string[]): string | undefined {
+  const args = rest.slice();
+  let accountFlag: string | undefined;
+  const flagIndex = args.findIndex((a) => a === "--account" || a === "-a");
+  if (flagIndex >= 0) {
+    accountFlag = args[flagIndex + 1];
+    args.splice(flagIndex, 2);
+  }
+  const target = args[0];
+  if (!accountFlag) return target;
+  if (!target) fail("--account requires a provider id");
+  return target.includes("@") ? target : `${target}@${accountFlag}`;
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "start":
     await cmdStart(rest.includes("--foreground"));
     break;
   case "stop":
-    cmdStop();
+    await cmdStop();
     break;
   case "status":
     await cmdStatus();
     break;
-  case "connect": {
-    let accountFlag: string | undefined;
-    let connectTarget: string | undefined;
-    const args = rest.slice();
-    const flagIndex = args.findIndex((a) => a === "--account" || a === "-a");
-    if (flagIndex >= 0) {
-      accountFlag = args[flagIndex + 1];
-      args.splice(flagIndex, flagIndex + 1 <= args.length ? 2 : 1);
-    }
-    connectTarget = args[0];
-    // If --account was given but the target already embeds an @, that wins.
-    // Otherwise append @account to the bare provider.
-    if (accountFlag && connectTarget && !connectTarget.includes("@")) {
-      connectTarget = `${connectTarget}@${accountFlag}`;
-    } else if (accountFlag && !connectTarget) {
-      console.error("--account requires a provider id");
-      process.exit(1);
-    }
-    await cmdConnect(connectTarget);
+  case "connect":
+    await cmdConnect(connectTargetFromArgs(rest));
     break;
-  }
   case "autofind":
     await cmdAutofind();
     break;
@@ -544,7 +584,7 @@ switch (cmd) {
   case "admin":
     {
       const settings = applyEnvOverrides(loadSettings());
-      console.log(`http://${settings.listen.host}:${settings.listen.port}/admin`);
+      console.log(`${proxyUrl(settings)}/admin`);
     }
     break;
   case "log":
@@ -557,9 +597,25 @@ switch (cmd) {
   case "service":
     await cmdService(rest[0]);
     break;
-  case "update":
-    await cmdUpdate();
+  case "update": {
+    const result = await cmdUpdate();
+    for (const step of result.steps) console.log(`  ${step}`);
+    if (result.errors.length > 0) {
+      for (const error of result.errors) console.error(`update failed: ${error}`);
+      process.exitCode = 1;
+    } else {
+      console.log(
+        result.changed ? `Updated ${result.before} → ${result.after}.` : "Already up to date."
+      );
+    }
     break;
+  }
+  case "doctor": {
+    const doctor = await runDoctor({ fix: rest.includes("--fix") });
+    console.log(doctor.report);
+    process.exitCode = doctor.ok ? 0 : 1;
+    break;
+  }
   case "overnight":
     await cmdOvernight(rest.includes("--parallel"));
     break;

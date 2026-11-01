@@ -33,6 +33,7 @@ against them is worth filing:
 - **Credential handling.** Secrets reaching a log, a trace, an artifact on disk, or a tool response that travels back to a model. Redaction is applied to captured output and to URL userinfo; a bypass is in scope.
 - **The MCP tool surface** (`mcp-server/src/*_tools.ts`). A tool that reads or writes outside its declared boundary, or whose declared safety annotations understate what it does.
 - **Routing and lane selection.** Anything that causes work to leave the machine when it should not — most importantly, any path that selects a cloud lane while `policy.cloudEscalation.optIn` is `false`. Cloud escalation being opt-in is a security property here, not a preference.
+- **The Free OpenCode proxy** (`packages/plugin/src/proxy/`). It holds provider API keys and listens on loopback. A way for a web page, another local user, or a network peer to read keys, change settings, or relay requests through it is in scope — in particular a bypass of the Host / Origin / content-type guards or the Admin token.
 - **Session and artifact storage.** Scratch directories, capture files, and log files are expected to be owner-only; a path that widens those permissions is in scope.
 - **Supply chain.** A runtime dependency of `@xx-stack/mcp-server` with a known exploitable advisory. The package is not published to any registry and is run from a clone, so "shipped" here means "reached at runtime by anyone running this server", not "distributed by us".
 
@@ -49,12 +50,16 @@ CI runs `npm audit --omit=dev --audit-level=high` on every push and pull
 request, so a high or critical advisory against a **shipped** dependency breaks
 the build. The runtime dependency surface is deliberately small — the MCP
 server ships two direct dependencies, `@modelcontextprotocol/sdk` and `zod`.
+The root `package.json` overrides `zod` to a patched release, because a
+dev-only dependency (`@opencode-ai/plugin`) pins an older one that npm would
+otherwise hoist for the SDK to use at runtime.
 
 Dev dependencies are updated by Dependabot but are **not** a build gate, for the
-reason given under "out of scope". One known dev-only advisory is open: `eslint`
-is pinned at `8.57.1`, which is end-of-life and pulls a `js-yaml` with two high
-advisories. Clearing it means migrating to ESLint 9 flat config, which is
-tracked as ordinary maintenance work rather than as a vulnerability.
+reason given under "out of scope". ESLint is on 10 with a flat config
+(`eslint.config.mjs`). Remaining dev-only advisories are in `minimatch` (via
+typescript-eslint) and `toml` (via `@opencode-ai/plugin` → `effect`); both
+clear only with upstream releases. TypeScript stays on 6.x because
+typescript-eslint does not yet support TypeScript 7.
 
 ## Threat model in one paragraph
 

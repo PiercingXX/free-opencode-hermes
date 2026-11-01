@@ -2,18 +2,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { CompletionMemorySyncGuard } from "./memory_runtime.js";
-import type { SupervisorToolDeps } from "./supervisor_tool_deps.js";
+import { withLockedSession, type SupervisorToolDeps } from "./supervisor_tool_deps.js";
 
 import { jsonContent } from "./agent_tool_helpers.js";
 import { getCompletionMemorySyncStatus } from "./memory_runtime.js";
 import { compactOutput } from "./output_compaction.js";
-import { guardStoreAccess } from "./supervisor_store_runtime.js";
-import {
-  buildContinuationPrompt,
-  isDotenvPath,
-  redactDotenvAssignments,
-  redactSecrets,
-} from "./supervisor_completion_tools.js";
+import { isDotenvPath, redactDotenvAssignments, redactSecrets } from "./secret_redaction.js";
+import { buildContinuationPrompt } from "./supervisor_prompts.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -224,97 +219,88 @@ export async function reviewToContinuation(
   const readMemorySyncStatus =
     overrides.getCompletionMemorySyncStatus ?? getCompletionMemorySyncStatus;
 
-  return guardStoreAccess(() =>
-    deps.withSupervisorStoreLock(async () => {
-      const reliability = await deps.loadReliabilityConfig();
-      const store = deps.pruneSupervisorStore(await deps.readSupervisorStore(), reliability);
-      const state = store.sessions[sessionId];
-      if (!state) {
-        return jsonContent({ status: "missing", sessionId });
-      }
+  return withLockedSession(deps, sessionId, async ({ store, state }) => {
+    // The session's repo, not the server's launch directory (MCP-8).
+    const diffCwd = cwd?.trim() || state.completionMemorySync?.cwd || process.cwd();
 
-      // The session's repo, not the server's launch directory (MCP-8).
-      const diffCwd = cwd?.trim() || state.completionMemorySync?.cwd || process.cwd();
-
-      let diffSource: "argument" | "git" | "unavailable";
-      let diffError: string | null = null;
-      let rawDiff = "";
-      if (diff !== undefined) {
-        rawDiff = diff;
-        diffSource = "argument";
+    let diffSource: "argument" | "git" | "unavailable";
+    let diffError: string | null = null;
+    let rawDiff = "";
+    if (diff !== undefined) {
+      rawDiff = diff;
+      diffSource = "argument";
+    } else {
+      const detection = await readDiff(diffCwd);
+      if (detection.status === "detected") {
+        rawDiff = detection.diff;
+        diffSource = "git";
       } else {
-        const detection = await readDiff(diffCwd);
-        if (detection.status === "detected") {
-          rawDiff = detection.diff;
-          diffSource = "git";
-        } else {
-          diffSource = "unavailable";
-          diffError = detection.detail;
-        }
+        diffSource = "unavailable";
+        diffError = detection.detail;
       }
+    }
 
-      // Redact first, then compact: redacting the retained text after a cut
-      // could leave half a credential intact on the truncation boundary.
-      const compacted = compactOutput(redactDiffSecrets(rawDiff, { source: diffSource }), {
-        cap: REVIEW_DIFF_CAP,
-        stripAnsi: true,
-      });
+    // Redact first, then compact: redacting the retained text after a cut
+    // could leave half a credential intact on the truncation boundary.
+    const compacted = compactOutput(redactDiffSecrets(rawDiff, { source: diffSource }), {
+      cap: REVIEW_DIFF_CAP,
+      stripAnsi: true,
+    });
 
-      const now = Date.now();
-      state.continuationCount += 1;
-      state.lastContinuationAt = now;
-      deps.pushSessionEvent(state, "review.injected", `review with ${notes.length} notes`);
-      await deps.writeSupervisorStore(store);
+    const now = Date.now();
+    state.continuationCount += 1;
+    state.lastContinuationAt = now;
+    deps.pushSessionEvent(state, "review.injected", `review with ${notes.length} notes`);
+    await deps.writeSupervisorStore(store);
 
-      const mustAddress = notes.map((note) => ({
-        note,
-        required: true,
-      }));
+    const mustAddress = notes.map((note) => ({
+      note,
+      required: true,
+    }));
 
-      const memorySyncStatus = state.completionMemorySync
-        ? await readMemorySyncStatus(state.completionMemorySync)
-        : null;
+    const memorySyncStatus = state.completionMemorySync
+      ? await readMemorySyncStatus(state.completionMemorySync)
+      : null;
 
-      const diffSection =
-        diffSource === "unavailable"
-          ? `(diff unavailable — git diff failed in ${diffCwd}: ${diffError}; the review notes below still apply to the current working tree)`
-          : compacted.output.length > 0
-            ? compacted.output
-            : "(no diff detected — review notes apply to the current working tree)";
+    const diffSection =
+      diffSource === "unavailable"
+        ? `(diff unavailable — git diff failed in ${diffCwd}: ${diffError}; the review notes below still apply to the current working tree)`
+        : compacted.output.length > 0
+          ? compacted.output
+          : "(no diff detected — review notes apply to the current working tree)";
 
-      const prompt = buildContinuationPrompt(
-        sessionId,
-        state.continuationCount,
-        state.currentRoute,
-        state.completionMemorySync,
-        memorySyncStatus,
-        /* completionRecoveryReason */ "review_to_continuation",
-        /* remediationChecklist */ [],
-        notes,
-        [
-          "- mustAddress: every item under remaining tasks above is a review finding and is required; none may be deferred",
-          `- diff source: ${diffSource} (cwd ${diffCwd})`,
-          ...(compacted.dropped.length > 0
-            ? [`- diff compaction: ${compacted.dropped.join("; ")}`]
-            : []),
-          "- diff under review:",
-          diffSection,
-        ]
-      );
+    const prompt = buildContinuationPrompt(
+      sessionId,
+      state.continuationCount,
+      state.currentRoute,
+      state.completionMemorySync,
+      memorySyncStatus,
+      /* completionRecoveryReason */ "review_to_continuation",
+      /* remediationChecklist */ [],
+      notes,
+      [
+        "- mustAddress: every item under remaining tasks above is a review finding and is required; none may be deferred",
+        `- diff source: ${diffSource} (cwd ${diffCwd})`,
+        ...(compacted.dropped.length > 0
+          ? [`- diff compaction: ${compacted.dropped.join("; ")}`]
+          : []),
+        "- diff under review:",
+        diffSection,
+      ]
+    );
 
-      return jsonContent({
-        status: "ready",
-        reasonCode: "review_to_continuation_emitted",
-        sessionId,
-        continuationCount: state.continuationCount,
-        mustAddress,
-        diffSource,
-        diffCwd,
-        diffError,
-        diffDropped: compacted.dropped,
-        memorySyncDrift: memorySyncStatus?.driftDetected ?? null,
-        prompt,
-      });
-    })
-  );
+    return jsonContent({
+      status: "ready",
+      reasonCode: "review_to_continuation_emitted",
+      sessionId,
+      continuationCount: state.continuationCount,
+      mustAddress,
+      diffSource,
+      diffCwd,
+      diffError,
+      diffDropped: compacted.dropped,
+      memorySyncDrift: memorySyncStatus?.driftDetected ?? null,
+      prompt,
+    });
+  });
 }

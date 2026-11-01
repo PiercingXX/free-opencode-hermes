@@ -21,7 +21,8 @@ Usage: ./install-hermes.sh [--skip-hermes] [--no-systemd]
 Installs Hermes Agent, generates lanes from inventory.json, installs the
 loopback orchestration proxy, and puts `xx-hermes` on PATH.
 
-  --skip-hermes   Do not download Hermes Agent (use an existing install)
+  --skip-hermes   Do not download Hermes Agent (use an existing install;
+                  same as FOC_SKIP_VENDOR_INSTALL=1)
   --no-systemd    Skip user-systemd units; start the proxy in the foreground docs
 EOF
       exit 0
@@ -49,7 +50,7 @@ if [ "$SKIP_HERMES_BIN" -eq 0 ]; then
     info "Hermes Agent already on PATH: $(command -v hermes)"
   else
     info "installing Hermes Agent"
-    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+    run_vendor_installer https://hermes-agent.nousresearch.com/install.sh "Hermes Agent" FOC_SKIP_VENDOR_INSTALL
     hash -r || true
     have hermes || warn "Hermes installer finished but 'hermes' is not on PATH yet — open a new shell"
   fi

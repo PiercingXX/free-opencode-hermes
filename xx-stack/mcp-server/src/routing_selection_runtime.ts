@@ -189,6 +189,75 @@ export interface WatchdogProbeDeps {
   fetchResidentModels?: (host: Host) => Promise<ResidentModel[] | null>;
 }
 
+interface ProbedLane {
+  candidate: { tierId: string; host: Host };
+  host: Host;
+  candidateModel: string | null;
+  candidateHealth:
+    | HostModelHealthResult
+    | { hostHealthy: false; modelAvailable: false; reason: "circuit breaker active" };
+  isBanned: boolean;
+  residency: LaneResidency;
+  memoryPressure: HostMemoryPressure | null;
+  overload: boolean;
+}
+
+/**
+ * Probe one fallback lane: breaker check, health, and — riding the same slot —
+ * residency and memory pressure.
+ */
+async function probeFallbackLane(
+  candidate: { tierId: string; host: Host },
+  description: string,
+  banned: Set<string>,
+  probeHealth: NonNullable<WatchdogProbeDeps["checkHostModelHealth"]>,
+  probeResident: NonNullable<WatchdogProbeDeps["fetchResidentModels"]>
+): Promise<ProbedLane> {
+  const candidateModel = chooseModelForTask(candidate.host, description);
+  const key = failureKey(candidate.host.id, candidateModel);
+  if (banned.has(key)) {
+    return {
+      candidate,
+      host: candidate.host,
+      candidateModel,
+      candidateHealth: {
+        hostHealthy: false,
+        modelAvailable: false,
+        reason: "circuit breaker active",
+      } as const,
+      isBanned: true,
+      residency: "unknown" as LaneResidency,
+      memoryPressure: null,
+      overload: false,
+    };
+  }
+  const candidateHealth = await probeHealth(candidate.host, candidateModel);
+  // The residency probe rides this fan-out slot — the same slot that just
+  // dialled this endpoint for health. There is no second pass over the
+  // fleet, and a host without capabilities.supportsResidentModelInspection
+  // is never dialled for it at all: fetchResidentModels returns null before
+  // touching the network. An unreachable host is not asked either; its
+  // residency is unknown, which costs it nothing in the ranking.
+  const resident = candidateHealth.hostHealthy ? await probeResident(candidate.host) : null;
+  const residency: LaneResidency =
+    resident === null
+      ? "unknown"
+      : candidateModel && isModelResident(resident, candidateModel)
+        ? "warm"
+        : "cold";
+  const memoryPressure = laneMemoryPressure(candidate.host, resident);
+  return {
+    candidate,
+    host: candidate.host,
+    candidateModel,
+    candidateHealth,
+    isBanned: false,
+    residency,
+    memoryPressure,
+    overload: memoryPressure?.overload === true,
+  };
+}
+
 export async function buildWatchdogRouteCandidates(
   registry: Registry,
   description: string,
@@ -253,51 +322,11 @@ export async function buildWatchdogRouteCandidates(
   // Probe up to maxFallbacks * 2 candidates in parallel so we have healthy spares
   const probeCount = Math.min(allCandidates.length, maxFallbacks * 2);
   const probeResults = await Promise.all(
-    allCandidates.slice(0, probeCount).map(async (candidate) => {
-      const candidateModel = chooseModelForTask(candidate.host, description);
-      const key = failureKey(candidate.host.id, candidateModel);
-      if (banned.has(key)) {
-        return {
-          candidate,
-          host: candidate.host,
-          candidateModel,
-          candidateHealth: {
-            hostHealthy: false,
-            modelAvailable: false,
-            reason: "circuit breaker active",
-          } as const,
-          isBanned: true,
-          residency: "unknown" as LaneResidency,
-          memoryPressure: null,
-          overload: false,
-        };
-      }
-      const candidateHealth = await probeHealth(candidate.host, candidateModel);
-      // The residency probe rides this fan-out slot — the same slot that just
-      // dialled this endpoint for health. There is no second pass over the
-      // fleet, and a host without capabilities.supportsResidentModelInspection
-      // is never dialled for it at all: fetchResidentModels returns null before
-      // touching the network. An unreachable host is not asked either; its
-      // residency is unknown, which costs it nothing in the ranking.
-      const resident = candidateHealth.hostHealthy ? await probeResident(candidate.host) : null;
-      const residency: LaneResidency =
-        resident === null
-          ? "unknown"
-          : candidateModel && isModelResident(resident, candidateModel)
-            ? "warm"
-            : "cold";
-      const memoryPressure = laneMemoryPressure(candidate.host, resident);
-      return {
-        candidate,
-        host: candidate.host,
-        candidateModel,
-        candidateHealth,
-        isBanned: false,
-        residency,
-        memoryPressure,
-        overload: memoryPressure?.overload === true,
-      };
-    })
+    allCandidates
+      .slice(0, probeCount)
+      .map((candidate) =>
+        probeFallbackLane(candidate, description, banned, probeHealth, probeResident)
+      )
   );
 
   // Fold the live signals into the ordering here, not into hostCapacityScore:
@@ -697,13 +726,17 @@ const DEPENDENCY_SCHEDULE_NOTE =
   "xx-stack does not dispatch, poll, or sequence these — the calling agent runs a wave, " +
   "confirms it finished, and comes back for the next.";
 
-function normalizeParallelTasks(tasks: Array<string | ParallelTaskInput>): Array<{
+interface NormalizedParallelTask {
   id: string;
   description: string;
   blockedBy: string[];
   cohortKind: "slice" | "hypothesis";
   diversityCell?: DiversityCell;
-}> {
+}
+
+function normalizeParallelTasks(
+  tasks: Array<string | ParallelTaskInput>
+): NormalizedParallelTask[] {
   return tasks.map((task, index) =>
     typeof task === "string"
       ? { id: String(index), description: task, blockedBy: [], cohortKind: "slice" as const }
@@ -716,6 +749,56 @@ function normalizeParallelTasks(tasks: Array<string | ParallelTaskInput>): Array
           ...(task.diversityCell ? { diversityCell: task.diversityCell } : {}),
         }
   );
+}
+
+/**
+ * Walk tiers in preference order and take the host with the lowest
+ * load-to-capacity pressure (ties broken by static capacity score) among the
+ * hosts allowed for this task. Null when no tier has an eligible host.
+ */
+function pickLeastPressuredHost(
+  orderedTiers: string[],
+  hostsByTier: Map<string, Host[]>,
+  hostLoad: Map<string, number>,
+  description: string
+): { tierId: string; host: Host } | null {
+  const pressure = (host: Host): number =>
+    (hostLoad.get(host.id) ?? 0) / effectiveParallelCapacity(host);
+  for (const tierId of orderedTiers) {
+    const candidates = (hostsByTier.get(tierId) ?? []).filter((host) =>
+      hostAllowedForTask(host, description)
+    );
+    if (candidates.length === 0) continue;
+
+    const ranked = [...candidates].sort((left, right) => {
+      const leftPressure = pressure(left);
+      const rightPressure = pressure(right);
+      if (leftPressure !== rightPressure) return leftPressure - rightPressure;
+      return hostCapacityScore(right) - hostCapacityScore(left);
+    });
+    return { tierId, host: ranked[0]! };
+  }
+  return null;
+}
+
+/** Per-host assigned load against its parallel capacity, busiest first. */
+function summarizeHostUtilization(
+  hostLoad: Map<string, number>,
+  registry: Registry
+): ParallelSchedule["hostUtilization"] {
+  return Array.from(hostLoad.entries())
+    .map(([hostId, assigned]) => {
+      const found = findHostById(registry, hostId);
+      const capacity = found ? effectiveParallelCapacity(found.host) : 1;
+      return {
+        host: hostId,
+        tier: found?.tierId ?? "unknown",
+        assignedTasks: assigned,
+        parallelCapacity: capacity,
+        estimatedWaves: Math.max(1, Math.ceil(assigned / capacity)),
+      };
+    })
+    .sort((left, right) => Number(right.assignedTasks) - Number(left.assignedTasks));
 }
 
 /**
@@ -775,32 +858,8 @@ export function routeParallelTasks(
       ...orderedTierIds.filter((tierId) => tierId !== preferredTierId),
     ];
 
-    let selectedTierId = orderedTiers[0] ?? preferredTierId;
-    let selectedHost: Host | null = null;
-
-    for (const tierId of orderedTiers) {
-      const candidates = (allHostsByTier.get(tierId) ?? []).filter((host) =>
-        hostAllowedForTask(host, description)
-      );
-      if (candidates.length === 0) continue;
-
-      const ranked = [...candidates].sort((left, right) => {
-        const leftCapacity = effectiveParallelCapacity(left);
-        const rightCapacity = effectiveParallelCapacity(right);
-        const leftLoad = hostLoad.get(left.id) ?? 0;
-        const rightLoad = hostLoad.get(right.id) ?? 0;
-        const leftPressure = leftLoad / leftCapacity;
-        const rightPressure = rightLoad / rightCapacity;
-        if (leftPressure !== rightPressure) return leftPressure - rightPressure;
-        return hostCapacityScore(right) - hostCapacityScore(left);
-      });
-
-      selectedHost = ranked[0] ?? null;
-      selectedTierId = tierId;
-      if (selectedHost) break;
-    }
-
-    if (!selectedHost) {
+    const picked = pickLeastPressuredHost(orderedTiers, allHostsByTier, hostLoad, description);
+    if (!picked) {
       return {
         taskIndex: index,
         description,
@@ -809,6 +868,7 @@ export function routeParallelTasks(
       };
     }
 
+    const { tierId: selectedTierId, host: selectedHost } = picked;
     const currentLoad = hostLoad.get(selectedHost.id) ?? 0;
     const capacity = effectiveParallelCapacity(selectedHost);
     hostLoad.set(selectedHost.id, currentLoad + 1);
@@ -834,28 +894,7 @@ export function routeParallelTasks(
     };
   });
 
-  const hostUtilization = Array.from(hostLoad.entries())
-    .map(([hostId, assigned]) => {
-      let host: Host | null = null;
-      let tierId = "unknown";
-      for (const tier of registry.tiers) {
-        const match = tier.hosts.find((candidate) => candidate.id === hostId) ?? null;
-        if (match) {
-          host = match;
-          tierId = tier.id;
-          break;
-        }
-      }
-      const capacity = host ? effectiveParallelCapacity(host) : 1;
-      return {
-        host: hostId,
-        tier: tierId,
-        assignedTasks: assigned,
-        parallelCapacity: capacity,
-        estimatedWaves: Math.max(1, Math.ceil(assigned / capacity)),
-      };
-    })
-    .sort((left, right) => Number(right.assignedTasks) - Number(left.assignedTasks));
+  const hostUtilization = summarizeHostUtilization(hostLoad, registry);
 
   if (!edged) {
     // The flat form returns the document it has always returned, key for key.
@@ -891,8 +930,19 @@ export function routeParallelTasks(
   };
 
   const hypothesis = normalized.filter((task) => task.cohortKind === "hypothesis");
-  if (hypothesis.length === 0) return schedule;
+  if (hypothesis.length > 0) flagHypothesisCollisions(schedule, hypothesis);
+  return schedule;
+}
 
+/**
+ * Quality-diversity check over the hypothesis slices: those sharing a diversity
+ * cell or exceeding the family cap are flagged on their assignment, never
+ * reassigned.
+ */
+function flagHypothesisCollisions(
+  schedule: ParallelSchedule,
+  hypothesis: NormalizedParallelTask[]
+): void {
   const qd = allocateHypothesisCohort(
     hypothesis.map((task) => ({
       id: task.id,
@@ -920,5 +970,4 @@ export function routeParallelTasks(
       "Plan only: hypothesis slices that share a diversity cell or exceed the family cap are " +
       "flagged, not reassigned. xx-stack does not dispatch; restack the cohort before running it.",
   };
-  return schedule;
 }

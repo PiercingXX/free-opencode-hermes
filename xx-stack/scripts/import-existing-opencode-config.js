@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const { writeFileAtomic } = require("./lib/fs-atomic.js");
 const { HOST_IDS, NETWORK_SCOPES, PROVIDER_IDS, TIER_IDS } = require("./lib/runtime-constants.js");
 
 const registryPath = process.env.REGISTRY_PATH;
@@ -10,21 +11,6 @@ const recommendationsPath = process.env.RECOMMENDATIONS_PATH;
 if (!registryPath || !targetConfigPath || !recommendationsPath) {
   console.error("missing required environment for prior config import");
   process.exit(1);
-}
-
-function writeFileAtomic(filePath, data) {
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    fs.writeFileSync(tempPath, data);
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw error;
-  }
 }
 
 const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));

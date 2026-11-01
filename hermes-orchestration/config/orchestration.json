@@ -77,15 +77,14 @@
       ]
     },
     "allow_shell_execution": false,
+    "allow_repo_code_execution": false,
     "allowed_command_prefixes": [
       "pwd",
       "ls",
       "cat",
       "git status",
       "git diff",
-      "git log",
-      "python3 -m pytest",
-      "npm test"
+      "git log"
     ]
   },
   "proxy": {

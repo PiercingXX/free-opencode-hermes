@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { repoRoot, settingsPath } from "../paths.js";
+import { repoRoot } from "../paths.js";
 import type { ProviderDescriptor, ProviderFamily } from "./catalog.js";
+import { settingsSnapshot } from "../config/settings-snapshot.js";
 
 export type FoundHost = {
   id: string;
@@ -14,7 +15,8 @@ export type FoundHost = {
   models: string[];
 };
 
-const KIND_PORTS: Record<
+/** Self-hosted runtime kinds: model-list family, placeholder API key, default port. */
+const RUNTIME_KINDS: Record<
   string,
   { family: ProviderFamily; staticKey: string; defaultPort: number }
 > = {
@@ -78,7 +80,7 @@ function runtimeModels(runtime: InventoryRuntime): string[] {
 export function loadInventoryLanes(): InventoryLane[] {
   const path = inventoryPath();
   if (!path) return [];
-  let mtime = 0;
+  let mtime: number;
   try {
     mtime = statSync(path).mtimeMs;
   } catch {
@@ -100,13 +102,13 @@ export function loadInventoryLanes(): InventoryLane[] {
     const address = machine.network?.address?.trim();
     const scope = machine.network?.scope?.trim() || "unknown";
     if (!machineId || !address) continue;
-    const local = scope === "localhost" || scope === "loopback";
+    // Loopback runtimes are the built-in ollama/sglang/… catalog entries.
+    if (scope === "localhost" || scope === "loopback") continue;
     for (const runtime of machine.runtimes ?? []) {
       const kind = runtime.kind?.trim();
-      if (!kind || !KIND_PORTS[kind]) continue;
-      if (local) continue;
+      if (!kind || !RUNTIME_KINDS[kind]) continue;
       if (machineId.startsWith("example-") && runtime.enabled !== true) continue;
-      const port = Number(runtime.port) || KIND_PORTS[kind].defaultPort;
+      const port = Number(runtime.port) || RUNTIME_KINDS[kind].defaultPort;
       const providerId = `${kind}-${machineId}`.replace(/[^a-zA-Z0-9_-]+/g, "-");
       lanes.push({
         providerId,
@@ -125,82 +127,74 @@ export function loadInventoryLanes(): InventoryLane[] {
   return lanes;
 }
 
+/** A self-hosted provider card whose base URL is required and prefilled. */
+function selfHostedDescriptor(
+  id: string,
+  name: string,
+  kind: string,
+  baseUrl: string,
+  models: string[],
+  notes: string
+): ProviderDescriptor {
+  const spec = RUNTIME_KINDS[kind] ?? RUNTIME_KINDS.sglang;
+  return {
+    id,
+    name,
+    local: true,
+    family: spec.family,
+    staticKey: spec.staticKey,
+    defaultBaseUrl: baseUrl,
+    extra: [{ key: "baseUrl", label: "Base URL", placeholder: baseUrl, required: true }],
+    defaultModels: models,
+    notes,
+  };
+}
+
 export function inventoryProviders(): ProviderDescriptor[] {
   return loadInventoryLanes().map((lane) => {
-    const spec = KIND_PORTS[lane.kind];
-    return {
-      id: lane.providerId,
-      name: lane.label,
-      local: true,
-      family: spec.family,
-      staticKey: spec.staticKey,
-      defaultBaseUrl: lane.endpoint,
-      extra: [
-        {
-          key: "baseUrl",
-          label: "Base URL",
-          placeholder: lane.endpoint,
-          required: true,
-        },
-      ],
-      defaultModels: lane.models,
-      notes: [
-        lane.enabled ? `From inventory (${lane.scope}).` : `From inventory, currently disabled.`,
-        lane.notes,
-      ]
-        .filter(Boolean)
-        .join(" "),
-    };
+    const notes = [
+      lane.enabled ? `From inventory (${lane.scope}).` : `From inventory, currently disabled.`,
+      lane.notes,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return selfHostedDescriptor(
+      lane.providerId,
+      lane.label,
+      lane.kind,
+      lane.endpoint,
+      lane.models,
+      notes
+    );
   });
 }
 
 export function foundHostProviders(): ProviderDescriptor[] {
-  const path = settingsPath();
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as { foundHosts?: FoundHost[] };
-    const hosts = Array.isArray(parsed.foundHosts) ? parsed.foundHosts : [];
-    return hosts
-      .filter((host) => host?.id && host.baseUrl)
-      .map((host) => {
-        const spec = KIND_PORTS[host.kind] ?? KIND_PORTS.sglang;
-        return {
-          id: host.id,
-          name: host.label || `${host.host} · ${host.kind}`,
-          local: true,
-          family: spec.family,
-          staticKey: spec.staticKey,
-          defaultBaseUrl: host.baseUrl,
-          extra: [
-            {
-              key: "baseUrl",
-              label: "Base URL",
-              placeholder: host.baseUrl,
-              required: true,
-            },
-          ],
-          defaultModels: host.models ?? [],
-          notes: `Found on ${host.scope} (${host.host}).`,
-        };
-      });
-  } catch {
-    return [];
-  }
+  return (settingsSnapshot()?.foundHosts ?? []).map((host) =>
+    selfHostedDescriptor(
+      host.id,
+      host.label || `${host.host} · ${host.kind}`,
+      host.kind,
+      host.baseUrl,
+      host.models ?? [],
+      `Found on ${host.scope} (${host.host}).`
+    )
+  );
 }
 
+/** Generic Tailscale catalog entries → the runtime kind an enabled inventory lane can fill. */
+const TAILSCALE_GENERIC_KINDS: Record<string, string> = {
+  tailscale_ollama: "ollama",
+  tailscale_sglang: "sglang",
+};
+
 export function suggestedBaseUrl(providerId: string): string {
-  const compound = providerId.includes("@");
-  const baseProviderId = compound ? providerId.split("@")[0] : providerId;
-  const lane = loadInventoryLanes().find((row) => row.providerId === baseProviderId);
+  const baseProviderId = providerId.split("@")[0];
+  const lanes = loadInventoryLanes();
+  const lane = lanes.find((row) => row.providerId === baseProviderId);
   if (lane) return lane.endpoint;
-  const enabled = loadInventoryLanes().filter((row) => row.enabled);
-  if (baseProviderId === "tailscale_ollama") {
-    const hit = enabled.find((row) => row.kind === "ollama" && row.scope === "tailscale");
-    return hit?.endpoint ?? "";
-  }
-  if (baseProviderId === "tailscale_sglang") {
-    const hit = enabled.find((row) => row.kind === "sglang" && row.scope === "tailscale");
-    return hit?.endpoint ?? "";
-  }
-  return "";
+  const kind = TAILSCALE_GENERIC_KINDS[baseProviderId];
+  if (!kind) return "";
+  const hit = lanes.find((row) => row.enabled && row.kind === kind && row.scope === "tailscale");
+  return hit?.endpoint ?? "";
 }

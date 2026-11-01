@@ -49,11 +49,12 @@ function binDir() {
   return path.join(home, ".local", "bin");
 }
 
-function writeAtomic(filePath, contents) {
+function writeAtomic(filePath, contents, mode) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, contents, { encoding: "utf8" });
+  fs.writeFileSync(tmp, contents, { encoding: "utf8", ...(mode ? { mode } : {}) });
   fs.renameSync(tmp, filePath);
+  if (mode && !isWin) fs.chmodSync(filePath, mode);
 }
 
 /**
@@ -71,7 +72,7 @@ function copyDir(src, dest) {
 
 /** Remove a path that may be a dangling symlink (rmSync can no-op those). */
 function removePath(dest) {
-  let st = null;
+  let st;
   try {
     st = fs.lstatSync(dest);
   } catch {
@@ -100,7 +101,7 @@ function copyPath(src, dest) {
     return;
   }
   if (srcStat.isDirectory()) {
-    let destStat = null;
+    let destStat;
     try {
       destStat = fs.lstatSync(dest);
     } catch {
@@ -249,27 +250,95 @@ function installWrapper(name, execPath, scriptPath, extraArgs = []) {
   info(`installed ${name} -> ${scriptPath}${extraArgs.length ? " " + extraArgs.join(" ") : ""}`);
 }
 
+/**
+ * Strip // and /* *\/ comments and trailing commas from JSONC (OpenCode accepts
+ * both in opencode.json). String-aware: comment markers and commas inside
+ * string literals are left alone.
+ */
+function stripJsonc(text) {
+  // Pass 1: drop comments. Pass 2: drop commas before } or ]. Both passes
+  // copy string literals verbatim (including escaped quotes).
+  const scan = (input, onCode) => {
+    let out = "";
+    for (let i = 0; i < input.length; i += 1) {
+      if (input[i] === '"') {
+        let j = i + 1;
+        while (j < input.length && input[j] !== '"') j += input[j] === "\\" ? 2 : 1;
+        out += input.slice(i, j + 1);
+        i = j;
+        continue;
+      }
+      const step = onCode(input, i);
+      out += step.emit;
+      i = step.next;
+    }
+    return out;
+  };
+  const noComments = scan(text, (input, i) => {
+    if (input[i] === "/" && input[i + 1] === "/") {
+      let j = i;
+      while (j < input.length && input[j] !== "\n") j += 1;
+      return { emit: "\n", next: j };
+    }
+    if (input[i] === "/" && input[i + 1] === "*") {
+      const end = input.indexOf("*/", i + 2);
+      return { emit: " ", next: end < 0 ? input.length : end + 1 };
+    }
+    return { emit: input[i], next: i };
+  });
+  return scan(noComments, (input, i) => {
+    if (input[i] !== ",") return { emit: input[i], next: i };
+    let j = i + 1;
+    while (j < input.length && /\s/.test(input[j])) j += 1;
+    return { emit: input[j] === "}" || input[j] === "]" ? "" : ",", next: i };
+  });
+}
+
+/** Parse JSON or JSONC; throws on anything else. Leading BOM is ignored. */
+function parseJsonc(raw) {
+  const text = raw.replace(/^\uFEFF/, "");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return JSON.parse(stripJsonc(text));
+  }
+}
+
+/** Returns the object, or null when the file exists but cannot be parsed. */
 function loadJsonObject(configPath) {
   if (!fs.existsSync(configPath)) return {};
-  const raw = fs.readFileSync(configPath, "utf8").trim();
-  if (!raw) return {};
+  const raw = fs.readFileSync(configPath, "utf8");
+  if (!raw.trim()) return {};
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonc(raw);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    die(
-      `${configPath} is not valid JSON (${detail}). Fix or move it aside, then re-run the installer.`
-    );
+    console.error(`warning: ${configPath} could not be parsed as JSON/JSONC (${detail}).`);
+    return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
   return parsed;
 }
 
+/** Keep a copy of a user config before rewriting it (comments are not preserved). */
+function backupFile(configPath) {
+  if (!fs.existsSync(configPath)) return;
+  const backup = `${configPath}.bak`;
+  fs.copyFileSync(configPath, backup);
+  if (!isWin) fs.chmodSync(backup, 0o600);
+  info(`backed up ${configPath} -> ${backup}`);
+}
+
 function freeOpenCodeSettings() {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(home, ".free-opencode", "config.json"), "utf8"));
-    const host = typeof raw.listen?.host === "string" && raw.listen.host.trim() ? raw.listen.host.trim() : "127.0.0.1";
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(home, ".free-opencode", "config.json"), "utf8")
+    );
+    const host =
+      typeof raw.listen?.host === "string" && raw.listen.host.trim()
+        ? raw.listen.host.trim()
+        : "127.0.0.1";
     const port = Number.isInteger(raw.listen?.port) && raw.listen.port > 0 ? raw.listen.port : 8082;
     const token = typeof raw.proxyAuthToken === "string" ? raw.proxyAuthToken.trim() : "";
     return { baseURL: `http://${host}:${port}/v1`, token };
@@ -280,6 +349,15 @@ function freeOpenCodeSettings() {
 
 function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
   const config = loadJsonObject(configPath);
+  if (config === null) {
+    console.error(
+      `warning: left ${configPath} untouched. Add the plugin yourself, e.g.\n` +
+        `  "plugin": [${JSON.stringify(pluginRef)}]\n` +
+        "then re-run the installer to register the provider and MCP server."
+    );
+    hostSetupLog("host-setup.plugin-skipped", { configPath });
+    return false;
+  }
   const plugins = Array.isArray(config.plugin)
     ? config.plugin.filter((entry) => {
         if (typeof entry !== "string") return true;
@@ -318,7 +396,8 @@ function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
   config.default_agent = "build";
   config.agent = config.agent && typeof config.agent === "object" ? config.agent : {};
   for (const name of ["build", "plan", "general"]) {
-    const existing = config.agent[name] && typeof config.agent[name] === "object" ? config.agent[name] : {};
+    const existing =
+      config.agent[name] && typeof config.agent[name] === "object" ? config.agent[name] : {};
     config.agent[name] = {
       ...existing,
       mode: "primary",
@@ -341,9 +420,12 @@ function mergePlugin(configPath, pluginRef, mcpEntrypoint) {
     };
     info("registered MCP xx-stack-platform-routing");
   }
-  writeAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  backupFile(configPath);
+  // May hold the proxy token (provider.options.apiKey): keep it owner-only.
+  writeAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`, 0o600);
   hostSetupLog("host-setup.plugin", { configPath, pluginRef, mcp: Boolean(mcpEntrypoint) });
   info(`registered plugin in ${configPath}`);
+  return true;
 }
 
 function opencodeHost() {
@@ -426,12 +508,7 @@ function hermesHost() {
   fs.mkdirSync(tokenDir, { recursive: true });
   const tokenFile = path.join(tokenDir, "proxy.env");
   if (!fs.existsSync(tokenFile)) {
-    writeAtomic(tokenFile, `HERMES_PROXY_TOKEN=${randomBytes(24).toString("hex")}\n`);
-    try {
-      fs.chmodSync(tokenFile, 0o600);
-    } catch {
-      // Windows
-    }
+    writeAtomic(tokenFile, `HERMES_PROXY_TOKEN=${randomBytes(24).toString("hex")}\n`, 0o600);
     info(`wrote ${tokenFile}`);
   } else {
     info(`keeping existing ${tokenFile}`);
@@ -447,7 +524,14 @@ function hermesHost() {
   }
 }
 
-export { copyDir, copyAgentsSkippingNativePrimaries, quoteForCmd };
+export {
+  copyDir,
+  copyAgentsSkippingNativePrimaries,
+  mergePlugin,
+  parseJsonc,
+  quoteForCmd,
+  stripJsonc,
+};
 
 function isDirectRun() {
   const entry = process.argv[1];

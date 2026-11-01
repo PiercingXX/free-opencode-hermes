@@ -125,7 +125,8 @@ test("serviceInstall on win32 fails when schtasks returns non-zero", () => {
     status: 1,
     error: undefined as unknown as Error,
     stdout: "",
-    stderr: "ERROR: The task XML contains a value which is incorrectly formatted or out of range.\r\n",
+    stderr:
+      "ERROR: The task XML contains a value which is incorrectly formatted or out of range.\r\n",
   }));
   __setExecFileSync(() => "");
 
@@ -185,5 +186,38 @@ test("serviceStatus reads the on-disk unit, not a live systemd answer", () => {
   assert.equal(after.installed, true);
   assert.equal(after.source, "systemd");
 
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("serviceInstall on linux fails when systemctl exits non-zero (stderr surfaced)", () => {
+  const home = tempHome();
+  __setTestHome(home);
+  __setTestPlatform("linux");
+  __setSpawnSync((cmd) => ({
+    status: cmd === "systemctl" ? 1 : 0,
+    error: undefined as unknown as Error,
+    stdout: "",
+    stderr: cmd === "systemctl" ? "Failed to connect to bus: No medium found" : "",
+  }));
+  __setExecFileSync(() => "");
+  assert.throws(
+    () => serviceInstall(),
+    /systemctl --user daemon-reload failed: Failed to connect to bus/
+  );
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("serviceInstall on mac fails when launchctl bootstrap exits non-zero", () => {
+  const home = tempHome();
+  __setTestHome(home);
+  __setTestPlatform("darwin");
+  __setSpawnSync((cmd, args) => ({
+    status: cmd === "launchctl" && args[0] === "bootstrap" ? 5 : 0,
+    error: undefined as unknown as Error,
+    stdout: "",
+    stderr: "Bootstrap failed: 5: Input/output error",
+  }));
+  __setExecFileSync(() => "");
+  assert.throws(() => serviceInstall(), /launchctl bootstrap failed: Bootstrap failed/);
   rmSync(home, { recursive: true, force: true });
 });

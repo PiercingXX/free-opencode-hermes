@@ -4,8 +4,12 @@ import { join, sep } from "node:path";
 
 import {
   LOG_DIR,
+  MAX_SESSION_LOG_BYTES,
+  MAX_SESSION_LOG_FILES,
+  SESSION_LOG_RETENTION_DAYS,
   __logIo,
   logEvent,
+  pruneSessionLogs,
   resetTelemetryHealth,
   resolveSessionLogPath,
   sanitizeSessionIdForPath,
@@ -469,3 +473,73 @@ test(
     );
   })
 );
+
+// ---------------------------------------------------------------------------
+// Session log rotation + retention
+// ---------------------------------------------------------------------------
+
+test(
+  "an oversized session log rotates to .1 before the next append",
+  withFileIo(
+    { [join(SESSIONS_DIR, "sx-big.jsonl")]: "y".repeat(MAX_SESSION_LOG_BYTES + 1) },
+    async (io) => {
+      await logEvent({ session: "sx-big" }, "tick.result", {});
+      const current = join(SESSIONS_DIR, "sx-big.jsonl");
+      assert.deepEqual(io.renames, [{ from: current, to: `${current}.1` }]);
+      assert.ok(!io.appendCalls[0]!.payload.startsWith("\n"), "the fresh file needs no heal");
+      assert.equal(io.files.get(current)!.toString("utf-8"), io.appendCalls[0]!.payload);
+    }
+  )
+);
+
+test("pruneSessionLogs deletes expired logs and the oldest beyond the file cap", async () => {
+  const realIo = { ...__logIo };
+  const now = Date.parse("2026-11-01T00:00:00.000Z");
+  const day = 24 * 60 * 60 * 1000;
+  const files = new Map<string, number>();
+  // Two expired logs (current + rotated), one fresh, plus enough fresh files to
+  // exceed the count cap by three.
+  files.set("old.jsonl", now - (SESSION_LOG_RETENTION_DAYS + 1) * day);
+  files.set("old.jsonl.1", now - (SESSION_LOG_RETENTION_DAYS + 2) * day);
+  for (let i = 0; i < MAX_SESSION_LOG_FILES + 3; i += 1) {
+    files.set(`s-${i}.jsonl`, now - day + i * 1000); // larger i = newer
+  }
+  files.set("not-a-log.txt", now - 100 * day);
+  const unlinked: string[] = [];
+  __logIo.readdir = (async () => [...files.keys()]) as unknown as typeof __logIo.readdir;
+  __logIo.stat = (async (path: unknown) => {
+    const name = String(path).slice(SESSIONS_DIR.length + 1);
+    const mtimeMs = files.get(name);
+    if (mtimeMs === undefined) throw enoent();
+    return { size: 10, mtimeMs };
+  }) as unknown as typeof __logIo.stat;
+  __logIo.unlink = (async (path: unknown) => {
+    unlinked.push(String(path).slice(SESSIONS_DIR.length + 1));
+  }) as unknown as typeof __logIo.unlink;
+  try {
+    const removed = await pruneSessionLogs(now);
+    assert.equal(removed, 5);
+    assert.deepEqual(unlinked.sort(), [
+      "old.jsonl",
+      "old.jsonl.1",
+      "s-0.jsonl",
+      "s-1.jsonl",
+      "s-2.jsonl",
+    ]);
+    assert.ok(!unlinked.includes("not-a-log.txt"), "only session logs are pruned");
+  } finally {
+    Object.assign(__logIo, realIo);
+  }
+});
+
+test("pruneSessionLogs tolerates a missing sessions directory", async () => {
+  const realIo = { ...__logIo };
+  __logIo.readdir = (async () => {
+    throw enoent();
+  }) as unknown as typeof __logIo.readdir;
+  try {
+    assert.equal(await pruneSessionLogs(), 0);
+  } finally {
+    Object.assign(__logIo, realIo);
+  }
+});

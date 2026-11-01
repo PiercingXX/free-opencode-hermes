@@ -3,13 +3,8 @@ import { join } from "node:path";
 
 import type { Config } from "@opencode-ai/plugin";
 
-import {
-  applyEnvOverrides,
-  loadSettings,
-  readyProviderIds,
-  type Settings,
-} from "../config/settings.js";
-import { catalogClientModel, modelConfigEntry } from "../launchers/opencode-config.js";
+import { applyEnvOverrides, loadSettings, type Settings } from "../config/settings.js";
+import { catalogModelConfig } from "../launchers/opencode-config.js";
 import { nodeExecutable, opencodeConfigDir } from "../platform.js";
 import {
   CATALOG_MODEL_ID,
@@ -19,7 +14,7 @@ import {
   TOKEN_ENV,
   xxStackDir,
 } from "../paths.js";
-import { loadRuntimeAgents, loadSharedInstructions } from "./agents.js";
+import { loadRuntimeAgents, loadSharedInstructions, type InjectedAgent } from "./agents.js";
 import {
   isLaneAgentName,
   listReadyLocalLanes,
@@ -38,12 +33,10 @@ import { appendLog } from "../proxy/route-log.js";
 export const OPENCODE_AGENT_STEPS_FLOOR = 120;
 const DISABLED_HOST_AGENTS = new Set(["ping", "planning", "researcher"]);
 const OPENCODE_NATIVE_PRIMARIES = new Set(["build", "plan", "general"]);
-/** Native primaries plus xx-stack unattended orchestrators — omit OpenCode `steps`. */
-const UNBOUNDED_STEPS_AGENTS = new Set([
-  ...OPENCODE_NATIVE_PRIMARIES,
-  "execution-orchestrator",
-  "parallel-execution-orchestrator",
-]);
+/** xx-stack unattended orchestrators: primary, MCP task tools, halt rule. */
+const ORCHESTRATOR_AGENTS = new Set(["execution-orchestrator", "parallel-execution-orchestrator"]);
+/** Native primaries plus orchestrators — omit OpenCode `steps`. */
+const UNBOUNDED_STEPS_AGENTS = new Set([...OPENCODE_NATIVE_PRIMARIES, ...ORCHESTRATOR_AGENTS]);
 
 /** MCP tools the unattended orchestrators must keep; abort stays off. */
 const ORCHESTRATOR_MCP_TOOLS = [
@@ -70,24 +63,38 @@ const ORCHESTRATOR_HALT =
   '"session closed" / "nothing further to do". If your previous assistant message already said ' +
   "DONE, session closed, nothing further, or a final recap, output only STOP with no tools.";
 
+/** Object-valued config field as a fresh record; anything else (unset, string, array) → {}. */
+function recordOf(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+/** Existing permission with bash/edit forced to allow (unattended agents must not prompt). */
+function allowBashAndEdit(permission: unknown): Record<string, unknown> {
+  return { ...recordOf(permission), bash: "allow", edit: "allow" };
+}
+
 function enableOrchestratorMcpTools(def: AgentConfig): void {
-  const tools: Record<string, boolean> = {
-    ...((def.tools as Record<string, boolean> | undefined) ?? {}),
-  };
+  const tools = recordOf(def.tools);
   for (const name of ORCHESTRATOR_MCP_TOOLS) tools[name] = true;
   tools.supervisor_abort_session = false;
   def.tools = tools;
 }
+
 /** Markdown names that replace OpenCode's native build/plan/general tools. */
-export const OPENCODE_NATIVE_PRIMARY_FILES = ["build.md", "plan.md", "general.md"] as const;
+const OPENCODE_NATIVE_PRIMARY_FILES = ["build.md", "plan.md", "general.md"] as const;
 const PLUGIN_TOOLS = ["foc_status", "foc_models"] as const;
 
-/**
- * The catalog overlay does not set `agent.*.prompt`. A two-line stub (or xx-stack `build.md`)
- * replaces OpenCode's native tool instructions and the model falls back to empty
- * Read/$ calls. Native primaries omit `prompt` so the built-in agent keeps its schemas.
- */
+/** Marker that tells applyRuntimeExtras the tool-use prefix is already present. */
+const TOOL_USE_MARKER = "Free OpenCode is routing models";
 
+/**
+ * Global instructions instead of per-agent prompts: a two-line `agent.*.prompt`
+ * stub (or xx-stack `build.md`) replaces OpenCode's native tool instructions and
+ * the model falls back to empty Read/$ calls. Native primaries omit `prompt` so
+ * the built-in agent keeps its schemas.
+ */
 const TOOL_USE_PREFIX =
   "Free OpenCode is routing models through the local proxy. Prefer xx-stack routing tools when work should run on another machine you own. Cloud stays opt-in.\n\n" +
   "Every tool call must include the required arguments from that tool's schema. Empty bash/read/glob/grep calls are aborted and must not be retried empty.\n" +
@@ -150,7 +157,7 @@ const LANE_WORKER_PROMPT =
   "changed and checks run, then stop.";
 
 /** Advertise each ready local as a selectable free-opencode/<provider>/<model>. */
-export function localLaneModelEntries(
+function localLaneModelEntries(
   settings: Settings
 ): Record<string, { name: string; reasoning?: boolean }> {
   const out: Record<string, { name: string; reasoning?: boolean }> = {};
@@ -184,11 +191,7 @@ export function registerParallelLaneAgents(
       temperature: 0,
       prompt: LANE_WORKER_PROMPT,
       steps: openCodeAgentSteps(existing.steps),
-      permission: {
-        ...((existing.permission as Record<string, unknown> | undefined) ?? {}),
-        bash: "allow",
-        edit: "allow",
-      },
+      permission: allowBashAndEdit(existing.permission),
     };
   }
   return lanes;
@@ -222,12 +225,6 @@ export function catalogAgentOverlay(
   return out;
 }
 
-export function vendorAgentNames(): string[] {
-  const names = new Set<string>(DISABLED_HOST_AGENTS);
-  for (const agent of loadRuntimeAgents()) names.add(agent.name);
-  return [...names];
-}
-
 /**
  * Keep OpenCode's native build/plan/general tools. xx-stack agents stay
  * available as subagents; only ping/planning/researcher stay hidden.
@@ -243,11 +240,7 @@ export function neutralizeVendorAgents(config: MutableConfig): void {
       disable: false,
       hidden: false,
       mode: "primary",
-      permission: {
-        ...((existing.permission as Record<string, unknown> | undefined) ?? {}),
-        bash: "allow",
-        edit: "allow",
-      },
+      permission: allowBashAndEdit(existing.permission),
     };
     delete next.prompt;
     delete next.steps;
@@ -302,24 +295,6 @@ export function stripNativePrimaryAgentFiles(home?: string): string[] {
   return removed;
 }
 
-export function userConfiguredAgentNames(home?: string): string[] {
-  const names = new Set<string>();
-  const dir = opencodeConfigDir(home);
-  for (const file of ["config.json", "opencode.json"]) {
-    try {
-      const parsed = JSON.parse(readFileSync(join(dir, file), "utf8")) as {
-        agent?: Record<string, unknown>;
-      };
-      for (const name of Object.keys(parsed.agent ?? {})) {
-        if (name.trim()) names.add(name);
-      }
-    } catch {
-      // missing or invalid
-    }
-  }
-  return [...names];
-}
-
 export function openCodeAgentSteps(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n) || n <= 0) return OPENCODE_AGENT_STEPS_FLOOR;
@@ -339,98 +314,130 @@ function enablePluginTools(config: MutableConfig): void {
   if (!agents) return;
   for (const def of Object.values(agents)) {
     if (!def || typeof def !== "object") continue;
-    const current =
-      def.tools && typeof def.tools === "object" && !Array.isArray(def.tools)
-        ? (def.tools as Record<string, unknown>)
-        : {};
-    const next = { ...current };
+    const next = recordOf(def.tools);
     for (const name of PLUGIN_TOOLS) next[name] = true;
     def.tools = next;
   }
 }
 
-export function applyRuntimeExtras(config: MutableConfig): void {
-  const mcpPath = mcpServerEntrypoint();
-  if (existsSync(mcpPath)) {
-    config.mcp = config.mcp ?? {};
-    config.mcp["xx-stack-platform-routing"] = {
-      type: "local",
-      enabled: true,
-      command: [nodeExecutable(), mcpPath],
-      environment: {
-        XX_STACK_REPO: xxStackDir(),
-        FREE_OPENCODE_REPO: repoRoot(),
-      },
-    };
-    void appendLog("mcp.spawn", { command: [nodeExecutable(), mcpPath] });
-  }
+/** Slash commands; a user-defined command of the same name wins. */
+const FOC_COMMANDS: Record<string, { template: string; description: string; agent?: string }> = {
+  "foc-plan": {
+    template: "Create an implementation plan for: $ARGUMENTS",
+    description: "Plan a change with the xx-stack plan agent",
+    agent: "plan",
+  },
+  "foc-build": {
+    template: "Implement this task with quality gates: $ARGUMENTS",
+    description: "Implement with the xx-stack build agent",
+    agent: "build",
+  },
+  "foc-review": {
+    template: "Review the current changes for production bugs and missing tests: $ARGUMENTS",
+    description: "Review with the xx-stack reviewer agent",
+    agent: "reviewer",
+  },
+  "foc-orchestrate": {
+    template: "Orchestrate this work to completion: $ARGUMENTS",
+    description: "Run the xx-stack execution orchestrator",
+    agent: "execution-orchestrator",
+  },
+};
 
-  config.agent = config.agent ?? {};
-  for (const agent of loadRuntimeAgents()) {
-    const existing = (config.agent[agent.name] ?? {}) as AgentConfig;
-    if (OPENCODE_NATIVE_PRIMARIES.has(agent.name)) {
-      const native: AgentConfig = {
-        ...existing,
-        description: agent.description ?? existing.description,
-        mode: "primary",
-        temperature: agent.temperature ?? existing.temperature,
-        permission: {
-          ...(typeof existing.permission === "object" && existing.permission
-            ? (existing.permission as Record<string, unknown>)
-            : {}),
-          ...agent.permission,
-        },
-      };
-      delete native.prompt;
-      delete native.steps;
-      (config.agent as Record<string, AgentConfig>)[agent.name] = native;
-      continue;
-    }
-    const merged: AgentConfig = {
-      ...existing,
-      prompt: agent.prompt,
-      description: agent.description ?? existing.description,
-      mode: agent.mode ?? existing.mode ?? "subagent",
-      temperature: agent.temperature ?? existing.temperature,
-      permission: {
-        ...(typeof existing.permission === "object" && existing.permission
-          ? (existing.permission as Record<string, unknown>)
-          : {}),
-        ...agent.permission,
-      },
-    };
-    if (UNBOUNDED_STEPS_AGENTS.has(agent.name)) {
-      delete merged.steps;
-    } else {
-      merged.steps = openCodeAgentSteps(existing.steps ?? agent.steps);
-    }
-    if (
-      agent.name === "execution-orchestrator" ||
-      agent.name === "parallel-execution-orchestrator"
-    ) {
-      enableOrchestratorMcpTools(merged);
-      const halt = "\n\n## Halt\n\n" + ORCHESTRATOR_HALT + "\n";
-      if (typeof merged.prompt === "string" && !merged.prompt.includes("output only STOP")) {
-        merged.prompt = merged.prompt + halt;
-      }
-      const perm =
-        merged.permission &&
-        typeof merged.permission === "object" &&
-        !Array.isArray(merged.permission)
-          ? { ...(merged.permission as Record<string, unknown>) }
-          : {};
-      perm.edit = "allow";
-      perm.bash = "allow";
-      perm.task = {
-        ...(typeof perm.task === "object" && perm.task ? perm.task : {}),
-        "*": "allow",
-      };
-      merged.permission = perm;
-      merged.mode = "primary";
-    }
-    (config.agent as Record<string, AgentConfig>)[agent.name] = merged;
+export function applyRuntimeExtras(config: MutableConfig): void {
+  registerPlatformRoutingMcp(config);
+  mergeRuntimeAgents(config);
+  normalizeAgentLimits(config);
+  pinAgentsToCatalog(config);
+  const settings = applyEnvOverrides(loadSettings());
+  const lanes = registerParallelLaneAgents(config, settings);
+  pinParallelOrchestratorToWeakestLane(config, lanes);
+  enablePluginTools(config);
+
+  config.command = config.command ?? {};
+  for (const [name, command] of Object.entries(FOC_COMMANDS)) {
+    if (!config.command[name]) config.command[name] = command;
   }
+  appendToolUseInstructions(config);
+}
+
+function registerPlatformRoutingMcp(config: MutableConfig): void {
+  const mcpPath = mcpServerEntrypoint();
+  if (!existsSync(mcpPath)) return;
+  config.mcp = config.mcp ?? {};
+  config.mcp["xx-stack-platform-routing"] = {
+    type: "local",
+    enabled: true,
+    command: [nodeExecutable(), mcpPath],
+    environment: {
+      XX_STACK_REPO: xxStackDir(),
+      FREE_OPENCODE_REPO: repoRoot(),
+    },
+  };
+  void appendLog("mcp.spawn", { command: [nodeExecutable(), mcpPath] });
+}
+
+/** Overlay xx-stack markdown agents onto whatever the user's config already defines. */
+function mergeRuntimeAgents(config: MutableConfig): void {
+  config.agent = config.agent ?? {};
   const agents = config.agent as Record<string, AgentConfig>;
+  for (const agent of loadRuntimeAgents()) {
+    const existing = agents[agent.name] ?? {};
+    agents[agent.name] = OPENCODE_NATIVE_PRIMARIES.has(agent.name)
+      ? mergeNativePrimary(existing, agent)
+      : mergeStackAgent(existing, agent);
+  }
+}
+
+/** Native build/plan/general keep OpenCode's own prompt and an unbounded loop. */
+function mergeNativePrimary(existing: AgentConfig, agent: InjectedAgent): AgentConfig {
+  const native: AgentConfig = {
+    ...existing,
+    description: agent.description ?? existing.description,
+    mode: "primary",
+    temperature: agent.temperature ?? existing.temperature,
+    permission: { ...recordOf(existing.permission), ...agent.permission },
+  };
+  delete native.prompt;
+  delete native.steps;
+  return native;
+}
+
+function mergeStackAgent(existing: AgentConfig, agent: InjectedAgent): AgentConfig {
+  const merged: AgentConfig = {
+    ...existing,
+    prompt: agent.prompt,
+    description: agent.description ?? existing.description,
+    mode: agent.mode ?? existing.mode ?? "subagent",
+    temperature: agent.temperature ?? existing.temperature,
+    permission: { ...recordOf(existing.permission), ...agent.permission },
+  };
+  if (UNBOUNDED_STEPS_AGENTS.has(agent.name)) {
+    delete merged.steps;
+  } else {
+    merged.steps = openCodeAgentSteps(existing.steps ?? agent.steps);
+  }
+  if (ORCHESTRATOR_AGENTS.has(agent.name)) applyOrchestratorPolicy(merged);
+  return merged;
+}
+
+/** Unattended orchestrators: primary, may delegate any Task, and must halt cleanly. */
+function applyOrchestratorPolicy(def: AgentConfig): void {
+  enableOrchestratorMcpTools(def);
+  if (typeof def.prompt === "string" && !def.prompt.includes("output only STOP")) {
+    def.prompt = `${def.prompt}\n\n## Halt\n\n${ORCHESTRATOR_HALT}\n`;
+  }
+  const permission = recordOf(def.permission);
+  permission.edit = "allow";
+  permission.bash = "allow";
+  permission.task = { ...recordOf(permission.task), "*": "allow" };
+  def.permission = permission;
+  def.mode = "primary";
+}
+
+/** Every agent: OpenCode steps floor (or none for unbounded); host-only agents stay hidden. */
+function normalizeAgentLimits(config: MutableConfig): void {
+  const agents = (config.agent ?? {}) as Record<string, AgentConfig>;
   for (const [name, def] of Object.entries(agents)) {
     if (!def || typeof def !== "object") continue;
     if (UNBOUNDED_STEPS_AGENTS.has(name)) {
@@ -444,62 +451,28 @@ export function applyRuntimeExtras(config: MutableConfig): void {
       def.mode = "subagent";
     }
   }
-  pinAgentsToCatalog(config);
-  const settings = applyEnvOverrides(loadSettings());
-  const lanes = registerParallelLaneAgents(config, settings);
-  pinParallelOrchestratorToWeakestLane(config, lanes);
-  enablePluginTools(config);
+}
 
-  config.command = config.command ?? {};
-  const commands: Record<string, { template: string; description: string; agent?: string }> = {
-    "foc-plan": {
-      template: "Create an implementation plan for: $ARGUMENTS",
-      description: "Plan a change with the xx-stack plan agent",
-      agent: "plan",
-    },
-    "foc-build": {
-      template: "Implement this task with quality gates: $ARGUMENTS",
-      description: "Implement with the xx-stack build agent",
-      agent: "build",
-    },
-    "foc-review": {
-      template: "Review the current changes for production bugs and missing tests: $ARGUMENTS",
-      description: "Review with the xx-stack reviewer agent",
-      agent: "reviewer",
-    },
-    "foc-orchestrate": {
-      template: "Orchestrate this work to completion: $ARGUMENTS",
-      description: "Run the xx-stack execution orchestrator",
-      agent: "execution-orchestrator",
-    },
-  };
-  for (const [name, command] of Object.entries(commands)) {
-    if (!config.command[name]) config.command[name] = command;
-  }
-
+function appendToolUseInstructions(config: MutableConfig): void {
+  const { instruction } = config;
+  const already = Array.isArray(instruction)
+    ? instruction.some((line) => line.includes(TOOL_USE_MARKER))
+    : typeof instruction === "string" && instruction.includes(TOOL_USE_MARKER);
+  if (already) return;
   const shared = loadSharedInstructions();
   const prefix = shared ? TOOL_USE_PREFIX + shared : TOOL_USE_PREFIX;
-  const already =
-    (typeof config.instruction === "string" &&
-      config.instruction.includes("Free OpenCode is routing models")) ||
-    (Array.isArray(config.instruction) &&
-      config.instruction.some((line) => line.includes("Free OpenCode is routing models")));
-  if (!already) {
-    if (Array.isArray(config.instruction)) config.instruction.push(prefix);
-    else if (typeof config.instruction === "string")
-      config.instruction = `${config.instruction}\n\n${prefix}`;
-    else config.instruction = prefix;
-  }
+  if (Array.isArray(instruction)) instruction.push(prefix);
+  else if (typeof instruction === "string") config.instruction = `${instruction}\n\n${prefix}`;
+  else config.instruction = prefix;
 }
 
 export function injectOpenCodeConfig(config: MutableConfig): void {
   stripNativePrimaryAgentFiles();
   const settings = applyEnvOverrides(loadSettings());
-  const catalog = catalogClientModel();
-  const models: Record<string, { name: string; reasoning?: boolean }> = {
-    [catalog.wireSlug]: modelConfigEntry(catalog) as { name: string; reasoning?: boolean },
+  const models = {
+    ...catalogModelConfig(),
     ...localLaneModelEntries(settings),
-  };
+  } as Record<string, { name: string; reasoning?: boolean }>;
 
   const token = settings.proxyAuthToken;
   config.provider = config.provider ?? {};
@@ -525,7 +498,6 @@ export function injectOpenCodeConfig(config: MutableConfig): void {
     bash: "allow",
     edit: "allow",
   };
-  void readyProviderIds(settings);
 }
 
 /** Zen model refs that must not win the picker. big-pickle is OpenCode's free default. */

@@ -4,10 +4,18 @@ import { resolve } from "node:path";
 
 import { emitLifecycleHooks } from "./execution_policy.js";
 import { logEvent } from "./log_worker.js";
-import type { SupervisorRoute, SupervisorSessionState } from "./supervisor_runtime.js";
+import type {
+  ReliabilityConfig,
+  SupervisorRoute,
+  SupervisorSessionState,
+} from "./supervisor_runtime.js";
 import { shouldResetFailureStreak } from "./supervisor_runtime.js";
 import { guardStoreAccess, SUPERVISOR_TERMINAL_STATUSES } from "./supervisor_store_runtime.js";
-import type { SupervisorToolDeps } from "./supervisor_tool_deps.js";
+import {
+  withLockedSession,
+  type LockedSession,
+  type SupervisorToolDeps,
+} from "./supervisor_tool_deps.js";
 import { revokeSessionTaskLeases } from "./task_runtime.js";
 
 import { jsonContent } from "./agent_tool_helpers.js";
@@ -43,6 +51,262 @@ function safeId(description: string): z.ZodType<string, string> {
       message: "must contain at least one letter or digit; dot-only identifiers are rejected",
     })
     .describe(description);
+}
+
+const TICK_HELD_STATUSES = new Set<SupervisorSessionState["status"]>([
+  ...SUPERVISOR_TERMINAL_STATUSES,
+  "blocked",
+]);
+
+/** Fold this tick's observations into the session before any decision. */
+function applyTickSignals(
+  deps: SupervisorToolDeps,
+  state: SupervisorSessionState,
+  reliability: ReliabilityConfig,
+  now: number,
+  progressObserved: boolean | undefined,
+  note: string | undefined
+): void {
+  // MCP-11: the streak decays only when genuine progress was observed
+  // after the last failure and the reset window has since elapsed. A
+  // fallback bumps lastProgressAt without being progress, so anchoring
+  // here on lastProgressAt let a slow poller zero the count every tick.
+  if (shouldResetFailureStreak(state, now, reliability)) {
+    state.failureCount = 0;
+    deps.pushSessionEvent(
+      state,
+      "failure.reset",
+      "progress observed since the last failure and the reset window elapsed; resetting consecutive failure count"
+    );
+  }
+
+  if (
+    deps.shouldAutoReleaseLock(
+      state.recoveryInFlight,
+      state.lastRecoveryAt,
+      now,
+      reliability.retryDedupeWindowMs * 3
+    )
+  ) {
+    state.recoveryInFlight = false;
+    deps.pushSessionEvent(
+      state,
+      "recovery.inflight.cleared",
+      `auto-released stale lock after ${now - (state.lastRecoveryAt ?? 0)}ms`
+    );
+  }
+
+  if (progressObserved) {
+    state.lastProgressAt = now;
+    state.lastObservedProgressAt = now;
+    state.lastOutputAt = now;
+    state.abortDetectedAt = undefined;
+    state.pendingCompletionValidationAt = undefined;
+    // MCP-11: observed progress ends the backoff window. Without this the
+    // cooldown check in tickHoldPayload flipped the status straight back to
+    // "cooldown" in the same tick, so after any fallback real progress
+    // reported as cooldown for the whole backoff window.
+    state.cooldownUntil = undefined;
+    deps.clearCompletionProof(state);
+    state.status = "running";
+    state.recoveryInFlight = false;
+    deps.pushSessionEvent(state, "progress.observed", note ?? "progress signal received");
+  } else if (note) {
+    deps.pushSessionEvent(state, "progress.note", note);
+  }
+}
+
+/**
+ * Every reason this tick does NOT recover the session — a held status, an
+ * active cooldown or abort window, a healthy progress window, or a recovery
+ * already in flight. Returns the tool payload (the caller persists the store),
+ * or null when the session is stalled and recovery should proceed.
+ */
+function tickHoldPayload(
+  deps: SupervisorToolDeps,
+  sessionId: string,
+  state: SupervisorSessionState,
+  reliability: ReliabilityConfig,
+  now: number,
+  forceRecover: boolean
+): Record<string, unknown> | null {
+  if (TICK_HELD_STATUSES.has(state.status)) {
+    return {
+      status: state.status,
+      reasonCode: "terminal_state",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      currentRoute: state.currentRoute,
+      attemptCount: state.attemptCount,
+      failureCount: state.failureCount,
+    };
+  }
+
+  if (state.cooldownUntil && now < state.cooldownUntil) {
+    state.status = "cooldown";
+    return {
+      status: "cooldown",
+      reasonCode: "cooldown_active",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      waitMs: state.cooldownUntil - now,
+      currentRoute: state.currentRoute,
+    };
+  }
+
+  if (
+    deps.isAbortWindowActive(state.abortDetectedAt, now, reliability.abortWindowMs) &&
+    !forceRecover
+  ) {
+    state.status = "cooldown";
+    return {
+      status: "cooldown",
+      reasonCode: "abort_window_active",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      waitMs: reliability.abortWindowMs - (now - (state.abortDetectedAt ?? now)),
+      currentRoute: state.currentRoute,
+    };
+  }
+
+  const sinceProgress = now - state.lastProgressAt;
+  const sinceStart = now - state.startedAt;
+  const stalled =
+    forceRecover ||
+    sinceProgress >= reliability.progressTimeoutMs ||
+    sinceStart >= reliability.hardSessionTimeoutMs;
+
+  if (!stalled) {
+    state.status = "running";
+    return {
+      status: "running",
+      reasonCode: "healthy_progress_window",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      currentRoute: state.currentRoute,
+      sinceProgressMs: sinceProgress,
+      sinceStartMs: sinceStart,
+      progressTimeoutMs: reliability.progressTimeoutMs,
+      hardSessionTimeoutMs: reliability.hardSessionTimeoutMs,
+    };
+  }
+
+  if (state.recoveryInFlight) {
+    return {
+      status: "recovering",
+      reasonCode: "retry_in_flight",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      currentRoute: state.currentRoute,
+    };
+  }
+
+  const recoveryKey = deps.makeRecoveryKey(state);
+  if (
+    deps.shouldDedupeContinuation(
+      state.lastRecoveryKey,
+      state.lastRecoveryAt,
+      recoveryKey,
+      now,
+      reliability.retryDedupeWindowMs
+    )
+  ) {
+    return {
+      status: "cooldown",
+      reasonCode: "recovery_deduped",
+      sessionId,
+      currentAttemptId: state.currentAttemptId,
+      dedupeWindowMs: reliability.retryDedupeWindowMs,
+    };
+  }
+
+  return null;
+}
+
+/** Count the stall against the session and open the host/model breaker. */
+function recordStallFailure(
+  deps: SupervisorToolDeps,
+  { store, state, reliability }: LockedSession,
+  now: number
+): void {
+  state.failureCount += 1;
+  // Anchor for the streak decay (MCP-11): the streak is measured from the
+  // last failure, never from lastProgressAt (which failover bumps).
+  state.lastFailureAt = now;
+  deps.pushSessionEvent(
+    state,
+    "session.stalled",
+    `stalled after ${now - state.lastProgressAt}ms since progress, ${now - state.startedAt}ms since start`
+  );
+
+  const previousRoute = state.currentRoute;
+  if (!previousRoute) return;
+  const key = deps.failureKey(previousRoute.host, previousRoute.model);
+  const prev = store.hostModelFailures[key] ?? { count: 0, lastFailureAt: now };
+  prev.count += 1;
+  prev.lastFailureAt = now;
+  if (prev.count >= reliability.banHostModelAfterFailures) {
+    prev.cooldownUntil = now + reliability.failureResetWindowMs;
+    deps.pushSessionEvent(
+      state,
+      "breaker.opened",
+      `${key} banned until ${new Date(prev.cooldownUntil).toISOString()}`
+    );
+  }
+  store.hostModelFailures[key] = prev;
+}
+
+/**
+ * The next precomputed fallback, or — once those are spent — a freshly routed
+ * candidate that avoids banned host/models and the new primary. Refreshing
+ * replaces the session's fallback list.
+ */
+async function selectNextFallbackRoute(
+  deps: SupervisorToolDeps,
+  { store, state, reliability }: LockedSession,
+  now: number
+): Promise<SupervisorRoute | null> {
+  const precomputed = state.fallbackRoutes[state.nextFallbackIndex] ?? null;
+  if (precomputed) {
+    state.nextFallbackIndex += 1;
+    return precomputed;
+  }
+
+  const registry = await deps.loadRegistry();
+  const banned = new Set<string>();
+  for (const [key, failure] of Object.entries(store.hostModelFailures)) {
+    if (
+      (failure.cooldownUntil ?? 0) > now &&
+      failure.count >= reliability.banHostModelAfterFailures
+    ) {
+      banned.add(key);
+    }
+  }
+
+  const refreshed = await deps.buildWatchdogRouteCandidates(
+    registry,
+    state.description,
+    state.currentRoute?.host ?? null,
+    null,
+    4,
+    banned
+  );
+
+  const primaryKey = refreshed.primary
+    ? deps.failureKey(refreshed.primary.host, refreshed.primary.model)
+    : "";
+  const nextRoute =
+    refreshed.candidates.find(
+      (candidate) => deps.failureKey(candidate.host, candidate.model) !== primaryKey
+    ) ?? null;
+
+  if (nextRoute) {
+    state.fallbackRoutes = refreshed.candidates.filter(
+      (candidate) => candidate.host !== nextRoute.host || candidate.model !== nextRoute.model
+    );
+    state.nextFallbackIndex = 0;
+  }
+  return nextRoute;
 }
 
 export function registerSupervisorSessionTools(server: McpServer, deps: SupervisorToolDeps): void {
@@ -314,385 +578,171 @@ export function registerSupervisorSessionTools(server: McpServer, deps: Supervis
       annotations: toolAnnotations("supervisor_tick"),
     },
     async ({ sessionId, progressObserved, note, forceRecover }) =>
-      guardStoreAccess(() =>
-        deps.withSupervisorStoreLock(async () => {
-          const reliability = await deps.loadReliabilityConfig();
-          const store = deps.pruneSupervisorStore(await deps.readSupervisorStore(), reliability);
-          const state = store.sessions[sessionId];
+      withLockedSession(deps, sessionId, async (session) => {
+        const { store, state, reliability } = session;
+        const now = Date.now();
 
-          if (!state) {
-            return jsonContent({ status: "missing", sessionId });
-          }
+        void logEvent({ session: sessionId }, "tick.start", {
+          sessionId,
+          status: state.status,
+          sinceProgressMs: now - state.lastProgressAt,
+          sinceStartMs: now - state.startedAt,
+          failureCount: state.failureCount,
+          attemptCount: state.attemptCount,
+          recoveryInFlight: state.recoveryInFlight,
+          abortDetectedAt: state.abortDetectedAt,
+        });
 
-          const now = Date.now();
+        applyTickSignals(deps, state, reliability, now, progressObserved, note);
 
-          void logEvent({ session: sessionId }, "tick.start", {
-            sessionId,
-            status: state.status,
-            sinceProgressMs: now - state.lastProgressAt,
-            sinceStartMs: now - state.startedAt,
-            failureCount: state.failureCount,
-            attemptCount: state.attemptCount,
-            recoveryInFlight: state.recoveryInFlight,
-            abortDetectedAt: state.abortDetectedAt,
-          });
-
-          // MCP-11: the streak decays only when genuine progress was observed
-          // after the last failure and the reset window has since elapsed. A
-          // fallback bumps lastProgressAt without being progress, so anchoring
-          // here on lastProgressAt let a slow poller zero the count every tick.
-          if (shouldResetFailureStreak(state, now, reliability)) {
-            state.failureCount = 0;
-            deps.pushSessionEvent(
-              state,
-              "failure.reset",
-              "progress observed since the last failure and the reset window elapsed; resetting consecutive failure count"
-            );
-          }
-
-          if (
-            deps.shouldAutoReleaseLock(
-              state.recoveryInFlight,
-              state.lastRecoveryAt,
-              now,
-              reliability.retryDedupeWindowMs * 3
-            )
-          ) {
-            state.recoveryInFlight = false;
-            deps.pushSessionEvent(
-              state,
-              "recovery.inflight.cleared",
-              `auto-released stale lock after ${now - (state.lastRecoveryAt ?? 0)}ms`
-            );
-          }
-
-          if (progressObserved) {
-            state.lastProgressAt = now;
-            state.lastObservedProgressAt = now;
-            state.lastOutputAt = now;
-            state.abortDetectedAt = undefined;
-            state.pendingCompletionValidationAt = undefined;
-            // MCP-11: observed progress ends the backoff window. Without this the
-            // cooldown check ten lines below flipped the status straight back to
-            // "cooldown" in the same tick, so after any fallback real progress
-            // reported as cooldown for the whole backoff window.
-            state.cooldownUntil = undefined;
-            deps.clearCompletionProof(state);
-            state.status = "running";
-            state.recoveryInFlight = false;
-            deps.pushSessionEvent(state, "progress.observed", note ?? "progress signal received");
-          } else if (note) {
-            deps.pushSessionEvent(state, "progress.note", note);
-          }
-
-          if (
-            state.status === "completed" ||
-            state.status === "blocked" ||
-            state.status === "interrupted" ||
-            state.status === "exhausted" ||
-            state.status === "force_synthesized"
-          ) {
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: state.status,
-              reasonCode: "terminal_state",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              currentRoute: state.currentRoute,
-              attemptCount: state.attemptCount,
-              failureCount: state.failureCount,
-            });
-          }
-
-          if (state.cooldownUntil && now < state.cooldownUntil) {
-            state.status = "cooldown";
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "cooldown",
-              reasonCode: "cooldown_active",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              waitMs: state.cooldownUntil - now,
-              currentRoute: state.currentRoute,
-            });
-          }
-
-          if (
-            deps.isAbortWindowActive(state.abortDetectedAt, now, reliability.abortWindowMs) &&
-            forceRecover !== true
-          ) {
-            state.status = "cooldown";
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "cooldown",
-              reasonCode: "abort_window_active",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              waitMs: reliability.abortWindowMs - (now - (state.abortDetectedAt ?? now)),
-              currentRoute: state.currentRoute,
-            });
-          }
-
-          const sinceProgress = now - state.lastProgressAt;
-          const sinceStart = now - state.startedAt;
-          const stalled =
-            forceRecover === true ||
-            sinceProgress >= reliability.progressTimeoutMs ||
-            sinceStart >= reliability.hardSessionTimeoutMs;
-
-          if (!stalled) {
-            state.status = "running";
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "running",
-              reasonCode: "healthy_progress_window",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              currentRoute: state.currentRoute,
-              sinceProgressMs: sinceProgress,
-              sinceStartMs: sinceStart,
-              progressTimeoutMs: reliability.progressTimeoutMs,
-              hardSessionTimeoutMs: reliability.hardSessionTimeoutMs,
-            });
-          }
-
-          if (state.recoveryInFlight) {
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "recovering",
-              reasonCode: "retry_in_flight",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              currentRoute: state.currentRoute,
-            });
-          }
-
-          const recoveryKey = deps.makeRecoveryKey(state);
-          if (
-            deps.shouldDedupeContinuation(
-              state.lastRecoveryKey,
-              state.lastRecoveryAt,
-              recoveryKey,
-              now,
-              reliability.retryDedupeWindowMs
-            )
-          ) {
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "cooldown",
-              reasonCode: "recovery_deduped",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              dedupeWindowMs: reliability.retryDedupeWindowMs,
-            });
-          }
-
-          state.lastRecoveryKey = recoveryKey;
-          state.lastRecoveryAt = now;
-
-          state.recoveryInFlight = true;
+        const hold = tickHoldPayload(
+          deps,
+          sessionId,
+          state,
+          reliability,
+          now,
+          forceRecover === true
+        );
+        if (hold) {
           await deps.writeSupervisorStore(store);
+          return jsonContent(hold);
+        }
 
-          state.failureCount += 1;
-          // Anchor for the streak decay (MCP-11): the streak is measured from the
-          // last failure, never from lastProgressAt (which failover bumps).
-          state.lastFailureAt = now;
-          const previousRoute = state.currentRoute;
-          deps.pushSessionEvent(
-            state,
-            "session.stalled",
-            `stalled after ${sinceProgress}ms since progress, ${sinceStart}ms since start`
-          );
+        state.lastRecoveryKey = deps.makeRecoveryKey(state);
+        state.lastRecoveryAt = now;
 
-          if (previousRoute) {
-            const key = deps.failureKey(previousRoute.host, previousRoute.model);
-            const prev = store.hostModelFailures[key] ?? { count: 0, lastFailureAt: now };
-            prev.count += 1;
-            prev.lastFailureAt = now;
-            if (prev.count >= reliability.banHostModelAfterFailures) {
-              prev.cooldownUntil = now + reliability.failureResetWindowMs;
-              deps.pushSessionEvent(
-                state,
-                "breaker.opened",
-                `${key} banned until ${new Date(prev.cooldownUntil).toISOString()}`
-              );
-            }
-            store.hostModelFailures[key] = prev;
-          }
+        state.recoveryInFlight = true;
+        await deps.writeSupervisorStore(store);
 
-          if (
-            state.failureCount >= reliability.maxConsecutiveFailures ||
-            state.attemptCount >= reliability.maxAttemptsPerSlice
-          ) {
-            state.status = "exhausted";
-            state.recoveryInFlight = false;
-            deps.pushSessionEvent(state, "session.exhausted", "max failures or attempts reached");
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "exhausted",
-              reasonCode: "attempts_exhausted",
-              reason: "max failures or attempts reached",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              attemptCount: state.attemptCount,
-              failureCount: state.failureCount,
-              currentRoute: state.currentRoute,
-              forceSynthesisAvailable: true,
-              forceSynthesisDirective:
-                "Budget exhausted. Call supervisor_force_synthesis to convert gathered evidence into an honestly-labeled best-effort answer instead of discarding partial work.",
-            });
-          }
+        recordStallFailure(deps, session, now);
 
-          let nextRoute: SupervisorRoute | null =
-            state.fallbackRoutes[state.nextFallbackIndex] ?? null;
-          if (nextRoute) {
-            state.nextFallbackIndex += 1;
-          }
-
-          if (!nextRoute) {
-            const registry = await deps.loadRegistry();
-            const banned = new Set<string>();
-            for (const [key, failure] of Object.entries(store.hostModelFailures)) {
-              if (
-                (failure.cooldownUntil ?? 0) > now &&
-                failure.count >= reliability.banHostModelAfterFailures
-              ) {
-                banned.add(key);
-              }
-            }
-
-            const refreshed = await deps.buildWatchdogRouteCandidates(
-              registry,
-              state.description,
-              previousRoute?.host ?? null,
-              null,
-              4,
-              banned
-            );
-
-            const primaryKey = refreshed.primary
-              ? deps.failureKey(refreshed.primary.host, refreshed.primary.model)
-              : "";
-            nextRoute =
-              refreshed.candidates.find(
-                (candidate) => deps.failureKey(candidate.host, candidate.model) !== primaryKey
-              ) ?? null;
-
-            if (nextRoute) {
-              state.fallbackRoutes = refreshed.candidates.filter(
-                (candidate) =>
-                  candidate.host !== nextRoute?.host || candidate.model !== nextRoute?.model
-              );
-              state.nextFallbackIndex = 0;
-            }
-          }
-
-          if (!nextRoute) {
-            state.status = "blocked";
-            state.recoveryInFlight = false;
-            deps.pushSessionEvent(state, "session.blocked", "no healthy fallback routes available");
-            await deps.writeSupervisorStore(store);
-            return jsonContent({
-              status: "blocked",
-              reasonCode: "fallback_exhausted",
-              reason: "no healthy fallback routes available",
-              sessionId,
-              currentAttemptId: state.currentAttemptId,
-              attemptCount: state.attemptCount,
-              failureCount: state.failureCount,
-              forceSynthesisAvailable: true,
-              forceSynthesisDirective:
-                "Every lane is exhausted. Call supervisor_force_synthesis to convert gathered evidence into an honestly-labeled best-effort answer instead of discarding partial work.",
-            });
-          }
-
-          if (nextRoute.endpoint.startsWith("http")) {
-            const pingOk = await deps.quickPingEndpoint(nextRoute.endpoint);
-            if (!pingOk) {
-              void logEvent("server", "fallback.ping_failed", {
-                sessionId,
-                host: nextRoute.host,
-                endpoint: nextRoute.endpoint,
-                note: "skipping dead candidate; will re-try next fallback on next tick",
-              });
-              void logEvent({ session: sessionId }, "fallback.ping_failed", {
-                host: nextRoute.host,
-                endpoint: nextRoute.endpoint,
-              });
-              state.status = "cooldown";
-              state.cooldownUntil = now + reliability.retryDedupeWindowMs;
-              state.recoveryInFlight = false;
-              await deps.writeSupervisorStore(store);
-              return jsonContent({
-                status: "cooldown",
-                reasonCode: "fallback_ping_failed",
-                sessionId,
-                skippedHost: nextRoute.host,
-                retryAfterMs: reliability.retryDedupeWindowMs,
-              });
-            }
-          }
-
-          state.currentRoute = nextRoute;
-          state.attemptCount += 1;
-          state.currentAttemptId = deps.makeAttemptId(sessionId, state.attemptCount, nextRoute);
-          state.status = "cooldown";
-          const backoffMs = deps.computeBackoffMs(reliability, state.failureCount);
-          state.cooldownUntil = now + backoffMs;
-          // Gives the new lane a fresh stall window. Deliberately does NOT touch
-          // lastObservedProgressAt: a fallback is recovery, not progress (MCP-11).
-          state.lastProgressAt = now;
+        if (
+          state.failureCount >= reliability.maxConsecutiveFailures ||
+          state.attemptCount >= reliability.maxAttemptsPerSlice
+        ) {
+          state.status = "exhausted";
           state.recoveryInFlight = false;
-          deps.pushSessionEvent(
-            state,
-            "fallback.applied",
-            `${nextRoute.host}/${nextRoute.model ?? "<none>"} (attempt ${state.attemptCount})`
-          );
-
-          void logEvent("server", "fallback.applied", {
-            sessionId,
-            host: nextRoute.host,
-            model: nextRoute.model,
-            attemptCount: state.attemptCount,
-            failureCount: state.failureCount,
-            backoffMs,
-          });
-          void logEvent({ session: sessionId }, "fallback.applied", {
-            host: nextRoute.host,
-            model: nextRoute.model,
-            attemptCount: state.attemptCount,
-            backoffMs,
-            cooldownUntil: new Date(state.cooldownUntil).toISOString(),
-          });
-
+          deps.pushSessionEvent(state, "session.exhausted", "max failures or attempts reached");
           await deps.writeSupervisorStore(store);
-
-          // At-most-one-live-instance: the supervisor
-          // has no kill channel to the stalled lane, so failover revokes its
-          // claim instead. A returning lane's write-back is then rejected rather
-          // than landing on top of the fallback lane's work. Tasks with no lease
-          // take a pure no-op path — nothing is written.
-          const revokedLeases = await revokeSessionTaskLeases(
-            sessionId,
-            new Date(now).toISOString()
-          );
-
           return jsonContent({
-            status: "recovering",
-            reasonCode: "fallback_applied",
+            status: "exhausted",
+            reasonCode: "attempts_exhausted",
+            reason: "max failures or attempts reached",
             sessionId,
             currentAttemptId: state.currentAttemptId,
-            switchedTo: nextRoute,
-            backoffMs,
-            cooldownUntil: new Date(state.cooldownUntil).toISOString(),
             attemptCount: state.attemptCount,
             failureCount: state.failureCount,
-            revokedLeases,
-            handoffDirective:
-              "Failover applied. Compose a failover handoff prompt (compose-supervisor-prompts skill) with goal, current state (DONE/PARTIAL/NOT STARTED), key decisions, traps & dead ends, relevant files, and open work so the fallback lane does not repeat the stalled lane's mistakes.",
+            currentRoute: state.currentRoute,
+            forceSynthesisAvailable: true,
+            forceSynthesisDirective:
+              "Budget exhausted. Call supervisor_force_synthesis to convert gathered evidence into an honestly-labeled best-effort answer instead of discarding partial work.",
           });
-        })
-      )
+        }
+
+        const nextRoute = await selectNextFallbackRoute(deps, session, now);
+
+        if (!nextRoute) {
+          state.status = "blocked";
+          state.recoveryInFlight = false;
+          deps.pushSessionEvent(state, "session.blocked", "no healthy fallback routes available");
+          await deps.writeSupervisorStore(store);
+          return jsonContent({
+            status: "blocked",
+            reasonCode: "fallback_exhausted",
+            reason: "no healthy fallback routes available",
+            sessionId,
+            currentAttemptId: state.currentAttemptId,
+            attemptCount: state.attemptCount,
+            failureCount: state.failureCount,
+            forceSynthesisAvailable: true,
+            forceSynthesisDirective:
+              "Every lane is exhausted. Call supervisor_force_synthesis to convert gathered evidence into an honestly-labeled best-effort answer instead of discarding partial work.",
+          });
+        }
+
+        if (nextRoute.endpoint.startsWith("http")) {
+          const pingOk = await deps.quickPingEndpoint(nextRoute.endpoint);
+          if (!pingOk) {
+            void logEvent("server", "fallback.ping_failed", {
+              sessionId,
+              host: nextRoute.host,
+              endpoint: nextRoute.endpoint,
+              note: "skipping dead candidate; will re-try next fallback on next tick",
+            });
+            void logEvent({ session: sessionId }, "fallback.ping_failed", {
+              host: nextRoute.host,
+              endpoint: nextRoute.endpoint,
+            });
+            state.status = "cooldown";
+            state.cooldownUntil = now + reliability.retryDedupeWindowMs;
+            state.recoveryInFlight = false;
+            await deps.writeSupervisorStore(store);
+            return jsonContent({
+              status: "cooldown",
+              reasonCode: "fallback_ping_failed",
+              sessionId,
+              skippedHost: nextRoute.host,
+              retryAfterMs: reliability.retryDedupeWindowMs,
+            });
+          }
+        }
+
+        state.currentRoute = nextRoute;
+        state.attemptCount += 1;
+        state.currentAttemptId = deps.makeAttemptId(sessionId, state.attemptCount, nextRoute);
+        state.status = "cooldown";
+        const backoffMs = deps.computeBackoffMs(reliability, state.failureCount);
+        state.cooldownUntil = now + backoffMs;
+        // Gives the new lane a fresh stall window. Deliberately does NOT touch
+        // lastObservedProgressAt: a fallback is recovery, not progress (MCP-11).
+        state.lastProgressAt = now;
+        state.recoveryInFlight = false;
+        deps.pushSessionEvent(
+          state,
+          "fallback.applied",
+          `${nextRoute.host}/${nextRoute.model ?? "<none>"} (attempt ${state.attemptCount})`
+        );
+
+        void logEvent("server", "fallback.applied", {
+          sessionId,
+          host: nextRoute.host,
+          model: nextRoute.model,
+          attemptCount: state.attemptCount,
+          failureCount: state.failureCount,
+          backoffMs,
+        });
+        void logEvent({ session: sessionId }, "fallback.applied", {
+          host: nextRoute.host,
+          model: nextRoute.model,
+          attemptCount: state.attemptCount,
+          backoffMs,
+          cooldownUntil: new Date(state.cooldownUntil).toISOString(),
+        });
+
+        await deps.writeSupervisorStore(store);
+
+        // At-most-one-live-instance: the supervisor
+        // has no kill channel to the stalled lane, so failover revokes its
+        // claim instead. A returning lane's write-back is then rejected rather
+        // than landing on top of the fallback lane's work. Tasks with no lease
+        // take a pure no-op path — nothing is written.
+        const revokedLeases = await revokeSessionTaskLeases(sessionId, new Date(now).toISOString());
+
+        return jsonContent({
+          status: "recovering",
+          reasonCode: "fallback_applied",
+          sessionId,
+          currentAttemptId: state.currentAttemptId,
+          switchedTo: nextRoute,
+          backoffMs,
+          cooldownUntil: new Date(state.cooldownUntil).toISOString(),
+          attemptCount: state.attemptCount,
+          failureCount: state.failureCount,
+          revokedLeases,
+          handoffDirective:
+            "Failover applied. Compose a failover handoff prompt (compose-supervisor-prompts skill) with goal, current state (DONE/PARTIAL/NOT STARTED), key decisions, traps & dead ends, relevant files, and open work so the fallback lane does not repeat the stalled lane's mistakes.",
+        });
+      })
   );
 
   server.registerTool(
@@ -711,67 +761,55 @@ export function registerSupervisorSessionTools(server: McpServer, deps: Supervis
       annotations: toolAnnotations("supervisor_abort_session"),
     },
     async ({ sessionId, reason }) =>
-      guardStoreAccess(() =>
-        deps.withSupervisorStoreLock(async () => {
-          const reliability = await deps.loadReliabilityConfig();
-          const store = deps.pruneSupervisorStore(await deps.readSupervisorStore(), reliability);
-          const state = store.sessions[sessionId];
-          if (!state) {
-            return jsonContent({ status: "missing", sessionId });
-          }
-
-          // Classify BEFORE mutating. This used to set status = "interrupted"
-          // unconditionally, so aborting a session that finished ten minutes
-          // ago rewrote its terminal record, pushed a session.interrupted
-          // event, and reported "interrupted" as though it had stopped live
-          // work. The three terminal states are "deliberately distinguished"
-          // (MANUAL §5); a request to end something already ended erases that
-          // distinction, so it answers with what actually happened instead of
-          // echoing the transition that was asked for.
-          //
-          // Deliberately NOT ported: a running-vs-pending distinction. The
-          // control plane holds no kill channel, so which of the two a live
-          // session is in is unknowable from here, and guessing would be worse
-          // than today's behavior. Lease revocation stays on the live path
-          // below, where it is already idempotent.
-          if (SUPERVISOR_TERMINAL_STATUSES.has(state.status)) {
-            return jsonContent({
-              status: "already_terminal",
-              reasonCode: "session_terminal",
-              sessionId,
-              priorStatus: state.status,
-              detail:
-                `Session already ended as "${state.status}". Nothing was written, no event was ` +
-                "pushed, and no lease was touched — its terminal record is unchanged.",
-            });
-          }
-
-          const now = Date.now();
-          state.status = "interrupted";
-          state.lastProgressAt = now;
-          state.cooldownUntil = undefined;
-          state.recoveryInFlight = false;
-          deps.pushSessionEvent(state, "session.interrupted", reason ?? "abort requested");
-          await deps.writeSupervisorStore(store);
-
-          // At-most-one-live-instance (MCP-4): abort is a terminal transition,
-          // so no lane may keep a live claim on this session's tasks. Tasks
-          // with no lease take the pure no-op path — nothing is written.
-          const revokedLeases = await revokeSessionTaskLeases(
-            sessionId,
-            new Date(now).toISOString()
-          );
-
+      withLockedSession(deps, sessionId, async ({ store, state }) => {
+        // Classify BEFORE mutating. This used to set status = "interrupted"
+        // unconditionally, so aborting a session that finished ten minutes
+        // ago rewrote its terminal record, pushed a session.interrupted
+        // event, and reported "interrupted" as though it had stopped live
+        // work. The three terminal states are "deliberately distinguished"
+        // (MANUAL §5); a request to end something already ended erases that
+        // distinction, so it answers with what actually happened instead of
+        // echoing the transition that was asked for.
+        //
+        // Deliberately NOT ported: a running-vs-pending distinction. The
+        // control plane holds no kill channel, so which of the two a live
+        // session is in is unknowable from here, and guessing would be worse
+        // than today's behavior. Lease revocation stays on the live path
+        // below, where it is already idempotent.
+        if (SUPERVISOR_TERMINAL_STATUSES.has(state.status)) {
           return jsonContent({
-            status: "interrupted",
-            reasonCode: "interrupt_requested",
+            status: "already_terminal",
+            reasonCode: "session_terminal",
             sessionId,
-            currentAttemptId: state.currentAttemptId,
-            currentRoute: state.currentRoute,
-            reason: reason ?? "abort requested",
-            revokedLeases,
+            priorStatus: state.status,
+            detail:
+              `Session already ended as "${state.status}". Nothing was written, no event was ` +
+              "pushed, and no lease was touched — its terminal record is unchanged.",
           });
-        })
-      )
+        }
+
+        const now = Date.now();
+        state.status = "interrupted";
+        state.lastProgressAt = now;
+        state.cooldownUntil = undefined;
+        state.recoveryInFlight = false;
+        deps.pushSessionEvent(state, "session.interrupted", reason ?? "abort requested");
+        await deps.writeSupervisorStore(store);
+
+        // At-most-one-live-instance (MCP-4): abort is a terminal transition,
+        // so no lane may keep a live claim on this session's tasks. Tasks
+        // with no lease take the pure no-op path — nothing is written.
+        const revokedLeases = await revokeSessionTaskLeases(sessionId, new Date(now).toISOString());
+
+        return jsonContent({
+          status: "interrupted",
+          reasonCode: "interrupt_requested",
+          sessionId,
+          currentAttemptId: state.currentAttemptId,
+          currentRoute: state.currentRoute,
+          reason: reason ?? "abort requested",
+          revokedLeases,
+        });
+      })
   );
 }

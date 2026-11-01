@@ -3,16 +3,18 @@
  *
  * Sequence (each step is guarded):
  *   1. Resolve the repo root (FREE_OPENCODE_REPO / xx-stack + package.json).
- *   2. `git pull --ff-only` — fails clearly if the tree is dirty or not a checkout.
- *   3. `npm ci` when a lockfile is present (else `npm install`), then build the
+ *   2. Preflight, before anything changes: a git checkout, a clean tree, on
+ *      branch `main` tracking `<remote>/main`, and npm resolvable. A failure
+ *      here leaves HEAD where it was.
+ *   3. `git fetch`, print the commit range (old..new), then `git merge
+ *      --ff-only` onto the upstream.
+ *   4. `npm ci` when a lockfile is present (else `npm install`), then build the
  *      workspaces the installers already build (xx-stack/mcp-server, plugin).
- *   4. Re-run `node scripts/host-setup.mjs opencode-host` so the plugin URL, the
- *      MCP command, and the CLI wrappers point at this checkout. host-setup
- *      replaces any old packages/plugin/src/index.ts plugin entry.
- *   5. Restart the proxy (stop then start; the installed service is restarted).
+ *   5. Re-run `node scripts/host-setup.mjs opencode-host` so the plugin URL, the
+ *      MCP command, and the CLI wrappers point at this checkout.
+ *   6. Restart the proxy (stop then start; the installed service is restarted).
  *
- * It never force-pushes and never `git reset --hard`. The default is strictly
- * ff-only pull.
+ * It never force-pushes and never `git reset --hard`; only fast-forwards.
  */
 
 import { spawnSync } from "node:child_process";
@@ -32,12 +34,26 @@ export type UpdateResult = {
   errors: string[];
 };
 
-function run(cwd: string, cmd: string, args: string[], capture = false): string {
+const UPDATE_BRANCH = "main";
+
+type Command = { cmd: string; shell: boolean };
+
+/**
+ * npm is `npm.cmd` on Windows, which Node cannot spawn without a shell. The
+ * shell is only used on win32 and only with this module's fixed literal args.
+ */
+export function npmCommand(platform: NodeJS.Platform = process.platform): Command {
+  return platform === "win32" ? { cmd: "npm.cmd", shell: true } : { cmd: "npm", shell: false };
+}
+
+function run(cwd: string, command: Command | string, args: string[], capture = false): string {
+  const { cmd, shell } = typeof command === "string" ? { cmd: command, shell: false } : command;
   const result = spawnSync(cmd, args, {
     cwd,
     encoding: "utf8",
     stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
     windowsHide: true,
+    shell,
   });
   if (result.error) {
     throw new Error(`${cmd} failed: ${result.error.message}`);
@@ -49,20 +65,57 @@ function run(cwd: string, cmd: string, args: string[], capture = false): string 
   return `${result.stdout ?? ""}`.trim();
 }
 
+function git(root: string, args: string[]): string {
+  return run(root, "git", args, true);
+}
+
 function gitHead(root: string): string {
   try {
-    return run(root, "git", ["rev-parse", "--short", "HEAD"], true);
+    return git(root, ["rev-parse", "--short", "HEAD"]);
   } catch {
     return "unknown";
   }
 }
 
-function isGitClean(root: string): boolean {
-  try {
-    return !run(root, "git", ["status", "--porcelain"], true).trim();
-  } catch {
-    return true;
+/** Everything that can fail without side effects runs here, before any pull. */
+function preflight(root: string): { upstream: string } {
+  if (!existsSync(join(root, ".git"))) {
+    throw new Error("not a git checkout — update only works in the cloned repository");
   }
+  if (git(root, ["status", "--porcelain"])) {
+    throw new Error(
+      "the repository has uncommitted changes; stash or commit them first (update does not clobber a dirty tree)"
+    );
+  }
+  const branch = git(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (branch !== UPDATE_BRANCH) {
+    throw new Error(`update only runs on branch '${UPDATE_BRANCH}' (currently on '${branch}')`);
+  }
+  let upstream: string;
+  try {
+    upstream = git(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  } catch {
+    throw new Error(
+      `branch '${UPDATE_BRANCH}' has no upstream; run: git branch --set-upstream-to=origin/${UPDATE_BRANCH}`
+    );
+  }
+  if (!upstream.endsWith(`/${UPDATE_BRANCH}`)) {
+    throw new Error(`'${UPDATE_BRANCH}' tracks '${upstream}', expected <remote>/${UPDATE_BRANCH}`);
+  }
+  try {
+    run(root, npmCommand(), ["--version"], true);
+  } catch (error) {
+    throw new Error(
+      `npm is not runnable (${error instanceof Error ? error.message : String(error)}); install Node.js/npm first`,
+      { cause: error }
+    );
+  }
+  return { upstream };
+}
+
+/** Progress output (the commit range) goes straight to the terminal. */
+function say(line: string): void {
+  process.stdout.write(`${line}\n`);
 }
 
 function cliPath(): string {
@@ -70,13 +123,7 @@ function cliPath(): string {
 }
 
 function runCli(args: string[]): void {
-  const result = spawnSync(nodeExecutable(), [cliPath(), ...args], {
-    stdio: "inherit",
-    windowsHide: true,
-  });
-  if (result.error) {
-    throw new Error(`free-opencode ${args.join(" ")} failed: ${result.error.message}`);
-  }
+  run(repoRoot(), nodeExecutable(), [cliPath(), ...args]);
 }
 
 export async function cmdUpdate(): Promise<UpdateResult> {
@@ -87,31 +134,31 @@ export async function cmdUpdate(): Promise<UpdateResult> {
   void appendLog("update.step", { step: "begin", before, root });
 
   try {
-    if (!existsSync(join(root, ".git"))) {
-      throw new Error("not a git checkout — update only works in the cloned repository");
-    }
-    if (!isGitClean(root)) {
-      throw new Error(
-        "the repository has uncommitted changes; stash or commit them first (update does not clobber a dirty tree)"
-      );
-    }
+    const { upstream } = preflight(root);
+    const npm = npmCommand();
 
-    const pull = spawnSync("git", ["pull", "--ff-only"], { cwd: root, stdio: "inherit" });
-    if (pull.status !== 0) {
-      throw new Error("git pull --ff-only failed — resolve it, then re-run free-opencode update");
+    run(root, "git", ["fetch", "--quiet"]);
+    const incoming = Number(git(root, ["rev-list", "--count", `HEAD..${upstream}`]));
+    if (incoming > 0) {
+      const target = git(root, ["rev-parse", "--short", upstream]);
+      say(`Pulling ${upstream} ${before}..${target} (${incoming} commit(s)):`);
+      say(git(root, ["log", "--oneline", "--no-decorate", `HEAD..${upstream}`]));
+      run(root, "git", ["merge", "--ff-only", upstream]);
+    } else {
+      say(`${upstream} has no new commits.`);
     }
-    steps.push(`git pull --ff-only (${before} → ${gitHead(root)})`);
+    steps.push(`git fast-forward ${upstream} (${before} → ${gitHead(root)})`);
     void appendLog("update.step", { step: "pull", before, after: gitHead(root) });
 
     const lockfile = existsSync(join(root, "package-lock.json"));
-    run(root, "npm", lockfile ? ["ci"] : ["install"]);
+    run(root, npm, lockfile ? ["ci"] : ["install"]);
     steps.push(lockfile ? "npm ci" : "npm install");
     void appendLog("update.step", { step: "install", lockfile });
 
-    run(join(root, "xx-stack", "mcp-server"), "npm", ["run", "build"]);
+    run(join(root, "xx-stack", "mcp-server"), npm, ["run", "build"]);
     steps.push("built xx-stack/mcp-server");
 
-    run(root, "npm", ["run", "build", "-w", "free-opencode"]);
+    run(root, npm, ["run", "build", "-w", "free-opencode"]);
     steps.push("built free-opencode plugin");
 
     run(root, nodeExecutable(), [join(root, "scripts", "host-setup.mjs"), "opencode-host"]);
@@ -137,6 +184,7 @@ export async function cmdUpdate(): Promise<UpdateResult> {
     const message = error instanceof Error ? error.message : String(error);
     errors.push(message);
     void appendLog("update.error", { message, root });
-    return { before, after: before, changed: false, steps, errors };
+    const after = gitHead(root);
+    return { before, after, changed: before !== after, steps, errors };
   }
 }

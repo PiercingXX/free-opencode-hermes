@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { isDirectExecution } from "./entrypoint.js";
 
 type ProviderConfig = {
   options?: {
@@ -461,22 +461,10 @@ async function main(): Promise<void> {
   await runTraceSession(parseArgs(process.argv.slice(2)));
 }
 
-// --- Direct execution guard (same realpath pattern as cli.ts / index.ts) ---
+// --- Direct execution guard (entrypoint.ts) ---
 // Without it, importing this module from a test would spawn a live run.
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return fs.realpathSync(candidate);
-    } catch {
-      return path.resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   main().catch((error) => {
     console.error(`trace-provider-proxy failed: ${describeError(error)}`);
     process.exit(1);

@@ -80,34 +80,36 @@ sync_inventory() {
   node "$root/xx-stack/scripts/generate-registries.mjs"
 }
 
-merge_json_plugin() {
-  local config_path="$1"
-  local plugin_ref="$2"
-  node --input-type=module - "$config_path" "$plugin_ref" <<'NODE'
-import fs from "node:fs";
-import path from "node:path";
-
-const [configPath, pluginRef] = process.argv.slice(2);
-fs.mkdirSync(path.dirname(configPath), { recursive: true });
-let config = {};
-if (fs.existsSync(configPath)) {
-  const raw = fs.readFileSync(configPath, "utf8").trim();
-  if (raw) config = JSON.parse(raw);
-}
-if (typeof config !== "object" || config === null || Array.isArray(config)) {
-  config = {};
-}
-const plugins = Array.isArray(config.plugin) ? config.plugin : [];
-const already = plugins.some((entry) => {
-  if (typeof entry === "string") return entry === pluginRef || entry.startsWith("free-opencode");
-  return false;
-});
-if (!already) plugins.push(pluginRef);
-config.plugin = plugins;
-if (!config.$schema) config.$schema = "https://opencode.ai/config.json";
-const tmp = `${configPath}.tmp-${process.pid}`;
-fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
-fs.renameSync(tmp, configPath);
-console.log(`registered plugin in ${configPath}`);
-NODE
+# Download a vendor install script to a temp file, sanity-check it, then run it.
+# Never pipes the network straight into a shell: a truncated or HTML error
+# response is rejected instead of half-executed. No checksum pin (vendor
+# scripts change); set the named skip variable to 1 to skip entirely.
+#   run_vendor_installer <url> <display-name> <SKIP_ENV_VAR_NAME>
+run_vendor_installer() {
+  local url="$1"
+  local name="$2"
+  local skip_var="$3"
+  if [ "${!skip_var:-0}" = "1" ]; then
+    info "$skip_var=1 — skipping the $name installer"
+    return 0
+  fi
+  need curl
+  local tmp problem="" rc=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/foc-vendor-install.XXXXXX")" || die "mktemp failed"
+  info "downloading the $name installer from $url"
+  if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp" "$url"; then
+    problem="could not download the $name installer ($url)"
+  elif [ ! -s "$tmp" ]; then
+    problem="the $name installer download was empty ($url)"
+  elif ! head -n 1 "$tmp" | grep -Eq '^#!.*(ba|z|da|k)?sh'; then
+    problem="the $name installer ($url) does not look like a shell script; refusing to run it"
+  fi
+  if [ -n "$problem" ]; then
+    rm -f "$tmp"
+    die "$problem. Install $name yourself, or set $skip_var=1 to skip this step."
+  fi
+  info "running the $name installer ($(wc -c <"$tmp" | tr -d ' ') bytes)"
+  bash "$tmp" || rc=$?
+  rm -f "$tmp"
+  return "$rc"
 }

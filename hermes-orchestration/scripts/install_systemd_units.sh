@@ -13,6 +13,9 @@ if [ ! -d "$UNIT_SRC" ]; then
 fi
 
 mkdir -p "$UNIT_DEST"
+# ReadWritePaths= in the units names logs/; systemd refuses to start a unit
+# whose ReadWritePaths entry does not exist.
+mkdir -p "$HERMES_DIR/logs"
 
 for unit in "$UNIT_SRC"/*.service "$UNIT_SRC"/*.timer; do
   [ -e "$unit" ] || continue

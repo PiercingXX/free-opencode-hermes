@@ -264,7 +264,10 @@ test("free model ids include Zen -free, OpenRouter :free, and big-pickle", () =>
   assert.equal(isFreeModelId("union-alpha", "opencode_zen"), true);
   assert.equal(isFreeModelId("stealth/union-alpha", "open_router"), true);
   assert.equal(isFreeModelId("open_router/stealth/union-alpha"), true);
-  assert.equal(listingIsFree({ pricing: { prompt: "0", completion: "0" } }, "stealth/union-alpha"), true);
+  assert.equal(
+    listingIsFree({ pricing: { prompt: "0", completion: "0" } }, "stealth/union-alpha"),
+    true
+  );
   assert.equal(isFreeModelId("unbiased/pareto"), false);
   assert.equal(isFreeModelId("llama-3.3-70b-versatile"), false);
   // gpt-5-nano is free on Zen only — B.ai's same id is premium.
@@ -328,7 +331,10 @@ test("OpenRouter-style /models listings keep only tool-capable ids", async () =>
     );
   });
   assert.ok(models.includes("qwen/qwen3-coder:free"));
-  assert.ok(models.includes("stealth/union-alpha"), "curated stealth SKU survives a listing that omits it");
+  assert.ok(
+    models.includes("stealth/union-alpha"),
+    "curated stealth SKU survives a listing that omits it"
+  );
   assert.ok(models.includes("openrouter/free"));
   assert.ok(!models.includes("google/gemma-3-4b-it:free"));
   assert.ok(!models.includes("openai/text-embedding-3-small"));

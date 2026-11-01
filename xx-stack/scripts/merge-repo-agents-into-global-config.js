@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const { writeFileAtomic } = require("./lib/fs-atomic.js");
 
 const sourcePath = process.argv[2];
 const targetPath = process.argv[3];
@@ -8,21 +9,6 @@ const targetPath = process.argv[3];
 if (!sourcePath || !targetPath) {
   console.error("usage: merge-repo-agents-into-global-config.js <source_config> <target_config>");
   process.exit(1);
-}
-
-function writeFileAtomic(filePath, data) {
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    fs.writeFileSync(tempPath, data);
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw error;
-  }
 }
 
 const source = JSON.parse(fs.readFileSync(sourcePath, "utf8"));

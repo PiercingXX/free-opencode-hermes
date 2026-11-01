@@ -31,7 +31,7 @@ test("admin catalog keeps both local and cloud order within a bucket", () => {
 });
 
 test("admin inline script is valid JavaScript", () => {
-  const html = adminPage();
+  const html = adminPage("abc123");
   const start = html.indexOf("<script>");
   const end = html.indexOf("</script>", start);
   assert.ok(start >= 0 && end > start);
@@ -40,7 +40,7 @@ test("admin inline script is valid JavaScript", () => {
 });
 
 test("admin last-route template labels LOCAL hops and last-resort locals", () => {
-  const html = adminPage();
+  const html = adminPage("abc123");
   assert.ok(html.includes("LOCAL"));
   assert.ok(html.includes("local last-resort"));
   assert.ok(html.includes("last local hop"));
@@ -50,13 +50,13 @@ test("admin last-route template labels LOCAL hops and last-resort locals", () =>
 });
 
 test("admin cardFor keeps ready/configured cards expanded", () => {
-  const html = adminPage();
+  const html = adminPage("abc123");
   assert.ok(html.includes("isUsed(p) || filterMatches(p, query) || expanded.has(p.id)"));
   assert.ok(html.includes("saved — paste to replace"));
 });
 
 test("admin page template includes compact class and expand data for unused cards", () => {
-  const html = adminPage();
+  const html = adminPage("abc123");
   assert.ok(html.includes('class="card compact"'));
   assert.ok(html.includes("data-expand="));
   assert.ok(!html.includes('class="card ready compact"'));

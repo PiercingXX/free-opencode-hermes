@@ -7,6 +7,8 @@ import type {
   WatchdogRouteCandidates,
 } from "./supervisor_runtime.js";
 import type { Registry } from "./platform_types.js";
+import { jsonContent, type JsonToolResult } from "./agent_tool_helpers.js";
+import { guardStoreAccess } from "./supervisor_store_runtime.js";
 
 export interface SupervisorToolDeps {
   withSupervisorStoreLock: <T>(work: () => Promise<T>) => Promise<T>;
@@ -63,4 +65,41 @@ export interface SupervisorToolDeps {
   computeBackoffMs: (reliability: ReliabilityConfig, failureCount: number) => number;
   failureKey: (host: string, model: string | null) => string;
   quickPingEndpoint: (endpoint: string) => Promise<boolean>;
+}
+
+type SessionStoreDeps = Pick<
+  SupervisorToolDeps,
+  | "withSupervisorStoreLock"
+  | "loadReliabilityConfig"
+  | "readSupervisorStore"
+  | "pruneSupervisorStore"
+>;
+
+export interface LockedSession {
+  store: SupervisorStore;
+  state: SupervisorSessionState;
+  reliability: ReliabilityConfig;
+}
+
+/**
+ * The shared preamble of every single-session supervisor tool: take the store
+ * lock, load reliability, read + prune the store, and answer `missing` for an
+ * unknown session. Store-access failures become structured results (MCP-1).
+ */
+export function withLockedSession(
+  deps: SessionStoreDeps,
+  sessionId: string,
+  work: (session: LockedSession) => Promise<JsonToolResult>
+): Promise<JsonToolResult> {
+  return guardStoreAccess(() =>
+    deps.withSupervisorStoreLock(async () => {
+      const reliability = await deps.loadReliabilityConfig();
+      const store = deps.pruneSupervisorStore(await deps.readSupervisorStore(), reliability);
+      const state = store.sessions[sessionId];
+      if (!state) {
+        return jsonContent({ status: "missing", sessionId });
+      }
+      return work({ store, state, reliability });
+    })
+  );
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const { writeFileAtomic } = require("./lib/fs-atomic.js");
 
 const targetConfigPath = process.env.TARGET_CONFIG;
 const mcpEntrypoint = process.env.MCP_ENTRYPOINT;
@@ -8,21 +9,6 @@ const mcpEntrypoint = process.env.MCP_ENTRYPOINT;
 if (!targetConfigPath || !mcpEntrypoint) {
   console.error("missing TARGET_CONFIG or MCP_ENTRYPOINT");
   process.exit(1);
-}
-
-function writeFileAtomic(filePath, data) {
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    fs.writeFileSync(tempPath, data);
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw error;
-  }
 }
 
 const config = JSON.parse(fs.readFileSync(targetConfigPath, "utf8"));

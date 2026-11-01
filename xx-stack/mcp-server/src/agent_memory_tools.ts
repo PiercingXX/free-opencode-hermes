@@ -7,12 +7,14 @@ import { loadMergedAgentRuntimeConfig } from "./config_runtime.js";
 import {
   buildMemoryCompactionPrompt,
   buildMemoryResyncHelperPrompt,
+  compactMemoryFileIfOversized,
   ensureMemoryEntrypoint,
   getAgentMemoryEntrypoint,
   getAgentMemorySnapshotMetaPath,
   getAgentMemorySnapshotPath,
   hashMemoryContent,
   lineDiffSummary,
+  MAX_MEMORY_FILE_BYTES,
   markAgentMemorySupersededOnDisk,
   readMemoryEntrypoint,
   readSnapshotMeta,
@@ -275,12 +277,25 @@ export function registerAgentMemoryTools(server: McpServer): void {
       const heal = (await needsLeadingNewline(path)) ? "\n" : "";
       await appendFile(path, heal + entry, "utf-8");
 
+      // The cap is enforced after the append so the note itself is never
+      // lost; compaction drops superseded, then oldest, entries.
+      const compaction = await compactMemoryFileIfOversized(path);
+
       return jsonContent({
         status: "ok",
         agentId,
         scope: resolvedScope,
         path,
         appended: entry.trim(),
+        ...(compaction
+          ? {
+              compacted: {
+                droppedEntries: compaction.droppedEntries,
+                droppedBytes: compaction.droppedBytes,
+                capBytes: MAX_MEMORY_FILE_BYTES,
+              },
+            }
+          : {}),
       });
     }
   );

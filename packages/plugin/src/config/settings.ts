@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
+import { writeFileAtomic } from "../fs-atomic.js";
 import { DEFAULT_HOST, DEFAULT_PORT, settingsPath, stateDir } from "../paths.js";
 import { allProviders, providerById } from "../providers/catalog.js";
 import { suggestedBaseUrl, type FoundHost } from "../providers/inventory.js";
@@ -160,28 +160,34 @@ function asFoundHost(raw: unknown): FoundHost | null {
 
 export function loadSettings(home?: string): Settings {
   const path = settingsPath(home);
+  if (!existsSync(path)) {
+    const created = emptySettings();
+    saveSettings(created, home);
+    return created;
+  }
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    return normalizeSettings(parsed);
-  } catch {
-    // Never clobber an existing file — a concurrent write or parse glitch
-    // used to replace ~/.free-opencode/config.json with empty settings.
+    return normalizeSettings(JSON.parse(readFileSync(path, "utf8")));
+  } catch (err) {
+    // Writes are atomic, so a parse failure means the file is genuinely
+    // corrupt (hand edit, disk issue). Keep a copy before anything can save
+    // over it — the caller gets empty settings, but the keys are recoverable.
+    const backup = `${path}.corrupt-${Date.now()}`;
     try {
-      readFileSync(path, "utf8");
-      return emptySettings();
+      copyFileSync(path, backup);
     } catch {
-      const created = emptySettings();
-      saveSettings(created, home);
-      return created;
+      // unreadable: nothing to preserve
     }
+    process.stderr.write(
+      `free-opencode: ${path} is not valid JSON (${(err as Error).message}); ` +
+        `copied to ${backup} and starting from empty settings\n`
+    );
+    return emptySettings();
   }
 }
 
 export function saveSettings(settings: Settings, home?: string): void {
-  const path = settingsPath(home);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   mkdirSync(stateDir(home), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  writeFileAtomic(settingsPath(home), `${JSON.stringify(settings, null, 2)}\n`);
 }
 
 export function applyEnvOverrides(settings: Settings): Settings {
@@ -262,14 +268,6 @@ export function readyProviderIds(settings: Settings): string[] {
   return allProviders()
     .filter((p) => isProviderReady(settings, p.id))
     .map((p) => p.id);
-}
-
-export function redactedSettings(settings: Settings): Record<string, unknown> {
-  return {
-    ...settings,
-    proxyAuthToken: settings.proxyAuthToken ? "********" : "",
-    keys: Object.fromEntries(Object.keys(settings.keys).map((id) => [id, "********"])),
-  };
 }
 
 export function setProviderKey(
@@ -493,26 +491,4 @@ export function addAccount(
     settings: { ...settings, accounts },
     providerId: accountProviderId(providerId, id),
   };
-}
-
-/** List the account ids configured for a provider. Empty array means default single-account. */
-export function accountIdsFor(settings: Settings, providerId: string): string[] {
-  return (settings.accounts ?? []).filter((a) => a.providerId === providerId).map((a) => a.id);
-}
-
-/** Whether an account id for a provider is already configured. */
-export function accountIdExists(
-  settings: Settings,
-  providerId: string,
-  accountId: string
-): boolean {
-  return (settings.accounts ?? []).some((a) => a.providerId === providerId && a.id === accountId);
-}
-
-/** Safe base id for a newly minted auto account (a2, a3, ...). */
-export function nextAutoAccountId(settings: Settings, providerId: string): string {
-  const existing = new Set(accountIdsFor(settings, providerId));
-  let n = 2;
-  while (existing.has(`a${n}`)) n += 1;
-  return `a${n}`;
 }

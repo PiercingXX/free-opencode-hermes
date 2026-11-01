@@ -4,7 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { copyAgentsSkippingNativePrimaries, copyDir, quoteForCmd } from "./host-setup.mjs";
+import {
+  copyAgentsSkippingNativePrimaries,
+  copyDir,
+  mergePlugin,
+  parseJsonc,
+  quoteForCmd,
+  stripJsonc,
+} from "./host-setup.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -169,4 +176,43 @@ test("copyAgentsSkippingNativePrimaries does not copy build/plan/general", () =>
 test("quoteForCmd doubles embedded quotes for cmd.exe", () => {
   assert.equal(quoteForCmd(`C:\\Program Files\\node.exe`), `"C:\\Program Files\\node.exe"`);
   assert.equal(quoteForCmd(`C:\\weird\\"quote\\node.exe`), `"C:\\weird\\""quote\\node.exe"`);
+});
+
+test("parseJsonc accepts comments and trailing commas, string-aware", () => {
+  const raw = `{
+    // line comment
+    "url": "http://example.com/a//b", /* block */
+    "glob": "/* not a comment */",
+    "quote": "say \\"hi\\", // still string",
+    "list": [1, 2, 3,],
+    "nested": { "a": 1, // trailing comment after comma
+    },
+  }`;
+  assert.deepEqual(parseJsonc(raw), {
+    url: "http://example.com/a//b",
+    glob: "/* not a comment */",
+    quote: 'say "hi", // still string',
+    list: [1, 2, 3],
+    nested: { a: 1 },
+  });
+  assert.equal(stripJsonc('{"a": "x,}"}'), '{"a": "x,}"}');
+  assert.throws(() => parseJsonc("{ not json"));
+});
+
+test("mergePlugin keeps a .bak and skips (no throw) on unparseable config", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foc-merge-"));
+  const config = path.join(dir, "opencode.json");
+  fs.writeFileSync(config, '{\n  // mine\n  "theme": "dark",\n}\n');
+  assert.equal(mergePlugin(config, "/repo/packages/plugin", null), true);
+  assert.ok(fs.existsSync(`${config}.bak`));
+  assert.match(fs.readFileSync(`${config}.bak`, "utf8"), /\/\/ mine/);
+  const merged = JSON.parse(fs.readFileSync(config, "utf8"));
+  assert.equal(merged.theme, "dark");
+  assert.ok(merged.plugin.includes("/repo/packages/plugin"));
+  if (process.platform !== "win32") assert.equal(fs.statSync(config).mode & 0o777, 0o600);
+
+  const broken = path.join(dir, "broken.json");
+  fs.writeFileSync(broken, "{ definitely not json");
+  assert.equal(mergePlugin(broken, "/repo/packages/plugin", null), false);
+  assert.equal(fs.readFileSync(broken, "utf8"), "{ definitely not json");
 });

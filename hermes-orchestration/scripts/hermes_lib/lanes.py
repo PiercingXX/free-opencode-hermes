@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -28,7 +29,9 @@ class Lane:
     endpoint_type: str = "openai_compatible"
     provider: Optional[str] = None
     api_key_env: Optional[str] = None
-    api_key_command: Optional[Union[str, List[str]]] = None
+    # str (split with shlex, no shell), argv list, or
+    # {"command": str, "shell": true} for an explicit shell opt-in.
+    api_key_command: Optional[Union[str, List[str], Dict[str, Any]]] = None
     fallback_models: Optional[List[str]] = None
     catalog_models: Optional[List[str]] = None
     chat_probe_on_models_failure: bool = False
@@ -36,6 +39,10 @@ class Lane:
 
 class OrchestratorError(RuntimeError):
     pass
+
+
+class ApiKeyCommandError(OrchestratorError):
+    """A lane's api_key_command failed; the lane must not be called keyless."""
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -180,41 +187,73 @@ def health_timeout(cfg: Dict[str, Any]) -> int:
 API_KEY_COMMAND_TIMEOUT_SECONDS = 10
 
 
+def api_key_command_spec(lane: Lane) -> Tuple[Union[str, List[str]], bool]:
+    """Return (command, shell) for a lane's api_key_command.
+
+    Strings are split with shlex and run without a shell; a shell is used only
+    for the explicit `{"command": "...", "shell": true}` form.
+    """
+    spec: Any = lane.api_key_command
+    shell = False
+    if isinstance(spec, dict):
+        shell = bool(spec.get("shell", False))
+        spec = spec.get("command")
+        if shell:
+            if not isinstance(spec, str) or not spec.strip():
+                raise ApiKeyCommandError(
+                    f"lane {lane.key}: api_key_command with shell=true needs a non-empty 'command' string"
+                )
+            return spec, True
+    if isinstance(spec, list):
+        argv = [str(part) for part in spec]
+    elif isinstance(spec, str):
+        try:
+            argv = shlex.split(spec)
+        except ValueError as exc:
+            raise ApiKeyCommandError(f"lane {lane.key}: api_key_command does not parse: {exc}") from exc
+    else:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command must be a string, list, or object")
+    if not argv:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command is empty")
+    return argv, shell
+
+
 def resolve_api_key(lane: Lane, timeout: int = API_KEY_COMMAND_TIMEOUT_SECONDS) -> str:
+    """Resolve a lane's API key: env var first, then api_key_command.
+
+    Returns "" only when the lane has no credential configured at all. A
+    configured command that fails raises ApiKeyCommandError naming the lane,
+    rather than silently calling upstream keyless (which surfaces as a
+    confusing 401).
+    """
     if lane.api_key_env:
         value = os.environ.get(lane.api_key_env, "")
         if value:
             return value
 
-    if lane.api_key_command:
-        # The string form is the documented operator-owned pattern and stays
-        # shell-interpreted. The argv-list form runs without a shell, so no
-        # config content can ever be expanded by one.
-        shell = not isinstance(lane.api_key_command, list)
-        command: Any = lane.api_key_command
-        if not shell:
-            command = [str(part) for part in lane.api_key_command]
-        try:
-            completed = subprocess.run(
-                command,
-                shell=shell,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            print(
-                f"WARN: api_key_command for lane {lane.key} timed out after {timeout}s",
-                file=sys.stderr,
-            )
-            return ""
-        except OSError as exc:
-            print(f"WARN: api_key_command for lane {lane.key} failed: {exc}", file=sys.stderr)
-            return ""
-        if completed.returncode == 0:
-            return completed.stdout.strip()
+    if not lane.api_key_command:
+        return ""
 
-    return ""
+    command, shell = api_key_command_spec(lane)
+    try:
+        completed = subprocess.run(
+            command,
+            shell=shell,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command failed to start: {exc}") from exc
+    # stderr is deliberately not echoed: credential helpers may print secrets.
+    if completed.returncode != 0:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command exited {completed.returncode}")
+    key = completed.stdout.strip()
+    if not key:
+        raise ApiKeyCommandError(f"lane {lane.key}: api_key_command produced no output")
+    return key
 
 
 def lane_model_candidates(lane: Lane) -> List[str]:
@@ -223,7 +262,6 @@ def lane_model_candidates(lane: Lane) -> List[str]:
         if isinstance(model, str) and model and model not in candidates:
             candidates.append(model)
     return candidates
-
 
 
 def _http_request(
@@ -295,8 +333,6 @@ def http_open(
         return 599, {"error": str(e)}
 
 
-
-
 def run_hermes_cli_oneshot(lane: Lane, timeout: int, model: str, prompt: str) -> Tuple[bool, str]:
     # The public module is the documented monkeypatch point
     # (`hermes_orchestrator.run_hermes_cli_oneshot`). After the split, call
@@ -334,13 +370,19 @@ def run_hermes_cli_oneshot(lane: Lane, timeout: int, model: str, prompt: str) ->
     return True, output
 
 
-
 def lane_models_url(lane: Lane) -> str:
     return lane.base_url.rstrip("/") + "/models"
 
 
 def lane_chat_url(lane: Lane) -> str:
     return lane.base_url.rstrip("/") + "/chat/completions"
+
+
+def join_text_parts(content: List[Any]) -> str:
+    """Join the text parts of an OpenAI multi-part message content list."""
+    return "\n".join(
+        part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
+    )
 
 
 def parse_chat_content(lane_name: str, data: Dict[str, Any]) -> str:
@@ -353,11 +395,7 @@ def parse_chat_content(lane_name: str, data: Dict[str, Any]) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-        return "\n".join(parts).strip()
+        return join_text_parts(content).strip()
     return str(content)
 
 
@@ -387,56 +425,65 @@ def select_probe_model(lane: Lane, models: List[str]) -> str:
     return models[0] if models else lane.model
 
 
+def _error_code(data: Any) -> str:
+    """The OpenAI-style ``error.code`` of a response body, or ""."""
+    error_block = data.get("error") if isinstance(data, dict) else None
+    return str(error_block.get("code", "")) if isinstance(error_block, dict) else ""
+
+
+def _hermes_cli_health(lane: Lane, cli_timeout: int) -> Tuple[bool, str]:
+    last_error = "not_attempted"
+    for candidate_model in lane_model_candidates(lane):
+        ok, detail = run_hermes_cli_oneshot(lane, cli_timeout, candidate_model, "Reply with exactly: ok")
+        if ok:
+            return True, f"hermes_cli_ok:{candidate_model}"
+        last_error = detail
+    return False, f"hermes_cli_failed:{last_error}"
+
+
+def _chat_probe_health(lane: Lane, timeout: int, api_key: str) -> str:
+    """Fallback liveness check via a tiny chat call when GET /models 400s.
+
+    Returns the healthy reason, or "" when no candidate model answered.
+    """
+    for candidate_model in lane_model_candidates(lane):
+        probe_payload = {
+            "model": candidate_model,
+            "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
+            "temperature": 0,
+            "max_tokens": 8,
+        }
+        status, data = http_json("POST", lane_chat_url(lane), probe_payload, timeout, api_key or None)
+        if status < 400:
+            return f"chat_probe_ok:{candidate_model}"
+        if status == 400 and _error_code(data) == "RateLimitReached":
+            return f"chat_probe_rate_limited:{candidate_model}"
+    return ""
+
+
 def lane_health(lane: Lane, http_probe_timeout: int, cli_timeout: int) -> Tuple[bool, str]:
     if not lane.enabled:
         return False, "disabled"
     if "REPLACE_WITH" in lane.base_url:
         return False, "unconfigured_endpoint"
     if lane.endpoint_type == "hermes_cli":
-        last_error = "not_attempted"
-        for candidate_model in lane_model_candidates(lane):
-            ok, detail = run_hermes_cli_oneshot(
-                lane,
-                cli_timeout,
-                candidate_model,
-                "Reply with exactly: ok",
-            )
-            if ok:
-                return True, f"hermes_cli_ok:{candidate_model}"
-            last_error = detail
-        return False, f"hermes_cli_failed:{last_error}"
+        return _hermes_cli_health(lane, cli_timeout)
 
-    api_key = resolve_api_key(lane)
+    try:
+        api_key = resolve_api_key(lane)
+    except ApiKeyCommandError as exc:
+        return False, f"api_key_command_failed:{exc}"
     status, data = http_json("GET", lane_models_url(lane), None, http_probe_timeout, api_key or None)
-    error_block = data.get("error") if isinstance(data, dict) else None
-    error_code = ""
-    if isinstance(error_block, dict):
-        error_code = str(error_block.get("code", ""))
 
     # 401/403 often indicate auth policy while endpoint is alive (mainly cloud lanes).
     if status in (401, 403):
         return True, f"reachable_http_{status}"
-    if status == 400 and error_code == "no_model_name" and lane.catalog_models:
+    if status == 400 and _error_code(data) == "no_model_name" and lane.catalog_models:
         return True, "catalog_api_quirk"
     if status == 400 and lane.chat_probe_on_models_failure:
-        for candidate_model in lane_model_candidates(lane):
-            probe_payload = {
-                "model": candidate_model,
-                "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
-                "temperature": 0,
-                "max_tokens": 8,
-            }
-            probe_status, probe_data = http_json(
-                "POST", lane_chat_url(lane), probe_payload, cli_timeout, api_key or None
-            )
-            probe_error = probe_data.get("error") if isinstance(probe_data, dict) else None
-            probe_code = ""
-            if isinstance(probe_error, dict):
-                probe_code = str(probe_error.get("code", ""))
-            if probe_status < 400:
-                return True, f"chat_probe_ok:{candidate_model}"
-            if probe_status == 400 and probe_code == "RateLimitReached":
-                return True, f"chat_probe_rate_limited:{candidate_model}"
+        probed = _chat_probe_health(lane, cli_timeout, api_key)
+        if probed:
+            return True, probed
     if status >= 400:
         return False, f"http_{status}"
     if "data" not in data:
@@ -481,7 +528,6 @@ class LaneHealthCache:
             with self._lock:
                 self._entries[lane.key] = (time.monotonic(), (ok, reason))
         return ok, reason
-
 
 
 def call_chat(
@@ -547,7 +593,10 @@ def list_lane_models(lane: Lane, timeout: int) -> Tuple[List[str], str]:
             return sorted(set(lane.catalog_models)), "configured_catalog"
         return lane_model_candidates(lane), "configured_candidates"
 
-    api_key = resolve_api_key(lane)
+    try:
+        api_key = resolve_api_key(lane)
+    except ApiKeyCommandError:
+        return [], "api_key_command_failed"
     status, data = http_json("GET", lane_models_url(lane), None, timeout, api_key or None)
     if status >= 400:
         if lane.catalog_models:
@@ -577,7 +626,10 @@ def probe_tool_call_support(lane: Lane, timeout: int, model: str) -> Tuple[bool,
     if lane.endpoint_type == "hermes_cli":
         return False, "unsupported_endpoint_type"
 
-    api_key = resolve_api_key(lane)
+    try:
+        api_key = resolve_api_key(lane)
+    except ApiKeyCommandError:
+        return False, "api_key_command_failed"
     payload = {
         "model": model,
         "temperature": 0,

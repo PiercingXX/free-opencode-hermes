@@ -1,8 +1,16 @@
-export function adminPage(): string {
+/**
+ * The Admin page. `adminToken` is a per-process secret the page echoes back
+ * in `x-foc-admin` on every API call; another site cannot read it (the Host
+ * and Origin guards stop rebinding and cross-origin reads) and cannot set
+ * custom headers on a cross-site request.
+ */
+export function adminPage(adminToken: string): string {
+  if (!/^[a-f0-9]+$/.test(adminToken)) throw new Error("admin token must be hex");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="foc-admin-token" content="${adminToken}" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Free OpenCode &amp; Hermes by PiercingXX</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -234,8 +242,11 @@ export function adminPage(): string {
         .replace(/"/g, "&quot;")
         .replace(/</g, "&lt;");
     }
+    const ADMIN_TOKEN = document.querySelector('meta[name="foc-admin-token"]').content;
     async function api(path, opts) {
-      const res = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+      const res = await fetch(path, Object.assign({}, opts, {
+        headers: { "Content-Type": "application/json", "x-foc-admin": ADMIN_TOKEN },
+      }));
       const data = await res.json();
       if (!res.ok) throw new Error((data.error && data.error.message) || res.statusText);
       return data;

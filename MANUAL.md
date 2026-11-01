@@ -113,10 +113,63 @@ like `tailscale_sglang/deepseek-v4-flash` is honored verbatim and always tried
 first. When a model returns 429 / 402 / a retryable 5xx it is marked in
 cooldown (Retry-After, else 60s doubling to a 30-minute cap) and skipped on
 later turns until it should be back; the first request after that window is the
-recheck. Cooldowns live in memory and clear on proxy restart.
+recheck. Cooldowns are saved to `~/.free-opencode/cooldowns.json` so a restart
+does not re-hit a drained model.
 `free-opencode status` and the Admin **Cooldown** panel show what is cooled
 down and when it returns. Admin shows "Self-hosted is used only after free
 models fail or are in cooldown."
+
+**Resilience layers.** Three independent mechanisms, each for a different
+failure:
+
+| Layer | Scope | Trips on | Effect |
+|---|---|---|---|
+| Cooldown | one model slug | 429 / 402 / retryable 5xx | slug skipped until Retry-After / backoff ends |
+| Circuit breaker | whole provider | 3 consecutive network errors, 408 or 5xx | every model of that provider skipped for 30s (15s local), doubling on a failed retry, 5-minute cap; in memory |
+| Context fit | one model slug | a context-overflow error on a request ≥ 8k chars | requests at least that large skip the slug; a larger success clears it; in memory |
+
+Account/quota errors (401/402/403/429) never trip the breaker — they belong to
+one key or one model.
+
+**Key rotation.** With several accounts on one provider (`groq` plus
+`groq@work`), the same model on the next account follows directly in the hop
+chain, so a 429 on one key tries the next key before switching models.
+
+**Routing presets.** Besides `free-opencode/default`, OpenCode lists two
+aliases built on the same Admin chain. Neither ever moves a paid or
+self-hosted model ahead of free cloud:
+
+| Model | Behaviour |
+|---|---|
+| `free-opencode/auto/fast` | each tier ordered by measured latency (moving average of successful hops) |
+| `free-opencode/auto/sticky` | the last model that answered goes first — fewer hops, better upstream prompt-cache reuse |
+
+**Tool-output compaction.** Before a request goes upstream, `role: "tool"`
+messages are compacted: a result identical to an earlier one becomes a short
+pointer to it, and a result over 32k characters keeps its head and tail around
+an explicit `[… N chars omitted by free-opencode …]` marker. User, system and
+assistant text is never changed, and the transform is deterministic so prompt
+caches keep hitting. The `x-foc-compacted-chars` response header reports the
+saving. Turn it off per request with `x-foc-compaction: off`, or globally with
+`FREE_OPENCODE_COMPACTION=off`.
+
+**Admin and proxy security.** "From 127.0.0.1" does not mean "from the user":
+any web page open in a browser can send requests to loopback. The proxy
+therefore:
+
+- rejects a `Host` header that is not `localhost`, an IP literal, the listen
+  host, or listed in `FREE_OPENCODE_ALLOWED_HOSTS` (blocks DNS rebinding);
+- rejects any `Origin` that is not one of those hosts (blocks cross-site
+  requests); native clients send no `Origin`;
+- accepts only `application/json` POST bodies, capped at 32 MB for `/v1` and
+  1 MB for Admin;
+- requires, on every `/admin/api/*` call, the per-process token the Admin page
+  embeds (`x-foc-admin`) or `Authorization: Bearer <proxyAuthToken>`.
+
+**Diagnose.** `free-opencode doctor [--fix]` checks the Node version,
+settings file mode (0600), the proxy port, proxy auth, the listen host, every
+ready provider, OpenCode's `auth.json` and the pidfile, and exits 1 on a
+failure. `--fix` tightens the settings file mode and removes a stale pidfile.
 
 **Keep-alive service, log, update.** `free-opencode service install`
 registers a per-user unit that runs `…/cli.js start --foreground` so `:8082`
@@ -127,9 +180,13 @@ and `free-opencode stop` manage it; the service survives a crash and restarts
 stop. `free-opencode log [--lines N]` tails `~/.free-opencode/proxy.log`
 (a 5 MB rotating JSONL of route attempts / results / `proxy.start` /
 `proxy.stop` / `service.*` / `update.*` / `mcp.spawn` — keys never written).
-`free-opencode update` does `git pull --ff-only` (fails on a dirty tree),
-reinstalls and rebuilds, re-runs host-setup, and restarts the proxy or service;
-it never force-pushes.
+`free-opencode update` first checks that the tree is clean, the branch is
+`main` tracking an upstream `…/main`, and npm runs; then fetches, prints the
+commit range it is about to apply, fast-forwards, reinstalls and rebuilds,
+re-runs host-setup, and restarts the proxy or service. It never force-pushes.
+`stop` and `update` only ever stop a detached proxy they can verify (the
+pidfile records whether the proxy runs detached or inside OpenCode, and
+`/health` reports the pid), so they cannot kill an OpenCode session.
 
 Launchers installed next to `free-opencode`:
 
@@ -385,26 +442,35 @@ dependencies beyond the MCP SDK and zod.
 
 | Module | Lines | Role |
 |---|---|---|
-| `index.ts` | — | wires every tool group; the only place `register*` is called |
-| `routing_selection_runtime.ts` | 838 | tier scoring, model choice, the cloud gate |
-| `routing_runtime.ts` | 488 | architect/editor split, competitive fan-out, review routing, batch fan-out |
-| `routing_tools.ts` | — | 7 routing tools |
-| `supervisor_completion_tools.ts` | 1557 | continuation/handoff/forced-synthesis prompts, completion gate |
-| `supervisor_session_tools.ts` | 777 | `supervisor_tick`, failover, lease revocation |
+| `index.ts` | 164 | wires every tool group; the only place `register*` is called |
+| `entrypoint.ts` | 26 | shared direct-execution guard for the CLI entry points |
+| `routing_selection_runtime.ts` | 973 | tier scoring, model choice, the cloud gate |
+| `routing_runtime.ts` | 499 | architect/editor split, competitive fan-out, review routing, batch fan-out |
+| `routing_tools.ts` | 319 | 7 routing tools |
+| `supervisor_completion_tools.ts` | 644 | completion gate, continuation/handoff tools |
+| `supervisor_prompts.ts` | 559 | pure prompt formatters: continuation, lease fences, handoff, forced synthesis |
+| `supervisor_session_tools.ts` | 815 | `supervisor_tick`, failover, lease revocation |
 | `supervisor_session_runtime.ts` | 403 | stall detection, backoff, dedupe |
-| `supervisor_store_runtime.ts` | 384 | session persistence |
-| `task_runtime.ts` | 560 | task store, goal contracts, leases |
-| `task_tools.ts` | 583 | 6 task tools |
-| `memory_runtime.ts` | 758 | agent memory, budgeted recall, compaction, CAS writes |
-| `execution_policy.ts` | 705 | the exec gate: denylist → allowlist → process-group spawn |
-| `observability_tools.ts` | 1101 | platform listing, health, telemetry, tool search |
-| `cli.ts` | 693 | the `xx` CLI |
-| `repo_map_runtime.ts` | 1159 | budget-fitted repo map |
-| `context_selection_runtime.ts` | — | lazy-greedy submodular selection |
-| `output_compaction.ts` | — | head/tail truncation |
-| `hook_tools.ts` | — | `_Stop` / `_PostCompact`, flag-gated |
-| `platform_runtime.ts` | — | registry load, hardware probe, cost lookup |
+| `supervisor_store_runtime.ts` | 390 | session persistence; shared strict JSON store read/write |
+| `supervisor_tool_deps.ts` | 105 | `withLockedSession` and shared supervisor tool deps |
+| `task_runtime.ts` | 635 | task store, goal contracts, leases |
+| `task_tools.ts` | 588 | 6 task tools |
+| `memory_runtime.ts` | 875 | agent memory, budgeted recall, size cap + compaction, CAS writes |
+| `execution_policy.ts` | 730 | the exec gate: denylist (fails closed) → allowlist → process-group spawn |
+| `verify_edit_tools.ts` | 654 | `verify_edit`: verification-shaped commands only, workspace-confined |
+| `secret_redaction.ts` | 241 | secret / dotenv redaction for captured output |
+| `io_runtime.ts` | 375 | atomic writes, cross-process file lock, store lock |
+| `observability_tools.ts` | 986 | platform listing, health, telemetry, tool search (`TOOL_CATALOG`) |
+| `cli.ts` | 683 | the `xx` CLI |
+| `repo_map_runtime.ts` | 1168 | budget-fitted repo map |
+| `context_selection_runtime.ts` | 360 | lazy-greedy submodular selection |
+| `output_compaction.ts` | 235 | head/tail truncation |
+| `hook_tools.ts` | 554 | `_Stop` / `_PostCompact`, flag-gated |
+| `log_worker.ts` | 355 | server + per-session logs, rotation and retention |
+| `platform_runtime.ts` | 332 | registry load, hardware probe, cost lookup |
 | `config_runtime.ts` | 425 | agent profile merge, tool policy |
+
+Line counts as of the last edit to this table; `wc -l xx-stack/mcp-server/src/*.ts` is authoritative.
 
 ### The execution gate
 
@@ -934,6 +1000,11 @@ with `git config core.hooksPath .githooks`.
 | `XX_STACK_ALLOW_CLOUD` | `1` opts into cloud lanes |
 | `XX_STACK_HOOK_TOOLS` | `1` registers `_Stop` / `_PostCompact` |
 | `XX_STACK_DANGEROUS_PATTERNS_FILE` | override the denylist path |
+| `XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS` | `1` runs commands even when the denylist cannot load (default: fail closed) |
+| `XX_STACK_ALLOW_ANY_CWD` | `1` lifts launch-dir confinement for memory tools and `verify_edit` |
+| `FREE_OPENCODE_ALLOWED_HOSTS` | extra comma-separated `Host` names the proxy accepts (e.g. a MagicDNS name) |
+| `FREE_OPENCODE_COMPACTION` | `off` disables tool-output compaction |
+| `FOC_SKIP_VENDOR_INSTALL` | `1` makes the installers skip the vendor OpenCode / Hermes install script |
 | `XX_STACK_SCRATCH_DIR` | base for `verify_edit` full-output artifacts |
 | `XX_STACK_HOOK_EVENT/_SESSION_ID/_TASK_ID` | passed to lifecycle hooks |
 | `HERMES_PROXY_TOKEN` | bearer token for the Hermes proxy |

@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import ipaddress
 import json
 import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .inventory import log_routing_event, routing_event
 from .lanes import (
     LANE_HEALTH_TTL_SECONDS,
+    ApiKeyCommandError,
+    Lane,
     LaneHealthCache,
     OrchestratorError,
     http_json,
     http_open,
     is_cloud_lane,
+    join_text_parts,
     lane_chat_url,
     lane_from_config,
     lane_model_candidates,
@@ -68,11 +72,7 @@ def flatten_messages_for_cli(messages: List[Dict[str, Any]]) -> str:
         role = str(message.get("role", "user"))
         content = message.get("content")
         if isinstance(content, list):
-            text = "\n".join(
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
+            text = join_text_parts(content)
         else:
             text = str(content or "")
         parts.append(f"{role}: {text}")
@@ -82,6 +82,116 @@ def flatten_messages_for_cli(messages: List[Dict[str, Any]]) -> str:
 MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 REQUEST_SOCKET_TIMEOUT_SECONDS = 30
 _DRAIN_CHUNK_BYTES = 64 * 1024
+
+
+# (completion data, open upstream stream or None, model that served it)
+ServedCompletion = Tuple[Dict[str, Any], Any, str]
+
+
+def proxy_lane_order(cfg: Dict[str, Any], requested_model: str) -> List[str]:
+    """Primary lane order, narrowed to lanes serving an explicitly named model.
+
+    "auto" (or an unmatched name) keeps every primary lane eligible.
+    """
+    order = primary_lane_order(cfg)
+    if requested_model in ("auto", "", "hermes-orchestrator"):
+        return order
+    matching = []
+    for key in order:
+        lane = lane_from_config(cfg, key)
+        if model_matches_requirement(requested_model, lane_model_candidates(lane), lane.model):
+            matching.append(key)
+    return matching or order
+
+
+def serve_via_hermes_cli(cfg: Dict[str, Any], lane: Lane, messages: List[Any]) -> Optional[ServedCompletion]:
+    """Run the flattened conversation through the hermes CLI, trying each model."""
+    prompt = flatten_messages_for_cli(messages)
+    for candidate_model in lane_model_candidates(lane):
+        ok, detail = run_hermes_cli_oneshot(lane, request_timeout(cfg), candidate_model, prompt)
+        if not ok:
+            continue
+        data = {
+            "id": f"chatcmpl-hermes-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": candidate_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": detail},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {},
+        }
+        return data, None, candidate_model
+    return None
+
+
+def serve_via_http(
+    cfg: Dict[str, Any],
+    lane: Lane,
+    payload: Dict[str, Any],
+    stream: bool,
+    attempts: List[str],
+) -> Optional[ServedCompletion]:
+    """Forward the request upstream, trying each model; failures go to ``attempts``."""
+    forward = {key: payload[key] for key in PROXY_PASSTHROUGH_KEYS if key in payload}
+    try:
+        api_key = resolve_api_key(lane)
+    except ApiKeyCommandError:
+        attempts.append(f"{lane.name}:api_key_command_failed")
+        return None
+    for candidate_model in lane_model_candidates(lane):
+        forward["model"] = candidate_model
+        if stream:
+            forward["stream"] = True
+            status, upstream = http_open(
+                "POST", lane_chat_url(lane), forward, request_timeout(cfg), api_key or None
+            )
+            if status < 400:
+                return {"model": candidate_model, "usage": {}}, upstream, candidate_model
+        else:
+            status, upstream = http_json(
+                "POST", lane_chat_url(lane), forward, request_timeout(cfg), api_key or None
+            )
+            if status < 400:
+                return upstream, None, str(upstream.get("model", lane.model))
+        attempts.append(f"{lane.name}:{candidate_model}:http_{status}")
+        if status in (401, 403, 404):
+            # Auth and missing-endpoint failures are lane problems: every
+            # fallback model hits the same credentials and URL, so retrying
+            # them cannot succeed.
+            break
+    return None
+
+
+def log_proxy_event(
+    cfg: Dict[str, Any],
+    lane: Optional[Lane],
+    model: str,
+    requested_model: str,
+    stream: bool,
+    attempts: List[str],
+    latency_ms: Optional[int] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    error: str = "",
+) -> None:
+    """One routing.jsonl record per proxied request; ``lane`` None means total failure."""
+    log_routing_event(
+        cfg,
+        routing_event(
+            "proxy", lane, model, ok=lane is not None, latency_ms=latency_ms, usage=usage, error=error,
+            extra={
+                "requested_model": requested_model,
+                "stream": stream,
+                # Reasons every earlier lane was skipped or failed. Empty when
+                # the first lane served the request (HERMES-DOC-1).
+                "attempts": list(attempts),
+            },
+        ),
+    )
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -182,30 +292,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._reject(404, f"unknown path {self.path}")
             return
 
-        length = self._content_length()
-        if length < 0:
-            self._send_json(400, {"error": {"message": "invalid Content-Length"}}, close=True)
+        payload = self._read_json_body()
+        if payload is None:
             return
-        if length > MAX_REQUEST_BODY_BYTES:
-            # Do not read it; answer and close rather than stream megabytes we
-            # already know we will discard (HERMES-6).
-            self._send_json(
-                413,
-                {"error": {"message": f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"}},
-                close=True,
-            )
-            return
-
-        try:
-            raw = self.rfile.read(length) if length else b""
-            if len(raw) != length:
-                self._send_json(400, {"error": {"message": "truncated request body"}}, close=True)
-                return
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-        except (ValueError, json.JSONDecodeError, OSError):
-            self._send_json(400, {"error": {"message": "invalid JSON body"}}, close=True)
-            return
-
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             self._send_json(400, {"error": {"message": "'messages' must be a non-empty list"}})
@@ -215,105 +304,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
         requested_model = str(payload.get("model") or "auto")
         stream = bool(payload.get("stream", False))
 
-        order = [key for key in primary_lane_order(cfg)]
-        if requested_model not in ("auto", "", "hermes-orchestrator"):
-            matching = []
-            for key in order:
-                lane = lane_from_config(cfg, key)
-                if model_matches_requirement(requested_model, lane_model_candidates(lane), lane.model):
-                    matching.append(key)
-            if matching:
-                order = matching
-
         attempts: List[str] = []
-        for lane_key in order:
+        for lane_key in proxy_lane_order(cfg, requested_model):
             lane = lane_from_config(cfg, lane_key)
             if not lane.enabled:
                 continue
-            if is_cloud_lane(cfg, lane_key) and not self.server.allow_cloud:
-                attempts.append(f"{lane.name}:cloud_not_allowed")
+            skip_reason = self._lane_skip_reason(cfg, lane_key, lane)
+            if skip_reason:
+                attempts.append(f"{lane.name}:{skip_reason}")
                 continue
-            if not is_cloud_lane(cfg, lane_key):
-                ok, reason = self.server.health_cache.get(cfg, lane)
-                if not ok:
-                    attempts.append(f"{lane.name}:unhealthy:{reason}")
-                    continue
 
             start = time.monotonic()
-            stream_handle = None
-            streamed_model = lane.model
             if lane.endpoint_type == "hermes_cli":
-                prompt = flatten_messages_for_cli(messages)
-                success = False
-                for candidate_model in lane_model_candidates(lane):
-                    ok, detail = run_hermes_cli_oneshot(lane, request_timeout(cfg), candidate_model, prompt)
-                    if ok:
-                        data = {
-                            "id": f"chatcmpl-hermes-{int(time.time() * 1000)}",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": candidate_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": {"role": "assistant", "content": detail},
-                                    "finish_reason": "stop",
-                                }
-                            ],
-                            "usage": {},
-                        }
-                        success = True
-                        break
-                if not success:
+                served = serve_via_hermes_cli(cfg, lane, messages)
+                if served is None:
                     attempts.append(f"{lane.name}:cli_failed")
                     continue
             else:
-                forward = {key: payload[key] for key in PROXY_PASSTHROUGH_KEYS if key in payload}
-                api_key = resolve_api_key(lane)
-                data = None
-                for candidate_model in lane_model_candidates(lane):
-                    forward["model"] = candidate_model
-                    if stream:
-                        forward["stream"] = True
-                        status, upstream = http_open(
-                            "POST", lane_chat_url(lane), forward, request_timeout(cfg), api_key or None
-                        )
-                        if status < 400:
-                            stream_handle = upstream
-                            streamed_model = candidate_model
-                            data = {"model": candidate_model, "usage": {}}
-                            break
-                    else:
-                        status, upstream = http_json(
-                            "POST", lane_chat_url(lane), forward, request_timeout(cfg), api_key or None
-                        )
-                        if status < 400:
-                            data = upstream
-                            break
-                    attempts.append(f"{lane.name}:{candidate_model}:http_{status}")
-                    if status in (401, 403, 404):
-                        # Auth and missing-endpoint failures are lane problems:
-                        # every fallback model hits the same credentials and
-                        # URL, so retrying them cannot succeed.
-                        break
-                if data is None:
+                served = serve_via_http(cfg, lane, payload, stream, attempts)
+                if served is None:
                     continue
+            data, stream_handle, model_used = served
 
-            latency_ms = int((time.monotonic() - start) * 1000)
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-            model_used = streamed_model if stream_handle is not None else str(data.get("model", lane.model))
-            log_routing_event(
-                cfg,
-                routing_event(
-                    "proxy", lane, model_used, ok=True, latency_ms=latency_ms, usage=usage,
-                    extra={
-                        "requested_model": requested_model,
-                        "stream": stream,
-                        # Reasons every earlier lane was skipped or failed. Empty
-                        # when the first lane served the request (HERMES-DOC-1).
-                        "attempts": list(attempts),
-                    },
-                ),
+            log_proxy_event(
+                cfg, lane, model_used, requested_model, stream, attempts,
+                latency_ms=int((time.monotonic() - start) * 1000), usage=usage,
             )
             if stream_handle is not None:
                 self._relay_upstream_stream(stream_handle, model_used)
@@ -325,25 +341,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # Total failure used to write no telemetry at all, so failed requests were
         # invisible in routing.jsonl (HERMES-12).
-        log_routing_event(
-            cfg,
-            routing_event(
-                "proxy",
-                None,
-                requested_model,
-                ok=False,
-                error="no lane could serve the request",
-                extra={
-                    "requested_model": requested_model,
-                    "stream": stream,
-                    "attempts": list(attempts),
-                },
-            ),
+        log_proxy_event(
+            cfg, None, requested_model, requested_model, stream, attempts,
+            error="no lane could serve the request",
         )
         self._send_json(
             502,
             {"error": {"message": "no lane could serve the request", "attempts": attempts}},
         )
+
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        """Read and parse the request body; on failure answer the client and return None."""
+        length = self._content_length()
+        if length < 0:
+            self._send_json(400, {"error": {"message": "invalid Content-Length"}}, close=True)
+            return None
+        if length > MAX_REQUEST_BODY_BYTES:
+            # Do not read it; answer and close rather than stream megabytes we
+            # already know we will discard (HERMES-6).
+            self._send_json(
+                413,
+                {"error": {"message": f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"}},
+                close=True,
+            )
+            return None
+        try:
+            raw = self.rfile.read(length) if length else b""
+            if len(raw) != length:
+                self._send_json(400, {"error": {"message": "truncated request body"}}, close=True)
+                return None
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, json.JSONDecodeError, OSError):
+            self._send_json(400, {"error": {"message": "invalid JSON body"}}, close=True)
+            return None
+
+    def _lane_skip_reason(self, cfg: Dict[str, Any], lane_key: str, lane: Lane) -> str:
+        """Why an enabled lane must not serve this request, or "" when it may."""
+        if is_cloud_lane(cfg, lane_key):
+            return "" if self.server.allow_cloud else "cloud_not_allowed"
+        ok, reason = self.server.health_cache.get(cfg, lane)
+        return "" if ok else f"unhealthy:{reason}"
 
     def _relay_upstream_stream(self, resp: Any, model_used: str) -> None:
         """Copy an upstream SSE body, or wrap a JSON completion in the shim."""
@@ -409,6 +446,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(frames)
 
 
+def is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def check_bind_policy(host: str, token: Optional[str], allow_remote: bool) -> None:
+    """Enforce loopback-only exposure (policy), failing closed.
+
+    Non-loopback without auth would be an unauthenticated LAN relay to every
+    lane, so it is refused outright. Non-loopback with auth still needs an
+    explicit --allow-remote.
+    """
+    if is_loopback_host(host):
+        return
+    if token is None:
+        raise OrchestratorError(
+            f"Refusing to bind non-loopback host {host} with auth disabled: that is an "
+            "unauthenticated relay. Bind 127.0.0.1 or configure a token."
+        )
+    if not allow_remote:
+        raise OrchestratorError(
+            f"Refusing to bind non-loopback host {host}: policy requires loopback-only "
+            "exposure. Pass --allow-remote to override (auth stays required)."
+        )
+    print(
+        f"WARNING: proxy binding to non-loopback host {host} (--allow-remote). "
+        "Bearer auth is the only protection.",
+        file=sys.stderr,
+    )
+
+
 def command_serve(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
     proxy_cfg = cfg.get("proxy", {}) if isinstance(cfg.get("proxy"), dict) else {}
     host = args.host or str(proxy_cfg.get("bind_host", "127.0.0.1"))
@@ -424,12 +496,7 @@ def command_serve(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
             "(default HERMES_PROXY_TOKEN), pass --token, or explicitly pass --no-auth."
         )
 
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print(
-            f"WARNING: proxy binding to non-loopback host {host}. "
-            "Policy requires loopback-only exposure.",
-            file=sys.stderr,
-        )
+    check_bind_policy(host, token, bool(getattr(args, "allow_remote", False)))
 
     # No prompt-logging switch exists by design: request bodies are never written
     # anywhere, so there is nothing to gate (HERMES-9).

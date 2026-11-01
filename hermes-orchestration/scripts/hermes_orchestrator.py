@@ -56,9 +56,11 @@ from hermes_lib.inventory import (
 from hermes_lib.lanes import (
     API_KEY_COMMAND_TIMEOUT_SECONDS,
     LANE_HEALTH_TTL_SECONDS,
+    ApiKeyCommandError,
     Lane,
     LaneHealthCache,
     OrchestratorError,
+    api_key_command_spec,
     call_chat,
     check_lane_health,
     cloud_default_enabled,
@@ -95,7 +97,9 @@ from hermes_lib.proxy import (
     REQUEST_SOCKET_TIMEOUT_SECONDS,
     ProxyHandler,
     ProxyServer,
+    check_bind_policy,
     command_serve,
+    is_loopback_host,
     flatten_messages_for_cli,
 )
 from hermes_lib.routing import (
@@ -109,6 +113,7 @@ from hermes_lib.routing import (
 )
 from hermes_lib.safety import (
     DENIED_ARGUMENTS,
+    REPO_CODE_EXECUTION_PREFIXES,
     UNSAFE_TOKEN_CHARS,
     command_allowed,
     command_rejection_reason,
@@ -228,6 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--token", default="", help="Bearer token (default from env named by proxy.auth_token_env)")
     serve.add_argument("--allow-cloud", action="store_true", help="Allow proxied requests to reach cloud lanes")
     serve.add_argument("--no-auth", action="store_true", help="Explicitly run without auth (not recommended)")
+    serve.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit a non-loopback bind host (auth still required; refused with --no-auth)",
+    )
     serve.set_defaults(handler=command_serve)
 
     return parser

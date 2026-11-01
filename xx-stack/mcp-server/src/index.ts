@@ -2,9 +2,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
 
 import { logEvent, initServerLog, telemetryHealth } from "./log_worker.js";
 import { getAgentMemoryEntrypoint, getCompletionMemorySyncStatus } from "./memory_runtime.js";
@@ -47,6 +45,7 @@ import {
   withSupervisorStoreLock,
   writeSupervisorStore,
 } from "./supervisor_runtime.js";
+import { isDirectExecution } from "./entrypoint.js";
 
 // --- MCP Server ---
 
@@ -134,8 +133,11 @@ const hookToolsRegistered = registerHookToolsIfEnabled(gated, {
   getAgentMemoryEntrypoint,
 });
 
+// Binary allowlist for verify_edit. The tool further restricts these to
+// verification-shaped invocations (npm test/run, npx <linter|test runner>,
+// node --test) and confines cwd + path args to the launch directory.
 registerVerifyEditTools(gated, {
-  allowedCommands: ["echo", "cat", "node", "npm", "npx", "ruff", "pytest"],
+  allowedCommands: ["npm", "npx", "node", "ruff", "pytest"],
 });
 
 registerFindingTools(gated);
@@ -154,23 +156,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 }
 
-const isDirectExecution = ((): boolean => {
-  if (!process.argv[1]) return false;
-  // Compare real paths, not lexical ones. Components reach this server through
-  // a symlinked mcp-server/ directory, so the invoked path and import.meta.url
-  // legitimately differ; a lexical comparison made the server exit 0 without
-  // ever starting, which reads as "crashed silently" to every caller.
-  const realOrSelf = (candidate: string): string => {
-    try {
-      return realpathSync(candidate);
-    } catch {
-      return resolve(candidate);
-    }
-  };
-  return realOrSelf(process.argv[1]) === realOrSelf(fileURLToPath(import.meta.url));
-})();
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url)) {
   main().catch((err) => {
     console.error("Fatal:", err);
     process.exit(1);

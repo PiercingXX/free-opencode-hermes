@@ -6,7 +6,9 @@ import test from "node:test";
 import {
   fileUrlFromPath,
   isWindows,
+  isPidAlive,
   looksLikeNodeBinary,
+  looksLikeProxyCommand,
   nodeExecutable,
   opencodeConfigDir,
   userBinDir,
@@ -50,4 +52,24 @@ test("looksLikeNodeBinary rejects the OpenCode bun binary", () => {
 
 test("nodeExecutable is a node binary in this process", () => {
   assert.equal(looksLikeNodeBinary(nodeExecutable()), true);
+});
+
+test("proxy command detection only matches `cli.js start --foreground`", () => {
+  assert.ok(
+    looksLikeProxyCommand("/usr/bin/node /repo/packages/plugin/dist/cli.js start --foreground")
+  );
+  assert.ok(
+    looksLikeProxyCommand(
+      '"C:\\Program Files\\nodejs\\node.exe" C:\\repo\\dist\\cli.js start --foreground'
+    )
+  );
+  assert.ok(!looksLikeProxyCommand("/Applications/OpenCode.app/opencode"));
+  assert.ok(!looksLikeProxyCommand("node cli.js stop"));
+  assert.ok(!looksLikeProxyCommand(null));
+});
+
+test("isPidAlive sees this process and rejects bogus pids", () => {
+  assert.equal(isPidAlive(process.pid), true);
+  assert.equal(isPidAlive(0), false);
+  assert.equal(isPidAlive(-1), false);
 });

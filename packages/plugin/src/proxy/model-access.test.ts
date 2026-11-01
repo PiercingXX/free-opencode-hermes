@@ -68,7 +68,7 @@ test("accessProbeCandidates skips deepseek and known paywalls", () => {
 });
 
 test("probeProviderAccess marks open vs paywall from fake transport", async () => {
-  let settings = setProviderKey(emptySettings(), "bai", "k");
+  const settings = setProviderKey(emptySettings(), "bai", "k");
   settings.discovered.bai = ["glm-5.3-flash", "qwen3.8-flash", "deepseek-v4.1-flash"];
   assert.equal(providerNeedsAccessProbe(settings, "bai"), true);
 
@@ -82,7 +82,9 @@ test("probeProviderAccess marks open vs paywall from fake transport", async () =
         });
       }
       if (body.model === "glm-5.3-flash") {
-        return new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 });
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+        });
       }
       return new Response(
         JSON.stringify({ error: { message: "credit insufficient balance: balance=0 required=4" } }),

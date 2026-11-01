@@ -13,7 +13,8 @@ import {
   type DiffDetection,
   type ReviewToolOverrides,
 } from "./review_tools.js";
-import { buildContinuationPrompt, redactSecrets } from "./supervisor_completion_tools.js";
+import { redactSecrets } from "./secret_redaction.js";
+import { buildContinuationPrompt } from "./supervisor_prompts.js";
 import {
   DEFAULT_RELIABILITY,
   emptySupervisorStore,

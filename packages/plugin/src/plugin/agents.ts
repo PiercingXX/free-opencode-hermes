@@ -66,14 +66,14 @@ function asSteps(value: unknown): number | undefined {
 
 export function loadRuntimeAgents(stackDir = xxStackDir()): InjectedAgent[] {
   const dir = join(stackDir, "runtime", "agents");
-  let files: string[] = [];
+  let files: string[];
   try {
     files = readdirSync(dir).filter((name) => name.endsWith(".md") && !name.endsWith(".nano.md"));
   } catch {
     return [];
   }
 
-  let registry: Record<string, RegistryAgent> = {};
+  let registry: Record<string, RegistryAgent>;
   try {
     const config = JSON.parse(readFileSync(join(stackDir, "runtime", "config.json"), "utf8")) as {
       agent?: Record<string, RegistryAgent>;

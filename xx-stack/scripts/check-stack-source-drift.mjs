@@ -483,9 +483,9 @@ function walkFiles(dir, match, prefix = "") {
   return out;
 }
 
-function runContentCheck() {
+/** Compare every file under each CONTENT_PAIRS subtree; returns pairs compared. */
+function compareContentSubtrees() {
   let comparedPairs = 0;
-
   for (const pair of CONTENT_PAIRS) {
     const canonicalAbs = path.join(repoRoot, pair.canonicalDir);
     const mirrorAbs = path.join(repoRoot, pair.mirrorDir);
@@ -537,7 +537,10 @@ function runContentCheck() {
       );
     }
   }
+  return comparedPairs;
+}
 
+function checkTopLevelClassification() {
   // Every top-level document that exists on BOTH sides must be classified:
   // either content-gated or explicitly excluded with a reason. Without this,
   // adding a new mirrored runbook silently escapes the content check — the
@@ -553,7 +556,11 @@ function runContentCheck() {
       "exists on both sides but is neither in CONTENT_FILES nor NOT_CONTENT_GATED — classify it (gate it, or exclude it with a reason)"
     );
   }
+}
 
+/** Compare each top-level CONTENT_FILES document; returns pairs compared. */
+function compareContentFiles() {
+  let comparedPairs = 0;
   for (const name of CONTENT_FILES) {
     const canonicalRel = `${path.relative(repoRoot, SOURCES[0].dir)}/${name}`.replace(/\\/g, "/");
     const mirrorRel = `${path.relative(repoRoot, SOURCES[1].dir)}/${name}`.replace(/\\/g, "/");
@@ -568,6 +575,13 @@ function runContentCheck() {
     compareFilePair(canonicalRel, mirrorRel);
     comparedPairs += 1;
   }
+  return comparedPairs;
+}
+
+function runContentCheck() {
+  let comparedPairs = compareContentSubtrees();
+  checkTopLevelClassification();
+  comparedPairs += compareContentFiles();
 
   if (comparedPairs < MIN_CONTENT_FILE_PAIRS) {
     fail(

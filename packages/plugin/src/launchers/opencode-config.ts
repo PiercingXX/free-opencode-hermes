@@ -26,6 +26,31 @@ export function catalogClientModel(): ClientModel {
   };
 }
 
+/** Routing presets (proxy/models.ts ALIAS_PRESETS) offered beside the default. */
+const PRESET_MODELS: Array<{ wireSlug: string; displayName: string }> = [
+  { wireSlug: "auto/fast", displayName: "Free OpenCode · fastest" },
+  { wireSlug: "auto/sticky", displayName: "Free OpenCode · sticky" },
+];
+
+/** The default alias plus its routing presets, as client model entries. */
+export function catalogClientModels(): ClientModel[] {
+  const base = catalogClientModel();
+  return [
+    base,
+    ...PRESET_MODELS.map((preset) => ({
+      ...base,
+      wireSlug: preset.wireSlug,
+      providerModelRef: `${PROVIDER_ID}/${preset.wireSlug}`,
+      displayName: preset.displayName,
+    })),
+  ];
+}
+
+/** OpenCode `models` map for the catalog aliases. */
+export function catalogModelConfig(): Record<string, Record<string, unknown>> {
+  return Object.fromEntries(catalogClientModels().map((m) => [m.wireSlug, modelConfigEntry(m)]));
+}
+
 export function modelConfigEntry(model: ClientModel): Record<string, unknown> {
   const config: Record<string, unknown> = {
     name: model.displayName,
@@ -52,9 +77,7 @@ export function buildOpenCodeConfig(
     throw new Error("OpenCode requires at least one routable Free OpenCode model");
   }
   const catalog = catalogClientModel();
-  const modelConfig: Record<string, unknown> = {
-    [catalog.wireSlug]: modelConfigEntry(catalog),
-  };
+  const modelConfig: Record<string, unknown> = catalogModelConfig();
   // Ready self-hosted boxes become concrete free-opencode/<provider>/<model>
   // entries so parallel lane agents can pin workers to distinct hosts.
   for (const model of models) {

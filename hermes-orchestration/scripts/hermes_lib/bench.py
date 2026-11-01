@@ -8,12 +8,14 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .inventory import save_json
 from .lanes import (
+    Lane,
     OrchestratorError,
     call_chat,
     check_lane_health,
@@ -148,55 +150,120 @@ def evaluate_bench_sample(reply: str, finish_reason: Optional[str]) -> Dict[str,
     return verdict
 
 
-def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
-    lane_key = args.lane or (self_hosted_lane_keys(cfg)[0] if self_hosted_lane_keys(cfg) else "")
+def resolve_bench_lane(cfg: Dict[str, Any], requested_key: str) -> Tuple[str, Lane]:
+    """The requested lane (default: highest-priority self-hosted), which must be healthy."""
+    self_hosted = self_hosted_lane_keys(cfg)
+    lane_key = requested_key or (self_hosted[0] if self_hosted else "")
     if not lane_key or lane_key not in cfg.get("lanes", {}):
         raise OrchestratorError(f"Unknown bench lane: {lane_key!r}")
     lane = lane_from_config(cfg, lane_key)
     ok, reason = check_lane_health(cfg, lane)
     if not ok:
         raise OrchestratorError(f"Bench lane {lane.name} is unhealthy: {reason}")
+    return lane_key, lane
 
+
+def bench_prompt(context_tokens: int) -> str:
     # ~4 chars per token is a rough but adequate sizing heuristic for filler text.
-    target_chars = max(0, args.context_tokens * 4 - 200)
+    target_chars = max(0, context_tokens * 4 - 200)
     filler = (BENCH_FILLER * (target_chars // len(BENCH_FILLER) + 1))[:target_chars]
-    prompt = (
-        "Read the following operational notes and reply with a one-paragraph summary.\n\n"
-        + filler
-    )
+    return "Read the following operational notes and reply with a one-paragraph summary.\n\n" + filler
 
-    def one_request(_: int) -> Dict[str, Any]:
-        try:
-            reply, _, meta = call_chat(
-                lane,
-                request_timeout(cfg),
-                "You are a benchmark responder. Be concise.",
-                prompt,
-                temperature=0.1,
-                max_tokens=args.max_tokens,
+
+def bench_one_request(cfg: Dict[str, Any], lane: Lane, prompt: str, max_tokens: int) -> Dict[str, Any]:
+    """One timed completion, returned as a gate verdict plus token/latency fields."""
+    try:
+        reply, _, meta = call_chat(
+            lane,
+            request_timeout(cfg),
+            "You are a benchmark responder. Be concise.",
+            prompt,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+    except OrchestratorError as exc:
+        return {"error": str(exc)}
+    usage = meta.get("usage") or {}
+    reported = usage.get("completion_tokens")
+    sample = evaluate_bench_sample(reply, meta.get("finish_reason"))
+    # Estimates and measurements never share a field. A consumer reading
+    # completion_tokens_measured is reading provider-reported usage only.
+    if isinstance(reported, int) and not isinstance(reported, bool):
+        sample["completion_tokens"] = reported
+        sample["completion_tokens_estimated"] = None
+        sample["tokens_estimated"] = False
+    else:
+        sample["completion_tokens"] = None
+        sample["completion_tokens_estimated"] = max(1, len(reply) // 4)
+        sample["tokens_estimated"] = True
+    sample["latency_ms"] = float(meta.get("latency_ms") or 0)
+    return sample
+
+
+@dataclass
+class BenchTally:
+    """Accumulates timed-iteration samples; excluded samples are kept, not dropped."""
+
+    latencies_ms: List[float] = field(default_factory=list)
+    measured_tokens: int = 0
+    estimated_tokens: int = 0
+    errors: int = 0
+    samples_total: int = 0
+    excluded_samples: List[Dict[str, Any]] = field(default_factory=list)
+    exclusions_by_reason: Dict[str, int] = field(default_factory=dict)
+    finish_reason_unreported: int = 0
+    any_estimated: bool = False
+
+    def add(self, iteration: int, index: int, sample: Dict[str, Any]) -> None:
+        if sample.get("error"):
+            self.errors += 1
+            return
+        self.samples_total += 1
+        if not sample["finish_reason_reported"]:
+            self.finish_reason_unreported += 1
+        if not sample["publishable"]:
+            reason = sample["exclusion_reason"]
+            self.exclusions_by_reason[reason] = self.exclusions_by_reason.get(reason, 0) + 1
+            self.excluded_samples.append({"iteration": iteration, "slice": index, **sample})
+            print(
+                f"  EXCLUDED iteration {iteration} slice {index}: "
+                f"{reason} ({sample['exclusion_detail']})",
+                file=sys.stderr,
             )
-        except OrchestratorError as exc:
-            return {"error": str(exc)}
-        usage = meta.get("usage") or {}
-        reported = usage.get("completion_tokens")
-        sample = evaluate_bench_sample(reply, meta.get("finish_reason"))
-        # Estimates and measurements never share a field. A consumer reading
-        # completion_tokens_measured is reading provider-reported usage only.
-        if isinstance(reported, int) and not isinstance(reported, bool):
-            sample["completion_tokens"] = reported
-            sample["completion_tokens_estimated"] = None
-            sample["tokens_estimated"] = False
+            return
+        self.latencies_ms.append(sample["latency_ms"])
+        if sample["tokens_estimated"]:
+            self.any_estimated = True
+            self.estimated_tokens += sample["completion_tokens_estimated"]
         else:
-            sample["completion_tokens"] = None
-            sample["completion_tokens_estimated"] = max(1, len(reply) // 4)
-            sample["tokens_estimated"] = True
-        sample["latency_ms"] = float(meta.get("latency_ms") or 0)
-        return sample
+            self.measured_tokens += sample["completion_tokens"]
+
+    def publish_blockers(self) -> List[str]:
+        # A run only qualifies a model if every sample ended normally, was
+        # coherent, and nothing errored. Exclusions are reported either way;
+        # they just cannot become a published speed result.
+        blockers: List[str] = []
+        if self.samples_total - len(self.excluded_samples) <= 0:
+            blockers.append("no_publishable_samples")
+        if self.excluded_samples:
+            blockers.append("excluded_samples_present")
+        if self.errors:
+            blockers.append("request_errors")
+        if self.measured_tokens <= 0:
+            blockers.append("no_provider_reported_token_counts")
+        return blockers
+
+
+def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
+    lane_key, lane = resolve_bench_lane(cfg, args.lane)
+    prompt = bench_prompt(args.context_tokens)
 
     def run_iteration() -> Tuple[List[Dict[str, Any]], float]:
         start = time.monotonic()
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            results = list(pool.map(one_request, range(args.parallel)))
+            results = list(
+                pool.map(lambda _: bench_one_request(cfg, lane, prompt, args.max_tokens), range(args.parallel))
+            )
         return results, time.monotonic() - start
 
     # Warmup: recorded separately rather than discarded. The first request pays
@@ -219,66 +286,25 @@ def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
             file=sys.stderr,
         )
 
-    latencies_ms: List[float] = []
-    measured_tokens = 0
-    estimated_tokens = 0
-    errors = 0
+    tally = BenchTally()
     total_wall_seconds = 0.0
-    samples_total = 0
-    excluded_samples: List[Dict[str, Any]] = []
-    exclusions_by_reason: Dict[str, int] = {}
-    finish_reason_unreported = 0
-    any_estimated = False
-
     for iteration in range(1, args.iterations + 1):
         results, elapsed = run_iteration()
         total_wall_seconds += elapsed
         for index, sample in enumerate(results):
-            if sample.get("error"):
-                errors += 1
-                continue
-            samples_total += 1
-            if not sample["finish_reason_reported"]:
-                finish_reason_unreported += 1
-            if not sample["publishable"]:
-                reason = sample["exclusion_reason"]
-                exclusions_by_reason[reason] = exclusions_by_reason.get(reason, 0) + 1
-                excluded_samples.append({"iteration": iteration, "slice": index, **sample})
-                print(
-                    f"  EXCLUDED iteration {iteration} slice {index}: "
-                    f"{reason} ({sample['exclusion_detail']})",
-                    file=sys.stderr,
-                )
-                continue
-            latencies_ms.append(sample["latency_ms"])
-            if sample["tokens_estimated"]:
-                any_estimated = True
-                estimated_tokens += sample["completion_tokens_estimated"]
-            else:
-                measured_tokens += sample["completion_tokens"]
+            tally.add(iteration, index, sample)
         print(f"iteration {iteration}/{args.iterations} done", file=sys.stderr)
 
-    samples_publishable = samples_total - len(excluded_samples)
+    latencies_ms = sorted(tally.latencies_ms)
+    excluded = tally.excluded_samples
 
     def rate(tokens: int) -> Optional[float]:
         if tokens <= 0 or total_wall_seconds <= 0:
             return None
         return round(tokens / total_wall_seconds, 2)
 
-    # A run only qualifies a model if every sample ended normally, was coherent,
-    # and nothing errored. Exclusions are reported either way; they just cannot
-    # become a published speed result.
-    blockers: List[str] = []
-    if samples_publishable <= 0:
-        blockers.append("no_publishable_samples")
-    if excluded_samples:
-        blockers.append("excluded_samples_present")
-    if errors:
-        blockers.append("request_errors")
-    if measured_tokens <= 0:
-        blockers.append("no_provider_reported_token_counts")
+    blockers = tally.publish_blockers()
 
-    latencies_ms.sort()
     result = {
         "host": lane.name,
         "lane_key": lane_key,
@@ -293,18 +319,18 @@ def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         # tokens_per_sec is provider-reported usage only; it is null when the
         # provider reported none, so a consumer can never mistake an estimate
         # for a measurement.
-        "tokens_per_sec": rate(measured_tokens),
-        "tokens_per_sec_estimated": rate(estimated_tokens),
-        "completion_tokens_measured": measured_tokens,
-        "completion_tokens_estimated": estimated_tokens,
-        "tokens_estimated": any_estimated,
-        "error_count": errors,
-        "samples_total": samples_total,
-        "samples_publishable": samples_publishable,
-        "samples_excluded": len(excluded_samples),
-        "exclusions_by_reason": exclusions_by_reason,
-        "excluded_samples": excluded_samples,
-        "finish_reason_unreported_samples": finish_reason_unreported,
+        "tokens_per_sec": rate(tally.measured_tokens),
+        "tokens_per_sec_estimated": rate(tally.estimated_tokens),
+        "completion_tokens_measured": tally.measured_tokens,
+        "completion_tokens_estimated": tally.estimated_tokens,
+        "tokens_estimated": tally.any_estimated,
+        "error_count": tally.errors,
+        "samples_total": tally.samples_total,
+        "samples_publishable": tally.samples_total - len(excluded),
+        "samples_excluded": len(excluded),
+        "exclusions_by_reason": tally.exclusions_by_reason,
+        "excluded_samples": excluded,
+        "finish_reason_unreported_samples": tally.finish_reason_unreported,
         "validity_gate": {
             "min_reply_tokens": BENCH_MIN_REPLY_TOKENS,
             "min_distinct_tokens": BENCH_MIN_DISTINCT_TOKENS,
@@ -313,7 +339,7 @@ def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         "publishable": not blockers,
         "publish_blockers": blockers,
         "warmup_iterations": warmup_iterations,
-        "warmup_seconds": round(warmup_seconds, 3),
+        "warmup_seconds": round(warmup_seconds, 6),  # sub-ms warmups must not read as 0
         "warmup_errors": warmup_errors,
         "total_wall_seconds": round(total_wall_seconds, 3),
         # Operator-supplied fields; see model-qualification-matrix.md for why the
@@ -329,7 +355,7 @@ def command_bench(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
     if not result["publishable"]:
         print(
             f"NOT PUBLISHABLE: {', '.join(blockers)} "
-            f"({len(excluded_samples)} of {samples_total} samples excluded, {errors} error(s))",
+            f"({len(excluded)} of {tally.samples_total} samples excluded, {tally.errors} error(s))",
             file=sys.stderr,
         )
 

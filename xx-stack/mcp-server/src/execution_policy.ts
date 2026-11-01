@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { envFlagEnabled } from "./agent_tool_helpers.js";
 import {
   asRecord,
   getRepoConfigPath,
@@ -51,9 +52,17 @@ interface ExecValidationResult {
 // agent: it only stops the common catastrophic slips (rm -rf /, dd onto a
 // disk, fork bombs, curl|sh, git push --force, repo deletion).
 //
-// Fail-open contract: a missing or partially unparseable pattern file must
-// never brick the server. Unreadable file -> empty denylist; broken lines ->
-// skipped. Both are flagged via parseErrors/loaded and logged to stderr.
+// Fail-closed contract: if the pattern file cannot be found or read, the
+// denylist is unknown, so hook/agent-supplied commands are DENIED with
+// reason "dangerous_patterns_unavailable" rather than run with no denylist.
+// `XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS=1` is the explicit opt-out.
+// Individual broken lines are still skipped (the rest of the file protects),
+// and both conditions are flagged via parseErrors/loaded and logged to stderr.
+// The fixed internal probes (free/lspci/VRAM) are exact-match constants and
+// keep running either way.
+
+/** Env flag that lets execution proceed when the denylist file cannot be loaded. */
+export const ALLOW_MISSING_DANGEROUS_PATTERNS_ENV = "XX_STACK_ALLOW_MISSING_DANGEROUS_PATTERNS";
 
 export interface DangerousPattern {
   source: string;
@@ -68,11 +77,14 @@ export interface DangerousPatternsLoadResult {
 }
 
 // Resolved relative to this module (dist/ at runtime), mirroring the
-// runtime-constants.json candidate chain in runtime_constants.ts.
+// runtime-constants.json candidate chain in runtime_constants.ts. The canonical
+// repo files win; the last entry is the copy the build (strip-dist-tests.mjs)
+// ships into dist/, so a relocated dist/ still has a denylist.
 const DANGEROUS_PATTERNS_CANDIDATES = [
   "../dangerous-patterns.txt",
   "../../runtime/dangerous-patterns.txt",
   "../../opencode/dangerous-patterns.txt",
+  "./dangerous-patterns.txt",
 ] as const;
 
 export function parseDangerousPatterns(text: string): {
@@ -101,7 +113,8 @@ export function loadDangerousPatternsFromFile(filePath: string): DangerousPatter
     const { patterns, parseErrors } = parseDangerousPatterns(text);
     return { patterns, parseErrors, sourcePath: filePath, loaded: true };
   } catch (error) {
-    // Fail-open: an unreadable pattern file yields an empty denylist, flagged.
+    // Unreadable: empty denylist flagged loaded=false, which validateExecRequest
+    // treats as fail-closed.
     const message = error instanceof Error ? error.message : String(error);
     return { patterns: [], parseErrors: [message], sourcePath: filePath, loaded: false };
   }
@@ -114,9 +127,8 @@ let cachedDenylist: DangerousPatternsLoadResult | null = null;
  *
  * `fileURLToPath`, never `url.pathname`: pathname is percent-encoded, so an
  * install path containing a space, `#`, or any non-ASCII byte would hand
- * `readFileSync` a literal `%20`/`%23` that does not exist — and
- * `loadDangerousPatternsFromFile` fails open to an EMPTY denylist, killing the
- * catastrophic-command layer on exactly the hosts where the file is present.
+ * `readFileSync` a literal `%20`/`%23` that does not exist — and the denylist
+ * would then fail to load on exactly the hosts where the file is present.
  * It also strips the leading slash a Windows drive letter carries
  * (`/C:/...` -> `C:\...`).
  *
@@ -141,7 +153,7 @@ function loadDenylist(): DangerousPatternsLoadResult {
   if (resolved !== null) {
     return loadDangerousPatternsFromFile(resolved);
   }
-  // Fail-open: no pattern file found — deny layer inert, flagged as not loaded.
+  // No pattern file found — flagged as not loaded, so execution fails closed.
   return {
     patterns: [],
     parseErrors: ["dangerous-patterns.txt not found next to runtime/ or opencode/"],
@@ -156,7 +168,8 @@ export function getDangerousPatternsStatus(): DangerousPatternsLoadResult {
     if (!cachedDenylist.loaded || cachedDenylist.parseErrors.length > 0) {
       // stderr only — stdout carries the MCP protocol.
       console.error(
-        `xx-stack execution_policy: dangerous-pattern denylist degraded (fail-open). ` +
+        `xx-stack execution_policy: dangerous-pattern denylist degraded ` +
+          `(${cachedDenylist.loaded ? "broken lines skipped" : `fail-closed unless ${ALLOW_MISSING_DANGEROUS_PATTERNS_ENV}=1`}). ` +
           `loaded=${cachedDenylist.loaded} source=${cachedDenylist.sourcePath ?? "none"} ` +
           `errors=${JSON.stringify(cachedDenylist.parseErrors)}`
       );
@@ -282,8 +295,16 @@ export function validateExecRequest(
 
   // Deny layer runs AHEAD of the allowlist: a catastrophic pattern is
   // rejected even for an otherwise-allowlisted command.
+  const denylist = getDangerousPatternsStatus();
+  if (
+    context === "hook" &&
+    !denylist.loaded &&
+    !envFlagEnabled(ALLOW_MISSING_DANGEROUS_PATTERNS_ENV)
+  ) {
+    return { allowed: false, reason: "dangerous_patterns_unavailable" };
+  }
   const commandLine = [normalizedCommand, ...args].join(" ");
-  const dangerousPattern = findDangerousPattern(commandLine);
+  const dangerousPattern = findDangerousPattern(commandLine, denylist.patterns);
   if (dangerousPattern !== null) {
     return {
       allowed: false,

@@ -45,11 +45,13 @@ test("alias route: OpenRouter stealth/union-alpha is free-first", () => {
   const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
   assert.ok(slugs.includes("open_router/stealth/union-alpha"));
   assert.ok(
-    slugs.indexOf("open_router/stealth/union-alpha") < slugs.indexOf("groq/llama-3.3-70b-versatile"),
+    slugs.indexOf("open_router/stealth/union-alpha") <
+      slugs.indexOf("groq/llama-3.3-70b-versatile"),
     "stealth union-alpha must rank as free cloud, not paid"
   );
   assert.ok(
-    slugs.indexOf("open_router/stealth/union-alpha") < slugs.indexOf("open_router/qwen/qwen3-coder:free")
+    slugs.indexOf("open_router/stealth/union-alpha") <
+      slugs.indexOf("open_router/qwen/qwen3-coder:free")
   );
 });
 
@@ -122,19 +124,27 @@ test("alias route: configured fallbacks do not hop to unlisted paid or Zen free"
 
   const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
   assert.ok(slugs.includes("open_router/openrouter/free"));
-  assert.ok(slugs.includes("open_router/qwen/qwen3-coder:free"), "OpenRouter free siblings still fill in");
+  assert.ok(
+    slugs.includes("open_router/qwen/qwen3-coder:free"),
+    "OpenRouter free siblings still fill in"
+  );
   assert.ok(slugs.includes("bai/glm-5.3-flash"));
   assert.ok(slugs.includes("groq/llama-3.3-70b-versatile"), "bare groq expands to listed models");
   assert.ok(!slugs.includes("bai/gpt-5.5"), "unlisted paid B.ai catalog must not hop");
-  assert.ok(!slugs.includes("opencode_zen/big-pickle"), "Zen free must not hop unless Zen is in Admin list");
+  assert.ok(
+    !slugs.includes("opencode_zen/big-pickle"),
+    "Zen free must not hop unless Zen is in Admin list"
+  );
   // OpenRouter free leads; Admin B.ai default is explicit (not probed-free here).
   assert.ok(slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("bai/glm-5.3-flash"));
-  assert.ok(slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("groq/llama-3.3-70b-versatile"));
+  assert.ok(
+    slugs.indexOf("open_router/openrouter/free") < slugs.indexOf("groq/llama-3.3-70b-versatile")
+  );
 });
 
 test("alias route: B.ai prefers glm-5.3-flash free over mislabeled gpt-5-nano", () => {
   __resetCooldowns();
-  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  const settings = setProviderKey(emptySettings(), "bai", "bai_test");
   settings.model = null;
   settings.fallbacks = [];
   settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash", "gpt-5.5"];
@@ -214,7 +224,7 @@ test("400 credit insufficient on B.ai hops instead of ending the turn", async ()
 test("403 deposit on one premium model keeps hopping other B.ai siblings", async () => {
   __resetCooldowns();
   // Explicit Admin fallback is required — B.ai no longer auto-siblings.
-  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  const settings = setProviderKey(emptySettings(), "bai", "bai_test");
   settings.model = "bai/gpt-5-nano";
   settings.fallbacks = ["bai/glm-5.3-flash"];
   settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash"];
@@ -255,7 +265,7 @@ test("alias route: explicit fallbacks still block unlisted B.ai siblings", () =>
 
 test("403 deposit required hops past the premium slug", async () => {
   __resetCooldowns();
-  let settings = setProviderKey(emptySettings(), "bai", "bai_test");
+  const settings = setProviderKey(emptySettings(), "bai", "bai_test");
   settings.model = "bai/glm-5.3-flash";
   settings.fallbacks = [];
   settings.discovered.bai = ["gpt-5-nano", "glm-5.3-flash"];
@@ -286,7 +296,7 @@ test("403 deposit required hops past the premium slug", async () => {
 
 test("404 on stealth/union-alpha hops to the next OpenRouter free slug", async () => {
   __resetCooldowns();
-  let settings = setProviderKey(emptySettings(), "open_router", "or_test");
+  const settings = setProviderKey(emptySettings(), "open_router", "or_test");
   settings.model = "open_router/stealth/union-alpha";
   settings.fallbacks = ["open_router/openrouter/free"];
 
@@ -457,9 +467,7 @@ test("routeChat records a cooldown from a retryable upstream and answers the fal
         );
       }
       return new Response(JSON.stringify({ id: "ok", choices: [] }), { status: 200 });
-    },
-    undefined,
-    undefined
+    }
   );
   assert.equal(result.used.providerId, "tailscale_sglang");
 
@@ -503,12 +511,12 @@ test("routeChat repeat 429 without Retry-After doubles the cooldown backoff", as
   const request = { model: "open_router/openrouter/free", stream: false } satisfies ChatRequest;
 
   // First 429 cools the slug down for the default 60s.
-  await routeChat(settings, request, transport, undefined, undefined, home);
+  await routeChat(settings, request, transport, { home });
   assert.equal(cooldownAvailableAt("open_router/openrouter/free"), 60_000);
 
   // Fast-forward past the first window so the slug is eligible again (recheck).
   nowMs = 61_000;
-  await routeChat(settings, request, transport, undefined, undefined, home);
+  await routeChat(settings, request, transport, { home });
   // A second 429 with no Retry-After doubles the previous backoff → 120s.
   assert.equal(cooldownAvailableAt("open_router/openrouter/free"), 61_000 + 120_000);
   __resetCooldowns();
