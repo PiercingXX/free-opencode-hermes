@@ -67,6 +67,7 @@ test("alias route: free OpenRouter first, paid cloud, self-hosted last", () => {
   settings.model = "tailscale_sglang/deepseek-v4-flash";
   settings = setProviderKey(settings, "open_router", "or_test");
   settings = setProviderKey(settings, "groq", "gsk_test");
+  settings.discovered.open_router = ["qwen/qwen3-coder:free"];
 
   const targets = routeTargets(settings, "free-opencode/default");
   const slugs = targets.map((t) => t.slug);
@@ -121,6 +122,7 @@ test("alias route: configured fallbacks do not hop to unlisted paid or Zen free"
   settings = setProviderKey(settings, "opencode_zen", "zen_test");
   settings.model = "bai/glm-5.3-flash";
   settings.fallbacks = ["open_router/openrouter/free", "groq"];
+  settings.discovered.open_router = ["qwen/qwen3-coder:free"];
 
   const slugs = routeTargets(settings, "free-opencode/default").map((t) => t.slug);
   assert.ok(slugs.includes("open_router/openrouter/free"));

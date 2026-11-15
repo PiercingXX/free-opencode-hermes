@@ -52,12 +52,10 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     env: "OPENROUTER_API_KEY",
     credentialUrl: "https://openrouter.ai/keys",
     defaultBaseUrl: "https://openrouter.ai/api/v1",
-    defaultModels: [
-      "stealth/union-alpha",
-      "openrouter/free",
-      "qwen/qwen3-coder:free",
-      "moonshotai/kimi-k2:free",
-    ],
+    // Keep this list short: specific `:free` SKUs come and go, and discovery
+    // (`supported_parameters=tools`) picks up whichever are live. `openrouter/free`
+    // is OpenRouter's own free router and does not go stale.
+    defaultModels: ["stealth/union-alpha", "openrouter/free"],
     modelsQuery: "supported_parameters=tools",
   },
   {

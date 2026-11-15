@@ -43,6 +43,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- OpenRouter's curated defaults listed `qwen/qwen3-coder:free` and
+  `moonshotai/kimi-k2:free`, which OpenRouter no longer serves, so alias
+  traffic could hop onto dead slugs. Defaults are now `stealth/union-alpha`
+  and `openrouter/free`; live `:free` models come from tool-capable discovery.
 - `free-opencode stop` / `update` could SIGTERM the user's OpenCode session:
   the in-process proxy recorded OpenCode's own pid in the pidfile. Pidfile
   records now say whether the proxy is detached, and a pid is only killed after

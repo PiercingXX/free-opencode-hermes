@@ -96,6 +96,7 @@ test("catalog alias tries free cloud first, then paid, self-hosted last", () => 
   settings = setProviderKey(settings, "open_router", "k2");
   settings.model = "groq/llama-3.3-70b-versatile";
   settings.fallbacks = ["open_router/openrouter/free"];
+  settings.discovered.open_router = ["qwen/qwen3-coder:free"];
   // Alias traffic: free OpenRouter models rank before the paid Groq box.
   const alias = routeTargets(settings, "default").map((ref) => ref.slug);
   assert.ok(alias[0] === "open_router/openrouter/free", "free fallback leads the alias list");
